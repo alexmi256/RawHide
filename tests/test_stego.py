@@ -1123,6 +1123,68 @@ def test_bigtiff_seek_helpers_synthetic():
         assert C._seek_subifd_offsets(f, ifd0) == [s1b]
 
 
+def test_decode_max_bytes_opt_in():
+    # Regression: encode allows ~GB payloads but decode used to cap at
+    # 256 MiB by default, so max-capacity files failed with
+    # "declared payload exceeds max_bytes limit". The cap is now opt-in
+    # (None = bounded by image capacity); an explicit cap still fails
+    # closed with an actionable message.
+    from stegodng import DngStego
+    payload = os.urandom(5000)
+    out = _tmp("maxb.dng")
+    stego_dng.encode(payload, out, width=256, height=192, seed=51,
+                     lsb_planes=2, thumbnail="synthetic")
+    assert DngStego().decode(out) == payload  # default: no artificial cap
+    assert DngStego().decode(out, max_bytes=10 * 1024 * 1024) == payload
+    try:
+        DngStego().decode(out, max_bytes=100)
+    except ValueError as exc:
+        assert "max_bytes" in str(exc) and "--max-bytes" in str(exc)
+    else:
+        raise AssertionError("tiny max_bytes should fail")
+    # auto-detect must surface the limit error even when the payload is
+    # not on the last probed plane (else it looks like wrong-key).
+    try:
+        DngStego().decode(out, max_bytes=100)
+    except ValueError as exc:
+        assert "max_bytes" in str(exc) and "wrong key" not in str(exc)
+    else:
+        raise AssertionError("limit error should win over no-magic")
+
+
+def test_cli_max_bytes_flag():
+    import subprocess
+    d = tempfile.mkdtemp()
+    src_p = os.path.join(d, "in.bin")
+    enc = os.path.join(d, "o.dng")
+    rec = os.path.join(d, "out.bin")
+    with open(src_p, "wb") as f:
+        f.write(os.urandom(3000))
+    r = subprocess.run(
+        [sys.executable, "stego_dng.py", "encode", "-i", src_p, "-o", enc,
+         "--seed", "5", "--width", "256", "--height", "192",
+         "--thumbnail", "synthetic"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    r = subprocess.run(
+        [sys.executable, "stego_dng.py", "decode", "-i", enc, "-o", rec,
+         "--max-bytes", "10m"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    with open(src_p, "rb") as f1, open(rec, "rb") as f2:
+        assert f1.read() == f2.read()
+    r = subprocess.run(
+        [sys.executable, "stego_dng.py", "decode", "-i", enc, "-o", rec,
+         "--max-bytes", "1k"],
+        capture_output=True, text=True)
+    assert r.returncode == 1 and "max_bytes" in r.stderr
+    r = subprocess.run(
+        [sys.executable, "stego_dng.py", "decode", "-i", enc, "-o", rec,
+         "--max-bytes", "bogus"],
+        capture_output=True, text=True)
+    assert r.returncode == 1
+
+
 if __name__ == "__main__":
 
     for name, fn in sorted(

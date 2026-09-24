@@ -258,6 +258,9 @@ python stego_dng.py decode -i vol0001.dng vol0002.dng -o huge.raw
 
 # extract (--lsb-planes auto-detected; only --key must match)
 python stego_dng.py decode -i out.dng -o recovered.bin
+# opt-in safety cap on the declared payload per file (default: image
+# capacity, so any file this tool can encode also decodes)
+python stego_dng.py decode -i out.dng -o recovered.bin --max-bytes 500m
 
 # helpers
 python stego_dng.py capacity --width 23296 --height 17472 --lsb-planes 4
@@ -286,6 +289,14 @@ If nothing fits, the error states the payload size, the relevant maximum
 and suggests larger geometry / more planes / auto-sizing / splitting the
 input. `decode` needs no sizing flags: it tries 1-16 planes and accepts the
 one passing the magic+CRC check (explicit `--lsb-planes` = strict mode).
+`decode` bounds the accepted payload by the image capacity, so every
+encodable file decodes by default; `--max-bytes SIZE` (same `1g`/`100m`/
+`500k`/bare-count syntax as `--split-file`) opts into a smaller safety cap per
+file, and the API's `max_bytes=None` default behaves the same (pass an int
+to cap). For untrusted files, pass an explicit `--max-bytes`/`max_bytes`
+to bound the allocation before the capacity check runs. When a header match
+is rejected by that cap or by capacity, the error names the limit instead
+of the generic wrong-key hint.
 
 All user-facing sizes (encode/decode/capacity output and errors) are
 reported in kilobytes.

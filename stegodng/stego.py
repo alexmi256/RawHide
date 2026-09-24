@@ -41,6 +41,15 @@ from .profile import (
 )
 
 
+class _DecodeLimitError(ValueError):
+    """Declared payload rejected by the cap or image capacity.
+
+    Subclass of ValueError (so existing ``except ValueError`` callers are
+    unaffected); lets ``_decode_one`` recognize limit rejections by type
+    instead of fragile message-substring matching.
+    """
+
+
 class DngStego:
     """Embed and recover payloads in DNG raw sensor data."""
 
@@ -435,7 +444,7 @@ class DngStego:
         raws: list[np.ndarray],
         key: bytes | None,
         lsb_planes: int,
-        max_bytes: int,
+        max_bytes: int | None = None,
     ) -> bytes:
         """Single-plane-count decode attempt across ordered raw frames.
 
@@ -444,6 +453,10 @@ class DngStego:
         on failure. Header is read first (144 bits, tiny); the full frame
         is then streamed via :meth:`LsbCodec.extract_stream` so large
         payloads never materialize the ~8x bit-expanded array.
+
+        ``max_bytes`` is an opt-in safety cap (``None`` means bounded only
+        by the image capacity); it guards against allocating a huge buffer
+        from a bogus header before the capacity check runs.
         """
         head = LsbCodec.extract_bitarray(raws[0], lsb_planes, PayloadFrame.HEADER_LEN * 8)
         header = np.packbits(head).tobytes()
@@ -453,11 +466,16 @@ class DngStego:
             raise ValueError("no magic")
         (pay_len,) = struct.unpack(">Q", header[6:14])
         total_bits = (PayloadFrame.HEADER_LEN + pay_len) * 8
-        if pay_len > max_bytes:
-            raise ValueError("declared payload exceeds max_bytes limit")
+        if max_bytes is not None and pay_len > max_bytes:
+            raise _DecodeLimitError(
+                f"declared payload {format_kb_hi(pay_len)} exceeds "
+                f"max_bytes limit {format_kb_lo(max_bytes)} "
+                f"(pass --max-bytes larger than "
+                f"{format_kb_lo(max_bytes)})")
         total_slots = sum(int(raw.size) * lsb_planes for raw in raws)
         if total_bits > total_slots:
-            raise ValueError("declared payload exceeds image capacity")
+            raise _DecodeLimitError(
+                "declared payload exceeds image capacity")
         stream = LsbCodec.extract_stream(raws, lsb_planes, total_bits)
         payload, _ = PayloadFrame.unpack(stream, key)
         return payload
@@ -467,7 +485,7 @@ class DngStego:
         input_path: str | list[str],
         key: bytes | None = None,
         lsb_planes: int | None = None,
-        max_bytes: int = 256 * 1024 * 1024,
+        max_bytes: int | None = None,
         split_id_field: str = "ImageUniqueID",
         split_seq_field: str = "ImageNumber",
     ) -> bytes:
@@ -478,6 +496,12 @@ class DngStego:
         one shared UUID with consecutive sequences, otherwise the
         filenames must form a consecutive 0001-based sequence. A lone
         file carrying split markers decodes with a partial-data warning.
+
+        ``max_bytes`` caps the accepted declared payload per file
+        (``None`` — the default — means bounded only by the image
+        capacity, so any file this tool can encode also decodes).
+        For untrusted files, pass an explicit ``max_bytes`` to bound
+        the allocation before the capacity check runs.
         """
         if lsb_planes is not None and not (1 <= lsb_planes <= MAX_LSB_PLANES):
             raise ValueError(f"lsb_planes must be 1-{MAX_LSB_PLANES}")
@@ -507,7 +531,7 @@ class DngStego:
         input_path: str,
         key: bytes | None = None,
         lsb_planes: int | None = None,
-        max_bytes: int = 256 * 1024 * 1024,
+        max_bytes: int | None = None,
     ) -> bytes:
         """Decode a single DNG (chunk or whole payload)."""
         if lsb_planes is not None and not (1 <= lsb_planes <= MAX_LSB_PLANES):
@@ -516,11 +540,20 @@ class DngStego:
         candidates = ([lsb_planes] if lsb_planes is not None
                       else list(range(1, MAX_LSB_PLANES + 1)))
         last_err: ValueError | None = None
+        limit_err: ValueError | None = None
         for p in candidates:
             try:
                 return self._decode_with_planes(raws, key, p, max_bytes)
             except ValueError as exc:
+                # A magic match with a bad length means the right plane was
+                # found but the payload was rejected (cap/capacity). Surface
+                # that instead of a later plane's generic "no magic", which
+                # would misdirect (wrong-key hint) for non-16-plane payloads.
+                if isinstance(exc, _DecodeLimitError):
+                    limit_err = limit_err or exc
                 last_err = exc
+        if limit_err is not None:
+            raise limit_err
         if lsb_planes is not None:
             raise ValueError(
                 "magic not found - wrong key, wrong LSB depth/mode or no payload"
@@ -532,7 +565,7 @@ class DngStego:
         )
 
     def _decode_many(self, paths: list[str], *, key: bytes | None,
-                     lsb_planes: int | None, max_bytes: int,
+                     lsb_planes: int | None, max_bytes: int | None,
                      id_field: str, seq_field: str) -> bytes:
         """Verify a chunk set (metadata, else filenames) and concatenate."""
         markers = []
@@ -739,7 +772,7 @@ def decode(
     input_path: str | list[str],
     key: bytes | None = None,
     lsb_planes: int | None = None,
-    max_bytes: int = 256 * 1024 * 1024,
+    max_bytes: int | None = None,
     split_id_field: str = "ImageUniqueID",
     split_seq_field: str = "ImageNumber",
 ) -> bytes:
