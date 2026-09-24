@@ -31,12 +31,16 @@ is the operator's guide for changing code.
   (and `.venv/bin/pip`), never the system python.
 - Install deps with `.venv/bin/pip install -r requirements.txt`
   (`numpy`, `pillow`, `tifffile[all]`; `rawpy` optional, decode checks only).
+  Test deps (pytest + pytest-cov) live in `requirements-dev.txt`:
+  `.venv/bin/pip install -r requirements-dev.txt`.
 - Quick smoke: `.venv/bin/python stego_dng.py capacity --width 2048 --height 1536`
 
 ## Testing
 
-- Run the suite with `.venv/bin/python tests/test_stego.py` (no pytest;
-  every `test_*` must print `ok`, ends with `all tests passed`).
+- Run the suite with `.venv/bin/python -m pytest tests/ -q`.
+- Coverage: `.venv/bin/python -m pytest tests/ -q --cov=stegodng
+  --cov=stego_dng --cov-report=term-missing` (note: CLI cases run in
+  subprocesses, so `cli.py` reads artificially low in-process).
 - Keep tests **hermetic**: no network. Pin `thumbnail="synthetic"` on
   every `encode` call; test thumbnail fetching with injected `opener`
   callables (see `test_thumbnail_random_with_fake_opener`).
