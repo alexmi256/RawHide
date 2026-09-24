@@ -972,6 +972,157 @@ def test_split_offline_thumbs_differ():
         stego_mod.ThumbnailProvider = orig
 
 
+def test_streaming_chunked_roundtrip():
+    # Force the multi-chunk path: tiny sample chunks over two frames,
+    # unaligned payload lengths, planes 1/3/8/16 (uint16 throughout —
+    # P=16 on a uint8 container would truncate high planes).
+    from stegodng.codec import LsbCodec
+    from stegodng.framing import PayloadFrame
+    orig = LsbCodec._chunk_samples
+    LsbCodec._chunk_samples = staticmethod(lambda p: 64)
+    try:
+        rng = np.random.default_rng(1234)
+        c1 = (rng.integers(0, 65535, size=(64, 64, 3)).astype(np.uint16))
+        c2 = (rng.integers(0, 65535, size=(48, 48, 3)).astype(np.uint16))
+        for key in (None, b"chunk-key"):
+            for P in (1, 3, 8, 16):
+                cap = LsbCodec.capacity_bytes_total(c1.size, P, 1) \
+                    + LsbCodec.capacity_bytes_total(c2.size, P, 1) \
+                    + PayloadFrame.HEADER_LEN
+                for nbytes in (100, 1000, min(2000, cap)):
+                    payload = os.urandom(nbytes)
+                    frame = PayloadFrame.pack(payload, key)
+                    assert len(frame) * 8 <= c1.size * P + c2.size * P
+                    stegos = LsbCodec.stripe_frames(
+                        [c1.copy(), c2.copy()], frame, P)
+                    # 2000-byte payload at P=1 must spill into frame 2
+                    # (first cover holds only 12288 bits).
+                    out = LsbCodec.extract_stream(
+                        stegos, P, len(frame) * 8)
+                    assert PayloadFrame.unpack(out, key)[0] == payload, (P, nbytes, key)
+    finally:
+        LsbCodec._chunk_samples = orig
+
+
+def test_stripe_frames_overflow_raises():
+    # Old code silently dropped bits past the cover slots; fail closed.
+    from stegodng.codec import LsbCodec
+    cover = np.zeros((8, 8, 3), dtype=np.uint16)
+    try:
+        LsbCodec.stripe_frames([cover], b"\xff" * 10000, 1)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("oversize stripe_frames should raise")
+
+
+def test_extract_bitarray_oversize_raises():
+    from stegodng.codec import LsbCodec
+    raw = np.zeros((8, 8, 3), dtype=np.uint16)
+    try:
+        LsbCodec.extract_bitarray(raw, 1, raw.size + 1)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("oversize extract_bitarray should raise")
+
+
+def test_keystream_range_equivalence():
+    from stegodng.framing import PayloadFrame
+    key = b"range-key"
+    full = PayloadFrame._keystream(key, 200)
+    for off, ln in ((0, 18), (0, 200), (5, 100), (31, 33), (32, 64),
+                    (100, 7), (63, 65)):
+        assert PayloadFrame._keystream_range(key, off, ln) == full[off:off + ln]
+    assert PayloadFrame._keystream_range(key, 10, 0) == b""
+
+
+def test_seek_vs_buffer_parity():
+    import stego_dng
+    from stegodng import container as C
+    out = _tmp("parity.dng")
+    stego_dng.encode(b"parity-check", out, width=256, height=192, seed=9,
+                     frames=2, thumbnail="synthetic")
+    data = bytearray(open(out, "rb").read())
+    ifd0 = C._ifd0_offset(data)
+    with open(out, "rb") as f:
+        assert C._seek_ifd0_offset(f) == ifd0
+        assert C._seek_subifd_offsets(f, ifd0) == C._subifd_offsets(data, ifd0)
+        for tag in (271, 330, 34665):
+            e = C._find_ifd_entry(data, ifd0, tag)
+            found = C._seek_ifd_entry(f, ifd0, tag)
+            assert found is not None and found[0] == e, tag
+            assert found[1:4] == C._entry_value_ptr(data, e), tag
+        # Dummy 65000 is rewritten to ExifTag 34665 during finishing:
+        # absent in both views.
+        assert C._find_ifd_entry(data, ifd0, 65000) is None
+        with open(out, "rb") as f2:
+            assert C._seek_ifd_entry(f2, ifd0, 65000) is None
+
+
+def test_bigtiff_seek_helpers_synthetic():
+    import struct
+    from stegodng import container as C
+
+    def blob(ifd0_off, entries, blobs):
+        data = bytearray(ifd0_off)
+        data[0:4] = b"II+\x00"
+        struct.pack_into("<Q", data, 8, ifd0_off)
+        data += struct.pack("<Q", len(entries))
+        for tag, typ, count, field in entries:
+            data += struct.pack("<HHQ8s", tag, typ, count, field)
+        data += struct.pack("<Q", 0)
+        base = len(data)
+        out = []
+        for b in blobs:
+            out.append(len(data))
+            data += b
+        return data, base, out
+
+    def subifd(photo):
+        return (struct.pack("<Q", 1)
+                + struct.pack("<HHQ8s", 262, 3, 1,
+                              struct.pack("<H", photo) + b"\x00" * 6)
+                + struct.pack("<Q", 0))
+
+    # External-offset branch: tag 330 LONG8 count 2 -> 8-byte array.
+    ifd0 = 16
+    arr_off = ifd0 + 8 + 2 * 20 + 8
+    s1 = arr_off + 16
+    s2 = s1 + 36
+    data, base, _ = blob(
+        ifd0,
+        [(330, 18, 2, struct.pack("<Q", arr_off)),
+         (274, 3, 1, struct.pack("<H", 1) + b"\x00" * 6)],
+        [struct.pack("<QQ", s1, s2), subifd(2), subifd(2)])
+    assert base == arr_off
+    assert C._tiff_is_bigtiff(data) and C._ifd0_offset(data) == ifd0
+    assert C._subifd_offsets(data, ifd0) == [s1, s2]
+    e = C._find_ifd_entry(data, ifd0, 330)
+    p = _tmp("syn_bt.dng")
+    with open(p, "wb") as f:
+        f.write(data)
+    with open(p, "rb") as f:
+        assert C._seek_ifd0_offset(f) == ifd0
+        found = C._seek_ifd_entry(f, ifd0, 330)
+        assert found is not None and found[0] == e
+        assert found[1:4] == C._entry_value_ptr(data, e)
+        assert C._seek_subifd_offsets(f, ifd0) == [s1, s2]
+
+    # Inline branch: tag 330 count 1 fits the 8-byte value field.
+    s1b = ifd0 + 8 + 1 * 20 + 8
+    data2, _, _ = blob(
+        ifd0,
+        [(330, 18, 1, struct.pack("<Q", s1b))],
+        [subifd(2)])
+    assert C._subifd_offsets(data2, ifd0) == [s1b]
+    p2 = _tmp("syn_bt_inline.dng")
+    with open(p2, "wb") as f:
+        f.write(data2)
+    with open(p2, "rb") as f:
+        assert C._seek_subifd_offsets(f, ifd0) == [s1b]
+
+
 if __name__ == "__main__":
 
     for name, fn in sorted(

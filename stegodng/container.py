@@ -376,6 +376,76 @@ def _subifd_offsets(data: bytes | bytearray, ifd0: int) -> list[int]:
             for i in range(count)]
 
 
+def _seek_ifd_entry(f, ifd_off: int, tag: int):
+    """(entry_file_offset, typ, count, value_field_off, big) for ``tag``.
+
+    Seek-based: only the IFD header + entries are read (KBs), never the
+    whole multi-GB file. Returns None when the tag is absent.
+    """
+    f.seek(0)
+    magic = f.read(4)
+    if magic[:2] != b"II" or magic[2:4] not in (b"*\x00", b"+\x00"):
+        raise ValueError("not a little-endian TIFF")
+    big = magic == b"II+\x00"
+    f.seek(ifd_off)
+    if big:
+        (n,) = struct.unpack("<Q", f.read(8))
+        size, head = 20, 8
+    else:
+        (n,) = struct.unpack("<H", f.read(2))
+        size, head = 12, 2
+    entries = f.read(n * size)
+    for i in range(n):
+        e = ifd_off + head + i * size
+        (t,) = struct.unpack_from("<H", entries, i * size)
+        if t == tag:
+            typ = struct.unpack_from("<H", entries, i * size + 2)[0]
+            if big:
+                (count,) = struct.unpack_from("<Q", entries, i * size + 4)
+                vptr = e + 12
+            else:
+                (count,) = struct.unpack_from("<I", entries, i * size + 4)
+                vptr = e + 8
+            return e, typ, count, vptr, big
+    return None
+
+
+def _seek_subifd_offsets(f, ifd0: int) -> list[int]:
+    """All SubIFD offsets linked from IFD0 tag 330 (seek-based)."""
+    found = _seek_ifd_entry(f, ifd0, 330)
+    if found is None:  # pragma: no cover
+        raise ValueError("SubIFDs tag (330) not found")
+    _, typ, count, vptr, big = found
+    elem = _TYPE_SIZE.get(typ, 4)
+    if big and typ in (13, 18):
+        elem = 8
+    total = count * elem
+    field = 8 if big else 4
+    fmt = "<Q" if big else "<I"
+    if total <= field:
+        f.seek(vptr)
+        (off,) = struct.unpack(fmt, f.read(field if big else 4)[:8 if big else 4])
+        return [off]
+    f.seek(vptr)
+    (base,) = struct.unpack(fmt, f.read(8 if big else 4))
+    f.seek(base)
+    buf = f.read(count * (8 if big else 4))
+    return [struct.unpack_from(fmt, buf, i * (8 if big else 4))[0]
+            for i in range(count)]
+
+
+def _seek_ifd0_offset(f) -> int:
+    f.seek(0)
+    magic = f.read(4)
+    if magic[:2] != b"II" or magic[2:4] not in (b"*\x00", b"+\x00"):
+        raise ValueError("not a little-endian TIFF")
+    if magic == b"II+\x00":
+        f.seek(8)
+        return struct.unpack("<Q", f.read(8))[0]
+    f.seek(4)
+    return struct.unpack("<I", f.read(4))[0]
+
+
 def _append_exif(path: str, meta: dict, thumb_w: int, thumb_h: int) -> None:
     """Append EXIF Sub-IFD at EOF and link it from IFD0.
 
@@ -384,21 +454,22 @@ def _append_exif(path: str, meta: dict, thumb_w: int, thumb_h: int) -> None:
     count 1) whose 12-byte entry is rewritten in place as
     (34665, LONG, 1, exif_offset). Also patches PhotometricInterpretation
     is handled separately by :func:`_patch_linear_raw`.
+
+    Seek-based: the multi-GB pixel data is never read; one entry is
+    rewritten in place and the (KB-sized) EXIF block is appended.
     """
     with open(path, "r+b") as f:
-        data = bytearray(f.read())
-        if bytes(data[:2]) != b"II" or data[2:4] not in (b"*\x00", b"+\x00"):
-            raise ValueError("not a little-endian TIFF")
-        big = _tiff_is_bigtiff(data)
-        ifd0 = _ifd0_offset(data)
-        e = _find_ifd_entry(data, ifd0, 65000)
-        if e is None:  # pragma: no cover
+        ifd0 = _seek_ifd0_offset(f)
+        found = _seek_ifd_entry(f, ifd0, 65000)
+        if found is None:  # pragma: no cover
             raise ValueError("dummy tag 65000 not found in IFD0")
-        exif_offset = len(data)
+        e, _, _, _, big = found
+        f.seek(0, 2)
+        exif_offset = f.tell()
         # word-align
         if exif_offset % 2:
-            data += b"\x00"
-            exif_offset = len(data)
+            f.write(b"\x00")
+            exif_offset = f.tell()
         split_exif = meta.get("split_exif", {})
         extra = ([(tag, SPLIT_EXIF_DTYPES[tag]) for tag in split_exif]
                  if split_exif else None)
@@ -406,16 +477,15 @@ def _append_exif(path: str, meta: dict, thumb_w: int, thumb_h: int) -> None:
                                   extra)
         # rewrite the dummy entry in place as ExifTag (34665, LONG, 1).
         # Same-sized entry, no byte shifting required.
+        f.seek(e)
         if big:
-            struct.pack_into("<HHQ", data, e, 34665, 4, 1)
-            struct.pack_into("<Q", data, e + 12, exif_offset)
+            f.write(struct.pack("<HHQ", 34665, 4, 1))
+            f.write(struct.pack("<Q", exif_offset))
         else:
-            struct.pack_into("<HHI", data, e, 34665, 4, 1)
-            struct.pack_into("<I", data, e + 8, exif_offset)
-        data += block
-        f.seek(0)
-        f.write(data)
-        f.truncate()
+            f.write(struct.pack("<HHI", 34665, 4, 1))
+            f.write(struct.pack("<I", exif_offset))
+        f.seek(exif_offset)
+        f.write(block)
 
 
 def set_ifd0_tag(path: str, dummy_code: int, tag: int, dtype_name: str,
@@ -424,74 +494,69 @@ def set_ifd0_tag(path: str, dummy_code: int, tag: int, dtype_name: str,
 
     ``value`` is a tuple/list of ints stored inline (must fit the 4-byte
     classic / 8-byte BigTIFF value field). Same-sized entry rewrite, no
-    byte shifting. Handles classic TIFF and BigTIFF.
+    byte shifting. Handles classic TIFF and BigTIFF. Seek-based: only
+    the entry is rewritten, the pixel data is never read.
     """
     count, raw = _pack_val(dtype_name, value)
     with open(path, "r+b") as f:
-        data = bytearray(f.read())
-        if bytes(data[:2]) != b"II" or data[2:4] not in (b"*\x00", b"+\x00"):
-            raise ValueError("not a little-endian TIFF")
-        big = _tiff_is_bigtiff(data)
+        ifd0 = _seek_ifd0_offset(f)
+        found = _seek_ifd_entry(f, ifd0, dummy_code)
+        if found is None:  # pragma: no cover
+            raise ValueError(f"dummy tag {dummy_code} not found in IFD0")
+        e, _, _, _, big = found
         field_len = 8 if big else 4
         if len(raw) > field_len:  # pragma: no cover - defensive
             raise ValueError(f"value too large for inline IFD0 field: {value!r}")
-        ifd0 = _ifd0_offset(data)
-        e = _find_ifd_entry(data, ifd0, dummy_code)
-        if e is None:  # pragma: no cover
-            raise ValueError(f"dummy tag {dummy_code} not found in IFD0")
         field = raw + b"\x00" * (field_len - len(raw))
-        struct.pack_into("<HH" + ("Q" if big else "I"),
-                         data, e, tag, _DTYPE_NUM[dtype_name], count)
-        vptr = e + (12 if big else 8)
-        data[vptr:vptr + field_len] = field
-        f.seek(0)
-        f.write(data)
+        f.seek(e)
+        f.write(struct.pack("<HH" + ("Q" if big else "I"),
+                            tag, _DTYPE_NUM[dtype_name], count))
+        f.write(field)
 
 
 def append_ifd0_ascii(path: str, dummy_code: int, tag: int,
                       text: str) -> None:
-    """Rewrite a dummy IFD0 entry as an ASCII tag with an EOF blob value."""
+    """Rewrite a dummy IFD0 entry as an ASCII tag with an EOF blob value.
+
+    Seek-based: the blob is appended at EOF, one entry rewritten in
+    place; pixel data is never read.
+    """
     raw = text.encode("ascii") + b"\x00"
     with open(path, "r+b") as f:
-        data = bytearray(f.read())
-        if bytes(data[:2]) != b"II" or data[2:4] not in (b"*\x00", b"+\x00"):
-            raise ValueError("not a little-endian TIFF")
-        big = _tiff_is_bigtiff(data)
-        ifd0 = _ifd0_offset(data)
-        e = _find_ifd_entry(data, ifd0, dummy_code)
-        if e is None:  # pragma: no cover
+        ifd0 = _seek_ifd0_offset(f)
+        found = _seek_ifd_entry(f, ifd0, dummy_code)
+        if found is None:  # pragma: no cover
             raise ValueError(f"dummy tag {dummy_code} not found in IFD0")
-        blob_off = len(data)
+        e, _, _, _, big = found
+        f.seek(0, 2)
+        blob_off = f.tell()
         if blob_off % 2:
-            data += b"\x00"
-            blob_off = len(data)
-        data += raw
-        struct.pack_into("<HH" + ("Q" if big else "I"),
-                         data, e, tag, _DTYPE_NUM["ASCII"], len(raw))
-        struct.pack_into("<Q" if big else "<I", data, e + (12 if big else 8),
-                         blob_off)
-        f.seek(0)
-        f.write(data)
+            f.write(b"\x00")
+            blob_off = f.tell()
+        f.write(raw)
+        f.seek(e)
+        f.write(struct.pack("<HH" + ("Q" if big else "I"),
+                            tag, _DTYPE_NUM["ASCII"], len(raw)))
+        f.write(struct.pack("<Q" if big else "<I", blob_off))
 
 
 def _patch_linear_raw(path: str) -> None:
     """Change every SubIFD PhotometricInterpretation RGB(2) -> LinearRaw(34892).
 
     Handles classic TIFF and BigTIFF (DNG 1.6) layouts, and any number of
-    raw frames linked from tag 330.
+    raw frames linked from tag 330. Seek-based: only IFD headers are
+    read and 2 bytes per SubIFD are rewritten; pixel data is never read.
     """
     with open(path, "r+b") as f:
-        data = bytearray(f.read())
-        ifd0 = _ifd0_offset(data)
-        for subifd in _subifd_offsets(data, ifd0):
-            e2 = _find_ifd_entry(data, subifd, 262)
-            if e2 is None:  # pragma: no cover
+        ifd0 = _seek_ifd0_offset(f)
+        for subifd in _seek_subifd_offsets(f, ifd0):
+            found = _seek_ifd_entry(f, subifd, 262)
+            if found is None:  # pragma: no cover
                 raise ValueError(
                     "PhotometricInterpretation not found in SubIFD")
-            _, _, vptr = _entry_value_ptr(data, e2)
-            struct.pack_into("<H", data, vptr, 34892)
-        f.seek(0)
-        f.write(data)
+            _, _, _, vptr, _ = found
+            f.seek(vptr)
+            f.write(struct.pack("<H", 34892))
 
 
 

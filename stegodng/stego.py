@@ -441,31 +441,24 @@ class DngStego:
 
         The framed bitstream is striped over frames in write order; gather
         the needed prefix of the concatenated LSB stream. Raises ValueError
-        on failure.
+        on failure. Header is read first (144 bits, tiny); the full frame
+        is then streamed via :meth:`LsbCodec.extract_stream` so large
+        payloads never materialize the ~8x bit-expanded array.
         """
         head = LsbCodec.extract_bitarray(raws[0], lsb_planes, PayloadFrame.HEADER_LEN * 8)
         header = np.packbits(head).tobytes()
         if key:
-            header = bytes(
-                b ^ k for b, k in zip(header, PayloadFrame._keystream(key, len(header)))
-            )
+            header = PayloadFrame._xor_data(header, key)
         if header[:4] != PayloadFrame.MAGIC:
             raise ValueError("no magic")
         (pay_len,) = struct.unpack(">Q", header[6:14])
         total_bits = (PayloadFrame.HEADER_LEN + pay_len) * 8
         if pay_len > max_bytes:
             raise ValueError("declared payload exceeds max_bytes limit")
-        parts: list[np.ndarray] = []
-        remaining = total_bits
-        for raw in raws:
-            take = min(raw.size * lsb_planes, remaining)
-            parts.append(LsbCodec.extract_bitarray(raw, lsb_planes, take))
-            remaining -= take
-            if remaining <= 0:
-                break
-        if remaining > 0:
+        total_slots = sum(int(raw.size) * lsb_planes for raw in raws)
+        if total_bits > total_slots:
             raise ValueError("declared payload exceeds image capacity")
-        stream = np.packbits(np.concatenate(parts)).tobytes()
+        stream = LsbCodec.extract_stream(raws, lsb_planes, total_bits)
         payload, _ = PayloadFrame.unpack(stream, key)
         return payload
 
