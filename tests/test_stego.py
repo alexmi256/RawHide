@@ -1,80 +1,82 @@
-"""Roundtrip tests for stego_dng (no sample images required)."""
+"""Roundtrip tests for stego_dng (pytest format, no sample images required)."""
 
+import glob
 import io
 import os
+import shutil
+import struct
+import subprocess
 import sys
-import tempfile
+import time
 from urllib.error import URLError
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import stego_dng
 from stegodng.thumbnails import ThumbnailError, ThumbnailProvider
 
+STEGO_SCRIPT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "stego_dng.py",
+)
 
-def _tmp(name):
-    return os.path.join(tempfile.mkdtemp(), name)
 
-
-def test_linear_roundtrip():
+def test_linear_roundtrip(tmp_path):
     payload = os.urandom(4096)
-    out = _tmp("linear.dng")
+    out = str(tmp_path / "linear.dng")
     info = stego_dng.encode(payload, out, width=512, height=384, seed=11,
                             thumbnail="synthetic")
     assert info["payload_len"] == len(payload)
     assert stego_dng.decode(out) == payload
 
 
-def test_cfa_keyed_roundtrip():
+def test_cfa_keyed_roundtrip(tmp_path):
     payload = b"hello raw world" * 10
-    out = _tmp("cfa.dng")
+    out = str(tmp_path / "cfa.dng")
     stego_dng.encode(
         payload, out, width=320, height=240, seed=12, mode="cfa",
         key=b"passphrase",
-    thumbnail="synthetic",
+        thumbnail="synthetic",
     )
     assert stego_dng.decode(out, key=b"passphrase") == payload
 
 
-def test_wrong_key_fails():
-    out = _tmp("keyed.dng")
+def test_wrong_key_fails(tmp_path):
+    out = str(tmp_path / "keyed.dng")
     stego_dng.encode(b"secret", out, width=320, height=240, seed=13,
                      key=b"right", thumbnail="synthetic")
-    try:
+    with pytest.raises(ValueError):
         stego_dng.decode(out, key=b"wrong")
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("decode with wrong key should fail")
 
 
-def test_two_planes_14bit():
+def test_two_planes_14bit(tmp_path):
     payload = os.urandom(20000)
-    out = _tmp("p14.dng")
+    out = str(tmp_path / "p14.dng")
     stego_dng.encode(payload, out, width=512, height=384, seed=14,
                      lsb_planes=2, bit_depth=14, thumbnail="synthetic")
     assert stego_dng.decode(out, lsb_planes=2) == payload
 
 
-def test_all_bit_depths_roundtrip():
+def test_all_bit_depths_roundtrip(tmp_path):
     payload = os.urandom(2048)
     for bit_depth in stego_dng.SUPPORTED_BIT_DEPTHS:
         for mode in ("linear", "cfa"):
-            out = _tmp(f"bd{bit_depth}_{mode}.dng")
+            out = str(tmp_path / f"bd{bit_depth}_{mode}.dng")
             info = stego_dng.encode(
                 payload, out, width=512, height=384, seed=21,
                 bit_depth=bit_depth, mode=mode,
-            thumbnail="synthetic",
+                thumbnail="synthetic",
             )
             assert info["bit_depth"] == bit_depth, (bit_depth, mode)
             assert stego_dng.decode(out) == payload, (bit_depth, mode)
 
 
-def test_packed_bps_and_levels():
+def test_packed_bps_and_levels(tmp_path):
     import tifffile
-    out = _tmp("bps12.dng")
+    out = str(tmp_path / "bps12.dng")
     stego_dng.encode(b"z" * 100, out, width=256, height=192, seed=22,
                      bit_depth=12, thumbnail="synthetic")
     with tifffile.TiffFile(out) as tif:
@@ -87,29 +89,25 @@ def test_packed_bps_and_levels():
         assert tuple(raw_pg.tags[50714].value) == (16, 16, 16)
 
 
-def test_four_planes_roundtrip():
+def test_four_planes_roundtrip(tmp_path):
     payload = os.urandom(30000)
-    out = _tmp("p4.dng")
+    out = str(tmp_path / "p4.dng")
     stego_dng.encode(payload, out, width=512, height=384, seed=23,
                      lsb_planes=4, thumbnail="synthetic")
     assert stego_dng.decode(out, lsb_planes=4) == payload
 
 
-def test_packed_depth_rejects_deflate():
-    try:
-        stego_dng.encode(b"z" * 100, _tmp("bad.dng"), width=256,
+def test_packed_depth_rejects_deflate(tmp_path):
+    with pytest.raises(ValueError):
+        stego_dng.encode(b"z" * 100, str(tmp_path / "bad.dng"), width=256,
                          height=192, seed=24, bit_depth=12,
                          compression="adobe_deflate", thumbnail="synthetic")
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("packed depth + deflate should be rejected")
 
 
-def test_metadata_differs_per_seed():
+def test_metadata_differs_per_seed(tmp_path):
     p = b"x"
-    a = _tmp("a.dng")
-    b = _tmp("b.dng")
+    a = str(tmp_path / "a.dng")
+    b = str(tmp_path / "b.dng")
     ia = stego_dng.encode(p, a, width=256, height=192, seed=1, thumbnail="synthetic")
     ib = stego_dng.encode(p, b, width=256, height=192, seed=2, thumbnail="synthetic")
     assert ia["metadata"]["datetime"] != ib["metadata"]["datetime"]
@@ -121,14 +119,10 @@ def test_capacity():
     assert stego_dng.capacity_bytes(n, 1) == n // 8 - stego_dng.HEADER_LEN
 
 
-def test_oversize_rejected():
-    try:
-        stego_dng.encode(b"y" * 100000, _tmp("big.dng"),
+def test_oversize_rejected(tmp_path):
+    with pytest.raises(ValueError):
+        stego_dng.encode(b"y" * 100000, str(tmp_path / "big.dng"),
                          width=64, height=64, seed=1, thumbnail="synthetic")
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("oversize payload should be rejected")
 
 
 def test_auto_config_defaults():
@@ -157,47 +151,38 @@ def test_auto_config_fixed_dims_bumps_planes():
 
 def test_auto_config_too_big_reports_max():
     mx = stego_dng.capacity_bytes(23296 * 17472 * 3,
-                                    stego_dng.MAX_LSB_PLANES)
-    try:
+                                  stego_dng.MAX_LSB_PLANES)
+    with pytest.raises(ValueError) as excinfo:
         stego_dng.recommend_config(mx + 1)
-    except ValueError as exc:
-        assert stego_dng._kb_lo(mx) in str(exc) and "KB" in str(exc)
-        assert "bytes" not in str(exc) and "Split the input" in str(exc)
-    else:
-        raise AssertionError("oversize auto-config should fail")
+    assert stego_dng._kb_lo(mx) in str(excinfo.value) and "KB" in str(excinfo.value)
+    assert "bytes" not in str(excinfo.value) and "Split the input" in str(excinfo.value)
 
 
-def test_decode_autodetects_planes():
+def test_decode_autodetects_planes(tmp_path):
     payload = os.urandom(20000)
-    out = _tmp("autodet.dng")
+    out = str(tmp_path / "autodet.dng")
     stego_dng.encode(payload, out, width=512, height=384, seed=31,
                      lsb_planes=3, thumbnail="synthetic")
     assert stego_dng.decode(out) == payload  # no planes given
     assert stego_dng.decode(out, lsb_planes=3) == payload  # strict
-    try:
+    with pytest.raises(ValueError):
         stego_dng.decode(out, lsb_planes=1)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("strict wrong-plane decode should fail")
 
 
-def test_cli_auto_encode_roundtrip():
-    import subprocess
-    d = tempfile.mkdtemp()
-    src_p = os.path.join(d, "in.bin")
-    enc = os.path.join(d, "auto.dng")
-    rec = os.path.join(d, "out.bin")
+def test_cli_auto_encode_roundtrip(tmp_path):
+    src_p = str(tmp_path / "in.bin")
+    enc = str(tmp_path / "auto.dng")
+    rec = str(tmp_path / "out.bin")
     with open(src_p, "wb") as f:
         f.write(os.urandom(3000))
     r = subprocess.run(
-        [sys.executable, "stego_dng.py", "encode", "-i", src_p, "-o", enc,
+        [sys.executable, STEGO_SCRIPT, "encode", "-i", src_p, "-o", enc,
          "--seed", "5", "--thumbnail", "synthetic"],
         capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     assert "auto-config" in r.stdout
     r = subprocess.run(
-        [sys.executable, "stego_dng.py", "decode", "-i", enc, "-o", rec],
+        [sys.executable, STEGO_SCRIPT, "decode", "-i", enc, "-o", rec],
         capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     with open(src_p, "rb") as f1, open(rec, "rb") as f2:
@@ -220,67 +205,63 @@ def test_auto_size_exact_fit():
 def test_auto_size_floor_and_conflict():
     cfg = stego_dng.recommend_config(100, auto_size=True)
     assert (cfg["width"], cfg["height"]) == (64, 48)
-    try:
+    with pytest.raises(ValueError):
         stego_dng.recommend_config(100, width=100, auto_size=True)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("--auto-size + --width should fail")
 
 
-def test_auto_size_roundtrip_is_smaller():
-    import subprocess
-    d = tempfile.mkdtemp()
-    src_p = os.path.join(d, "in.bin")
-    auto_p = os.path.join(d, "auto.dng")
-    pre_p = os.path.join(d, "pre.dng")
-    rec = os.path.join(d, "out.bin")
+def test_auto_size_roundtrip_is_smaller(tmp_path):
+    src_p = str(tmp_path / "in.bin")
+    auto_p = str(tmp_path / "auto.dng")
+    pre_p = str(tmp_path / "pre.dng")
+    rec = str(tmp_path / "out.bin")
     with open(src_p, "wb") as f:
         f.write(os.urandom(60000))
     r = subprocess.run(
-        [sys.executable, "stego_dng.py", "encode", "-i", src_p,
+        [sys.executable, STEGO_SCRIPT, "encode", "-i", src_p,
          "-o", auto_p, "--seed", "5", "--auto-size",
          "--thumbnail", "synthetic"],
         capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     assert "warning: --auto-size chose non-standard dimensions" in r.stdout
     r = subprocess.run(
-        [sys.executable, "stego_dng.py", "encode", "-i", src_p,
+        [sys.executable, STEGO_SCRIPT, "encode", "-i", src_p,
          "-o", pre_p, "--seed", "5", "--thumbnail", "synthetic"],
         capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     assert os.path.getsize(auto_p) < os.path.getsize(pre_p) // 4
     r = subprocess.run(
-        [sys.executable, "stego_dng.py", "decode", "-i", auto_p, "-o", rec],
+        [sys.executable, STEGO_SCRIPT, "decode", "-i", auto_p, "-o", rec],
         capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     with open(src_p, "rb") as f1, open(rec, "rb") as f2:
         assert f1.read() == f2.read()
 
 
-def test_messages_use_kilobytes():
-    import subprocess
-    d = tempfile.mkdtemp()
-    src_p = os.path.join(d, "in.bin")
-    enc = os.path.join(d, "o.dng")
+def test_messages_use_kilobytes(tmp_path):
+    src_p = str(tmp_path / "in.bin")
+    enc = str(tmp_path / "o.dng")
     with open(src_p, "wb") as f:
         f.write(os.urandom(3000))
     r = subprocess.run(
-        [sys.executable, "stego_dng.py", "encode", "-i", src_p, "-o", enc,
+        [sys.executable, STEGO_SCRIPT, "encode", "-i", src_p, "-o", enc,
          "--seed", "5", "--width", "512", "--height", "384",
          "--thumbnail", "synthetic"],
         capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
-    assert "KB" in r.stdout and "bytes" not in r.stdout
+    # NOTE: tmp_path itself contains the test name ("...kilobytes..."),
+    # which includes the substring "bytes" and is echoed in the
+    # "thumbnail:" path line -- strip paths before checking size units.
+    scrubbed = r.stdout.replace(str(tmp_path), "")
+    assert "KB" in scrubbed and "bytes" not in scrubbed
     r = subprocess.run(
-        [sys.executable, "stego_dng.py", "capacity"],
+        [sys.executable, STEGO_SCRIPT, "capacity"],
         capture_output=True, text=True)
     assert "KB" in r.stdout and "bytes" not in r.stdout
 
 
-def test_sixteen_planes_full_replace():
+def test_sixteen_planes_full_replace(tmp_path):
     payload = os.urandom(5000)
-    out = _tmp("p16.dng")
+    out = str(tmp_path / "p16.dng")
     info = stego_dng.encode(payload, out, width=256, height=192, seed=41,
                             lsb_planes=16, thumbnail="synthetic")
     assert info["lsb_planes"] == 16
@@ -289,20 +270,16 @@ def test_sixteen_planes_full_replace():
     for kw in ({"lsb_planes": 17},
                {"lsb_planes": 16, "bit_depth": 14},
                {"lsb_planes": 9, "bit_depth": 8}):
-        try:
-            stego_dng.encode(b"z", _tmp("bad.dng"), width=64, height=64,
+        with pytest.raises(ValueError):
+            stego_dng.encode(b"z", str(tmp_path / "bad.dng"), width=64, height=64,
                              seed=41, **kw, thumbnail="synthetic")
-        except ValueError:
-            pass
-        else:
-            raise AssertionError(f"should reject {kw}")
 
 
-def test_frames_striped_roundtrip():
+def test_frames_striped_roundtrip(tmp_path):
     import tifffile
     c1 = stego_dng.capacity_bytes(256 * 192 * 3, 1)
     payload = os.urandom(int(c1 + 3000))  # forces striping over frame 2
-    out = _tmp("f3.dng")
+    out = str(tmp_path / "f3.dng")
     info = stego_dng.encode(payload, out, width=256, height=192, seed=42,
                             frames=3, thumbnail="synthetic")
     assert info["frames"] == 3
@@ -313,13 +290,9 @@ def test_frames_striped_roundtrip():
         subifds = tif.pages[0].tags[330].value
         assert len(subifds) == 3, subifds
     assert stego_dng.decode(out) == payload
-    try:
-        stego_dng.encode(b"z", _tmp("bad.dng"), width=64, height=64,
+    with pytest.raises(ValueError):
+        stego_dng.encode(b"z", str(tmp_path / "bad.dng"), width=64, height=64,
                          seed=42, frames=9, thumbnail="synthetic")
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("frames=9 should be rejected")
 
 
 def test_frames_multiplier_in_recommend():
@@ -329,7 +302,7 @@ def test_frames_multiplier_in_recommend():
         2048 * 1536 * 3, 1, 3) and b["frames"] == 3
 
 
-def test_bigtiff_patch_and_append():
+def test_bigtiff_patch_and_append(tmp_path):
     import numpy as np
     import tifffile
     rng = np.random.default_rng(0)
@@ -337,7 +310,7 @@ def test_bigtiff_patch_and_append():
                                  .astype(np.uint8))
     raw = np.ascontiguousarray(rng.integers(0, 65535, size=(64, 80, 3))
                                .astype(np.uint16))
-    p = _tmp("bt.dng")
+    p = str(tmp_path / "bt.dng")
     with tifffile.TiffFile(p, mode="w") if False else tifffile.TiffWriter(
             p, bigtiff=True) as tif:
         tif.write(thumb, photometric="ycbcr", compression="jpeg",
@@ -359,7 +332,6 @@ def test_bigtiff_patch_and_append():
     data = bytearray(open(p, "rb").read())
     subs = stego_dng._subifd_offsets(data, stego_dng._ifd0_offset(data))
     assert len(subs) == 2
-    import struct
     for s in subs:
         e2 = stego_dng._find_ifd_entry(data, s, 262)
         _, _, vptr = stego_dng._entry_value_ptr(data, e2)
@@ -386,16 +358,14 @@ def test_risk_warnings():
     assert any("12-bit" in line for line in w)
 
 
-def test_cli_frames_warnings_and_roundtrip():
-    import subprocess
-    d = tempfile.mkdtemp()
-    src_p = os.path.join(d, "in.bin")
-    enc = os.path.join(d, "f.dng")
-    rec = os.path.join(d, "out.bin")
+def test_cli_frames_warnings_and_roundtrip(tmp_path):
+    src_p = str(tmp_path / "in.bin")
+    enc = str(tmp_path / "f.dng")
+    rec = str(tmp_path / "out.bin")
     with open(src_p, "wb") as f:
         f.write(os.urandom(20000))
     r = subprocess.run(
-        [sys.executable, "stego_dng.py", "encode", "-i", src_p, "-o", enc,
+        [sys.executable, STEGO_SCRIPT, "encode", "-i", src_p, "-o", enc,
          "--seed", "5", "--width", "512", "--height", "384",
          "--thumbnail", "synthetic",
          "--lsb-planes", "6", "--raw-frames", "2"],
@@ -404,7 +374,7 @@ def test_cli_frames_warnings_and_roundtrip():
     assert "warning: 6 LSB planes" in r.stdout
     assert "warning: 2 full-resolution raw frames" in r.stdout
     r = subprocess.run(
-        [sys.executable, "stego_dng.py", "decode", "-i", enc, "-o", rec],
+        [sys.executable, STEGO_SCRIPT, "decode", "-i", enc, "-o", rec],
         capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     with open(src_p, "rb") as f1, open(rec, "rb") as f2:
@@ -430,12 +400,8 @@ def test_package_class_apis():
     # framing roundtrip incl. keyed + tamper detection
     f = PayloadFrame.pack(b"abc", key=b"k")
     assert PayloadFrame.unpack(f, key=b"k")[0] == b"abc"
-    try:
+    with pytest.raises(ValueError):
         PayloadFrame.unpack(f, key=b"wrong")
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("wrong key should fail")
     # metadata + cover + codec units
     m1 = MetadataRandomizer(7).randomize()
     assert MetadataRandomizer(7).randomize() == m1  # deterministic
@@ -450,11 +416,11 @@ def test_package_class_apis():
     assert AutoSizer().recommend(1000)["preset"] == "demo"
 
 
-def test_package_end_to_end_and_container():
+def test_package_end_to_end_and_container(tmp_path):
     import tifffile
     from stegodng import DngContainer, DngStego
     payload = os.urandom(3000)
-    out = _tmp("pkg.dng")
+    out = str(tmp_path / "pkg.dng")
     stego = DngStego()
     info = stego.encode(payload, out, width=512, height=384, seed=8,
                         lsb_planes=2, frames=2, thumbnail="synthetic")
@@ -465,7 +431,7 @@ def test_package_end_to_end_and_container():
     assert len(cont.exif()) == 43
     with tifffile.TiffFile(out) as tif:
         assert len(tif.pages[0].tags[330].value) == 2
-    assert DngStego().generate_tiff(_tmp("c.tif"), width=64, height=48,
+    assert DngStego().generate_tiff(str(tmp_path / "c.tif"), width=64, height=48,
                                     seed=8).endswith(".tif")
 
 
@@ -495,7 +461,7 @@ def test_shim_delegates_to_package():
 
 
 def _thumb_bytes(width=800, height=600, color=(10, 120, 200),
-                   fmt="JPEG", mode="RGB"):
+                 fmt="JPEG", mode="RGB"):
     from PIL import Image
     buf = io.BytesIO()
     Image.new(mode, (width, height), color).save(buf, format=fmt)
@@ -528,17 +494,12 @@ def test_thumbnail_prepare_aspect_and_size():
                         mode="RGBA")
     c = prepare(rgba, 100, 100)
     assert c.shape == (100, 100, 3)
-    try:
+    with pytest.raises(ThumbnailError):
         prepare(b"not-an-image", 64, 48)
-    except ThumbnailError:
-        pass
-    else:
-        raise AssertionError("corrupt bytes should fail")
 
 
 def test_thumbnail_random_with_fake_opener():
-    from stegodng.thumbnails import ThumbnailError, ThumbnailProvider
-    from urllib.error import URLError
+    from stegodng.thumbnails import ThumbnailProvider
     photo = _thumb_bytes(900, 700, fmt="PNG")
     p = ThumbnailProvider(seed=2,
                           opener=_fake_opener_factory(photo))
@@ -562,36 +523,26 @@ def test_thumbnail_random_with_fake_opener():
         seed=2, max_attempts=1, opener=svg_opener).get(64, 48)
     assert label3 == "synthetic-noise-fallback"
     # unknown source names are errors, not silent network fetches
-    try:
+    with pytest.raises(ThumbnailError):
         ThumbnailProvider(seed=2).get(64, 48, source="typo")
-    except ThumbnailError:
-        pass
-    else:
-        raise AssertionError("unknown source should fail")
 
 
-def test_thumbnail_file_source():
-    from stegodng.thumbnails import ThumbnailError, ThumbnailProvider
-    png = _tmp("pic.png")
+def test_thumbnail_file_source(tmp_path):
+    from stegodng.thumbnails import ThumbnailProvider
+    png = str(tmp_path / "pic.png")
     with open(png, "wb") as f:
         f.write(_thumb_bytes(500, 500, fmt="PNG"))
     arr, label = ThumbnailProvider(seed=2).get(100, 100, source=png)
     assert arr.shape == (100, 100, 3) and label == f"file:{png}"
-    try:
+    with pytest.raises(ThumbnailError):
         ThumbnailProvider(seed=2).get(100, 100, source=png + ".missing")
-    except ThumbnailError:
-        pass
-    else:
-        raise AssertionError("missing file source should fail")
 
 
-def test_cli_thumbnail_variants():
-    import subprocess
-    d = tempfile.mkdtemp()
-    src_p = os.path.join(d, "in.bin")
-    png = os.path.join(d, "thumb.png")
-    enc = os.path.join(d, "o.dng")
-    rec = os.path.join(d, "out.bin")
+def test_cli_thumbnail_variants(tmp_path):
+    src_p = str(tmp_path / "in.bin")
+    png = str(tmp_path / "thumb.png")
+    enc = str(tmp_path / "o.dng")
+    rec = str(tmp_path / "out.bin")
     with open(src_p, "wb") as f:
         f.write(os.urandom(2000))
     with open(png, "wb") as f:
@@ -599,13 +550,13 @@ def test_cli_thumbnail_variants():
     for extra in (["--thumbnail", "synthetic"],
                   ["--thumbnail", png]):
         r = subprocess.run(
-            [sys.executable, "stego_dng.py", "encode", "-i", src_p,
+            [sys.executable, STEGO_SCRIPT, "encode", "-i", src_p,
              "-o", enc, "--seed", "5", "--width", "256", "--height", "192"]
             + extra, capture_output=True, text=True)
         assert r.returncode == 0, r.stderr
         assert "thumbnail: " in r.stdout
         r = subprocess.run(
-            [sys.executable, "stego_dng.py", "decode", "-i", enc, "-o", rec],
+            [sys.executable, STEGO_SCRIPT, "decode", "-i", enc, "-o", rec],
             capture_output=True, text=True)
         assert r.returncode == 0, r.stderr
         with open(src_p, "rb") as f1, open(rec, "rb") as f2:
@@ -624,14 +575,14 @@ def test_cli_thumbnail_variants():
     assert im.size == (256, 192), im.size
 
 
-def test_thumbnail_ycbcr_colors_correct():
+def test_thumbnail_ycbcr_colors_correct(tmp_path):
     # Regression: YCbCr-tagged IFD0 must decode with faithful colors
     # (tifffile stores the planes verbatim, so RGB input came out swapped).
     import tifffile
     from PIL import Image
-    red = _tmp("red.png")
+    red = str(tmp_path / "red.png")
     Image.new("RGB", (300, 200), (255, 0, 0)).save(red)
-    out = _tmp("redthumb.dng")
+    out = str(tmp_path / "redthumb.dng")
     stego_dng.encode(b"payload-123", out, width=256, height=192, seed=1,
                      thumbnail=red)
     with tifffile.TiffFile(out) as tif:
@@ -660,12 +611,8 @@ def test_split_size_parsing():
     assert parse_size("1.5m") == int(1.5 * 1024 ** 2)
     assert parse_size("1024") == 1024
     for bad in ("", "abc", "10x", "0", "-5m"):
-        try:
+        with pytest.raises(ValueError):
             parse_size(bad)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError(f"should reject {bad!r}")
 
 
 def test_split_naming_and_parsing():
@@ -677,11 +624,10 @@ def test_split_naming_and_parsing():
     assert parse_chunk_name("plain.dng") is None
 
 
-def _split_three(tmpname="sp.dng", **kw):
-    import glob
+def _split_three(tmp_path, tmpname="sp.dng", **kw):
     from stegodng import DngStego
     payload = os.urandom(60000)
-    d = tempfile.mkdtemp()
+    d = str(tmp_path)
     out = os.path.join(d, tmpname)
     infos = DngStego().encode_split(
         payload, out, 20000, width=512, height=384, seed=5,
@@ -695,9 +641,9 @@ def _split_three(tmpname="sp.dng", **kw):
     return payload, files
 
 
-def test_split_roundtrip_defaults():
+def test_split_roundtrip_defaults(tmp_path):
     import tifffile
-    payload, files = _split_three()
+    payload, files = _split_three(tmp_path)
     from stegodng import DngStego
     with tifffile.TiffFile(files[1]) as tif:
         ex = tif.pages[0].tags[34665].value
@@ -709,59 +655,42 @@ def test_split_roundtrip_defaults():
     assert DngStego().decode(list(reversed(files))) == payload  # order-free
 
 
-def test_split_rename_uuid_ordering():
-    import shutil
+def test_split_rename_uuid_ordering(tmp_path):
     from stegodng import DngStego
-    payload, files = _split_three()
-    d = tempfile.mkdtemp()
+    payload, files = _split_three(tmp_path)
+    d = tmp_path / "renamed"
+    d.mkdir()
     renamed = []
     for src, name in zip(files, ["zeta.dng", "alpha.dng", "mid.dng"]):
-        dst = os.path.join(d, name)
+        dst = str(d / name)
         shutil.copy(src, dst)
         renamed.append(dst)
     assert DngStego().decode(renamed) == payload
 
 
-def test_split_gap_start_mixed_errors():
+def test_split_gap_start_mixed_errors(tmp_path):
     from stegodng import DngStego
-    payload, files = _split_three()
-    try:
+    payload, files = _split_three(tmp_path)
+    with pytest.raises(ValueError) as excinfo:
         DngStego().decode([files[0], files[2]])
-    except ValueError as exc:
-        assert "0002" in str(exc) and "consecutive" in str(exc)
-    else:
-        raise AssertionError("gap should fail")
-    try:
+    assert "0002" in str(excinfo.value) and "consecutive" in str(excinfo.value)
+    with pytest.raises(ValueError, match="0001"):
         DngStego().decode(files[1:])
-    except ValueError as exc:
-        assert "0001" in str(exc)
-    else:
-        raise AssertionError("start-at-0002 should fail")
     # mixed with a plain non-split file
-    plain = os.path.join(tempfile.mkdtemp(), "plain.dng")
+    plain = str(tmp_path / "plain.dng")
     DngStego().encode(b"x", plain, width=256, height=192, seed=5,
                       thumbnail="synthetic")
-    try:
+    with pytest.raises(ValueError, match="inconsistent"):
         DngStego().decode([files[0], plain])
-    except ValueError as exc:
-        assert "inconsistent" in str(exc)
-    else:
-        raise AssertionError("mixed set should fail")
     # not chunks at all
-    try:
+    with pytest.raises(ValueError, match="4-digit"):
         DngStego().decode([plain, plain])
-    except ValueError as exc:
-        assert "4-digit" in str(exc)
-    else:
-        raise AssertionError("non-chunks should fail")
 
 
-def test_split_none_none_filename_path():
-    import glob
-    import shutil
+def test_split_none_none_filename_path(tmp_path):
     from stegodng import DngStego
     payload = os.urandom(60000)
-    d = tempfile.mkdtemp()
+    d = str(tmp_path)
     infos = DngStego().encode_split(
         payload, os.path.join(d, "nn.dng"), 20000, width=512, height=384,
         seed=5, thumbnail="synthetic", split_id_field="none",
@@ -772,37 +701,28 @@ def test_split_none_none_filename_path():
     renamed = [os.path.join(d, n) for n in ("a.dng", "b.dng", "c.dng")]
     for src, dst in zip(files, renamed):
         shutil.copy(src, dst)
-    try:
+    with pytest.raises(ValueError, match="4-digit"):
         DngStego().decode(renamed)
-    except ValueError as exc:
-        assert "4-digit" in str(exc)
-    else:
-        raise AssertionError("renamed marker-less files should fail")
 
 
-def test_split_pagenumber_total_enforced():
-    import glob
+def test_split_pagenumber_total_enforced(tmp_path):
     from stegodng import DngStego
     payload = os.urandom(50000)
-    d = tempfile.mkdtemp()
+    d = str(tmp_path)
     DngStego().encode_split(
         payload, os.path.join(d, "pn.dng"), 20000, width=512, height=384,
         seed=5, thumbnail="synthetic", split_id="uid7",
         split_seq_field="PageNumber")
     files = sorted(glob.glob(os.path.join(d, "pn0*.dng")))
     assert DngStego().decode(files, split_seq_field="PageNumber") == payload
-    try:
+    with pytest.raises(ValueError) as excinfo:
         DngStego().decode(files[:2], split_seq_field="PageNumber")
-    except ValueError as exc:
-        assert "0003" in str(exc) and "total" in str(exc)
-    else:
-        raise AssertionError("subset should fail on total")
+    assert "0003" in str(excinfo.value) and "total" in str(excinfo.value)
 
 
-def test_split_single_chunk_plain_and_warning():
-    import warnings
+def test_split_single_chunk_plain_and_warning(tmp_path):
     from stegodng import DngStego
-    d = tempfile.mkdtemp()
+    d = str(tmp_path)
     infos = DngStego().encode_split(
         b"tiny", os.path.join(d, "one.dng"), 100000, width=256, height=192,
         seed=5, thumbnail="synthetic")
@@ -810,68 +730,53 @@ def test_split_single_chunk_plain_and_warning():
     assert "chunk_seq" not in infos[0]
     assert DngStego().decode(infos[0]["path"]) == b"tiny"
     # lone chunk file warns about partial data
-    _, files = _split_three()
-    with warnings.catch_warnings(record=True) as rec:
-        warnings.simplefilter("always")
+    _, files = _split_three(tmp_path, tmpname="sp2.dng")
+    with pytest.warns(UserWarning, match="partial"):
         part = DngStego().decode(files[0])
-    assert len(part) < 60000 and any("partial" in str(w.message) for w in rec)
+    assert len(part) < 60000
 
 
-def test_split_field_validation():
+def test_split_field_validation(tmp_path):
     from stegodng import DngStego
     for kw in ({"split_id_field": "Nope"},
                {"split_seq_field": "Nope"},
                {"split_id_field": "ImageDescription",
                 "split_seq_field": "ImageDescription"}):
-        try:
+        with pytest.raises(ValueError):
             DngStego().encode_split(
-                b"z" * 100, _tmp("v.dng"), 50, width=256, height=192,
+                b"z" * 100, str(tmp_path / "v.dng"), 50, width=256, height=192,
                 seed=5, thumbnail="synthetic", **kw)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError(f"should reject {kw}")
-    try:
+    with pytest.raises(ValueError):
         DngStego().encode_split(
-            b"z", _tmp("v.dng"), 0, width=256, height=192, seed=5,
+            b"z", str(tmp_path / "v.dng"), 0, width=256, height=192, seed=5,
             thumbnail="synthetic")
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("split_size=0 should fail")
 
 
-def test_split_partial_markers_error():
+def test_split_partial_markers_error(tmp_path):
     # Every file has a UUID but no sequence: precise error, not generic mix.
     from stegodng import DngStego
     payload = os.urandom(40000)
-    d = tempfile.mkdtemp()
+    d = str(tmp_path)
     infos = DngStego().encode_split(
         payload, os.path.join(d, "pm.dng"), 20000, width=512, height=384,
         seed=5, thumbnail="synthetic", split_id="partialset",
         split_seq_field="ImageDescription")
     files = [i["path"] for i in infos]
-    try:
+    with pytest.raises(ValueError, match="none carries sequence markers"):
         DngStego().decode(files)
-    except ValueError as exc:
-        assert "none carries sequence markers" in str(exc)
-    else:
-        raise AssertionError("uuid-only set should fail clearly")
     # ... but decodes once told the right seq field
     assert DngStego().decode(
         files, split_seq_field="ImageDescription") == payload
 
 
-def test_cli_split_roundtrip():
-    import subprocess
-    d = tempfile.mkdtemp()
-    src_p = os.path.join(d, "in.bin")
-    enc = os.path.join(d, "out.dng")
-    rec = os.path.join(d, "back.bin")
+def test_cli_split_roundtrip(tmp_path):
+    src_p = str(tmp_path / "in.bin")
+    enc = str(tmp_path / "out.dng")
+    rec = str(tmp_path / "back.bin")
     with open(src_p, "wb") as f:
         f.write(os.urandom(50000))
     r = subprocess.run(
-        [sys.executable, "stego_dng.py", "encode", "-i", src_p, "-o", enc,
+        [sys.executable, STEGO_SCRIPT, "encode", "-i", src_p, "-o", enc,
          "--seed", "5", "--width", "512", "--height", "384",
          "--thumbnail", "synthetic", "--split-file", "20k",
          "--key", "pw"],
@@ -879,28 +784,27 @@ def test_cli_split_roundtrip():
     assert r.returncode == 0, r.stderr
     assert "chunk 1/3" in r.stdout and "chunk 3/3" in r.stdout
     assert "bytes" not in r.stdout
-    import glob as _glob
-    files = sorted(_glob.glob(os.path.join(d, "out0*.dng")))
+    files = sorted(glob.glob(os.path.join(str(tmp_path), "out0*.dng")))
     assert len(files) == 3
     r = subprocess.run(
-        [sys.executable, "stego_dng.py", "decode", "-i"] + files +
+        [sys.executable, STEGO_SCRIPT, "decode", "-i"] + files +
         ["-o", rec, "--key", "pw"], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     with open(src_p, "rb") as f1, open(rec, "rb") as f2:
         assert f1.read() == f2.read()
     # gap via CLI
     r = subprocess.run(
-        [sys.executable, "stego_dng.py", "decode", "-i", files[0], files[2],
+        [sys.executable, STEGO_SCRIPT, "decode", "-i", files[0], files[2],
          "-o", rec], capture_output=True, text=True)
     assert r.returncode == 1 and "0002" in r.stderr
 
 
-def test_split_imagenumber_fail_open_pinned():
+def test_split_imagenumber_fail_open_pinned(tmp_path):
     # ImageNumber carries no total: a consecutive-from-0001 subset
     # decodes WITHOUT error (fail-open). Use PageNumber to fail closed.
     from stegodng import DngStego
     payload = os.urandom(60000)
-    d = tempfile.mkdtemp()
+    d = str(tmp_path)
     infos = DngStego().encode_split(
         payload, os.path.join(d, "sp.dng"), 20000, width=512, height=384,
         seed=5, thumbnail="synthetic", split_id="failopen")
@@ -910,7 +814,6 @@ def test_split_imagenumber_fail_open_pinned():
 
 
 def test_auto_size_large_fast():
-    import time
     from stegodng.sizing import recommend
     t = time.time()
     cfg = recommend(200_000_000, auto_size=True)
@@ -920,12 +823,12 @@ def test_auto_size_large_fast():
     assert dt < 1.0, dt
 
 
-def test_split_frames_striped_roundtrip():
+def test_split_frames_striped_roundtrip(tmp_path):
     import tifffile
     from stegodng import DngStego
     c1 = stego_dng.capacity_bytes_total(256 * 192 * 3, 1, 2)
     payload = os.urandom(int(c1 + 3000))  # forces striping over chunk 2
-    d = tempfile.mkdtemp()
+    d = str(tmp_path)
     infos = DngStego().encode_split(
         payload, os.path.join(d, "sf.dng"), int(c1), width=256, height=192,
         seed=5, thumbnail="synthetic", frames=2, split_id="framed")
@@ -937,7 +840,7 @@ def test_split_frames_striped_roundtrip():
     assert DngStego().decode(files) == payload
 
 
-def test_split_offline_thumbs_differ():
+def test_split_offline_thumbs_differ(tmp_path):
     import tifffile
     from stegodng import DngStego
     import stegodng.stego as stego_mod
@@ -951,7 +854,7 @@ def test_split_offline_thumbs_differ():
     stego_mod.ThumbnailProvider = OfflineProvider
     try:
         payload = os.urandom(40000)
-        d = tempfile.mkdtemp()
+        d = str(tmp_path)
         infos = DngStego().encode_split(
             payload, os.path.join(d, "off.dng"), 20000, width=512,
             height=384, seed=None, thumbnail="random")
@@ -1008,23 +911,15 @@ def test_stripe_frames_overflow_raises():
     # Old code silently dropped bits past the cover slots; fail closed.
     from stegodng.codec import LsbCodec
     cover = np.zeros((8, 8, 3), dtype=np.uint16)
-    try:
+    with pytest.raises(ValueError):
         LsbCodec.stripe_frames([cover], b"\xff" * 10000, 1)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("oversize stripe_frames should raise")
 
 
 def test_extract_bitarray_oversize_raises():
     from stegodng.codec import LsbCodec
     raw = np.zeros((8, 8, 3), dtype=np.uint16)
-    try:
+    with pytest.raises(ValueError):
         LsbCodec.extract_bitarray(raw, 1, raw.size + 1)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("oversize extract_bitarray should raise")
 
 
 def test_keystream_range_equivalence():
@@ -1037,10 +932,10 @@ def test_keystream_range_equivalence():
     assert PayloadFrame._keystream_range(key, 10, 0) == b""
 
 
-def test_seek_vs_buffer_parity():
+def test_seek_vs_buffer_parity(tmp_path):
     import stego_dng
     from stegodng import container as C
-    out = _tmp("parity.dng")
+    out = str(tmp_path / "parity.dng")
     stego_dng.encode(b"parity-check", out, width=256, height=192, seed=9,
                      frames=2, thumbnail="synthetic")
     data = bytearray(open(out, "rb").read())
@@ -1060,8 +955,7 @@ def test_seek_vs_buffer_parity():
             assert C._seek_ifd_entry(f2, ifd0, 65000) is None
 
 
-def test_bigtiff_seek_helpers_synthetic():
-    import struct
+def test_bigtiff_seek_helpers_synthetic(tmp_path):
     from stegodng import container as C
 
     def blob(ifd0_off, entries, blobs):
@@ -1099,7 +993,7 @@ def test_bigtiff_seek_helpers_synthetic():
     assert C._tiff_is_bigtiff(data) and C._ifd0_offset(data) == ifd0
     assert C._subifd_offsets(data, ifd0) == [s1, s2]
     e = C._find_ifd_entry(data, ifd0, 330)
-    p = _tmp("syn_bt.dng")
+    p = str(tmp_path / "syn_bt.dng")
     with open(p, "wb") as f:
         f.write(data)
     with open(p, "rb") as f:
@@ -1116,14 +1010,14 @@ def test_bigtiff_seek_helpers_synthetic():
         [(330, 18, 1, struct.pack("<Q", s1b))],
         [subifd(2)])
     assert C._subifd_offsets(data2, ifd0) == [s1b]
-    p2 = _tmp("syn_bt_inline.dng")
+    p2 = str(tmp_path / "syn_bt_inline.dng")
     with open(p2, "wb") as f:
         f.write(data2)
     with open(p2, "rb") as f:
         assert C._seek_subifd_offsets(f, ifd0) == [s1b]
 
 
-def test_decode_max_bytes_opt_in():
+def test_decode_max_bytes_opt_in(tmp_path):
     # Regression: encode allows ~GB payloads but decode used to cap at
     # 256 MiB by default, so max-capacity files failed with
     # "declared payload exceeds max_bytes limit". The cap is now opt-in
@@ -1131,65 +1025,51 @@ def test_decode_max_bytes_opt_in():
     # closed with an actionable message.
     from stegodng import DngStego
     payload = os.urandom(5000)
-    out = _tmp("maxb.dng")
+    out = str(tmp_path / "maxb.dng")
     stego_dng.encode(payload, out, width=256, height=192, seed=51,
                      lsb_planes=2, thumbnail="synthetic")
     assert DngStego().decode(out) == payload  # default: no artificial cap
     assert DngStego().decode(out, max_bytes=10 * 1024 * 1024) == payload
-    try:
+    with pytest.raises(ValueError) as excinfo:
         DngStego().decode(out, max_bytes=100)
-    except ValueError as exc:
-        assert "max_bytes" in str(exc) and "--max-bytes" in str(exc)
-    else:
-        raise AssertionError("tiny max_bytes should fail")
+    assert "max_bytes" in str(excinfo.value) and "--max-bytes" in str(excinfo.value)
     # auto-detect must surface the limit error even when the payload is
     # not on the last probed plane (else it looks like wrong-key).
-    try:
+    with pytest.raises(ValueError) as excinfo:
         DngStego().decode(out, max_bytes=100)
-    except ValueError as exc:
-        assert "max_bytes" in str(exc) and "wrong key" not in str(exc)
-    else:
-        raise AssertionError("limit error should win over no-magic")
+    assert "max_bytes" in str(excinfo.value) and "wrong key" not in str(excinfo.value)
 
 
-def test_cli_max_bytes_flag():
-    import subprocess
-    d = tempfile.mkdtemp()
-    src_p = os.path.join(d, "in.bin")
-    enc = os.path.join(d, "o.dng")
-    rec = os.path.join(d, "out.bin")
+def test_cli_max_bytes_flag(tmp_path):
+    src_p = str(tmp_path / "in.bin")
+    enc = str(tmp_path / "o.dng")
+    rec = str(tmp_path / "out.bin")
     with open(src_p, "wb") as f:
         f.write(os.urandom(3000))
     r = subprocess.run(
-        [sys.executable, "stego_dng.py", "encode", "-i", src_p, "-o", enc,
+        [sys.executable, STEGO_SCRIPT, "encode", "-i", src_p, "-o", enc,
          "--seed", "5", "--width", "256", "--height", "192",
          "--thumbnail", "synthetic"],
         capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     r = subprocess.run(
-        [sys.executable, "stego_dng.py", "decode", "-i", enc, "-o", rec,
+        [sys.executable, STEGO_SCRIPT, "decode", "-i", enc, "-o", rec,
          "--max-bytes", "10m"],
         capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     with open(src_p, "rb") as f1, open(rec, "rb") as f2:
         assert f1.read() == f2.read()
     r = subprocess.run(
-        [sys.executable, "stego_dng.py", "decode", "-i", enc, "-o", rec,
+        [sys.executable, STEGO_SCRIPT, "decode", "-i", enc, "-o", rec,
          "--max-bytes", "1k"],
         capture_output=True, text=True)
     assert r.returncode == 1 and "max_bytes" in r.stderr
     r = subprocess.run(
-        [sys.executable, "stego_dng.py", "decode", "-i", enc, "-o", rec,
+        [sys.executable, STEGO_SCRIPT, "decode", "-i", enc, "-o", rec,
          "--max-bytes", "bogus"],
         capture_output=True, text=True)
     assert r.returncode == 1
 
 
 if __name__ == "__main__":
-
-    for name, fn in sorted(
-        [(k, v) for k, v in globals().items() if k.startswith("test_")]
-    ):
-        fn()
-        print(f"{name} ... ok")
-    print("all tests passed")
+    raise SystemExit(pytest.main([__file__, "-v"]))

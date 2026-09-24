@@ -10,9 +10,11 @@ randomization so a batch of files does not share identical fingerprints.
 
 ```bash
 pip install -r requirements.txt            # numpy, tifffile[all]
+pip install -r requirements-dev.txt        # pytest + pytest-cov (dev)
 python stego_dng.py encode -i secret.bin -o out.dng --seed 42
 python stego_dng.py decode -i out.dng -o recovered.bin
-python tests/test_stego.py                 # roundtrip tests
+pytest tests/ -q                           # roundtrip tests
+pytest tests/ -q --cov=stegodng --cov=stego_dng --cov-report=term-missing  # coverage
 ```
 
 ## 1. Research findings
@@ -394,7 +396,8 @@ Module layout:
   adobe_deflate` is only accepted with `--bit-depth 8/16` (full-width);
   packed depths always write uncompressed (still lossless → payload-safe).
 * `requirements.txt`: `numpy`, `tifffile[all]` (`rawpy` optional, decode
-  verification only).
+  verification only). Dev-only test deps (`pytest`, `pytest-cov`) live in
+  `requirements-dev.txt`.
 
 ## 5. Limitations / out of scope
 
