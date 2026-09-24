@@ -104,6 +104,11 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("--lsb-planes", type=int, default=None,
                    choices=tuple(range(1, MAX_LSB_PLANES + 1)),
                    help="LSB planes used at encode time (default: auto-detect)")
+    d.add_argument("--max-bytes", default=None, metavar="SIZE",
+                   help="safety cap on the accepted declared payload per file "
+                   "(e.g. 1g, 500m, 64KB, or bare count; default: image "
+                   "capacity, so any file this tool can encode also decodes; "
+                   "pass an explicit cap for untrusted files)")
     d.add_argument("--split-file-metadata-id", default="ImageUniqueID",
                    choices=tuple(sorted(SPLIT_ID_FIELDS) + ["none"]),
                    help="metadata field holding the shared chunk-set UUID "
@@ -239,10 +244,22 @@ def main(argv: list[str] | None = None) -> int:
               f"{info['metadata']['lens']} S/N {info['metadata']['camera_serial']}")
     elif args.cmd == "decode":
         try:
+            max_bytes = None
+            if args.max_bytes is not None:
+                try:
+                    max_bytes = parse_size(args.max_bytes)
+                except ValueError as exc:
+                    print(f"error: {exc}", file=sys.stderr)
+                    return 1
+                if max_bytes <= 0:
+                    print("error: --max-bytes must be a positive SIZE",
+                          file=sys.stderr)
+                    return 1
             payload = decode(
                 args.input,
                 key=args.key.encode() if args.key else None,
                 lsb_planes=args.lsb_planes,
+                max_bytes=max_bytes,
                 split_id_field=args.split_file_metadata_id,
                 split_seq_field=args.split_file_metadata_seq,
             )

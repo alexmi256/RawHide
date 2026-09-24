@@ -147,7 +147,7 @@ def _rand_serial(rng, prefix: str = "") -> str:
 
 
 def _decode_with_planes(raw, key: bytes | None, lsb_planes: int,
-                        max_bytes: int) -> bytes:
+                        max_bytes: int | None = None) -> bytes:
     """Original single-frame signature; the class takes frame lists."""
     return DngStego._decode_with_planes([raw], key, lsb_planes, max_bytes)
 
