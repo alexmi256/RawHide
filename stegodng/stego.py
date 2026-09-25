@@ -5,6 +5,7 @@ wrappers preserve the original single-file API.
 """
 from __future__ import annotations
 
+import itertools
 import os
 import random
 import struct
@@ -29,6 +30,7 @@ from .thumbnails import ThumbnailProvider
 from .split import (
     chunk_path,
     format_seq_value,
+    iter_chunk_bounds,
     new_split_id,
     parse_chunk_name,
     resolve_split_fields,
@@ -252,6 +254,9 @@ class DngStego:
             )
         stegos = LsbCodec.stripe_frames(
             covers, PayloadFrame.pack(payload, key), lsb_planes)
+        # stripe_frames embeds in place: stegos share the covers'
+        # buffers, so drop the extra references promptly.
+        del covers
 
         tw, th = min(4000, width), min(3000, height)
         thumb, thumb_label = ThumbnailProvider(seed=seed).get(
@@ -340,9 +345,12 @@ class DngStego:
         except UnicodeEncodeError as exc:
             raise ValueError(
                 f"split_id must be ASCII for metadata storage: {exc}") from exc
-        chunks = [payload[i:i + split_size]
-                  for i in range(0, max(len(payload), 1), split_size)]
-        if len(chunks) == 1:
+        chunks = iter_chunk_bounds(len(payload), split_size)
+        # Peek the first item to learn the total without slicing any
+        # payload bytes up front.
+        first = next(chunks)
+        _, total, _, _ = first
+        if total == 1:
             # Fits in one chunk: plain single file, no split markers.
             return [self.encode(
                 payload, output_path, width=width, height=height, seed=seed,
@@ -351,15 +359,18 @@ class DngStego:
                 no_randomize=no_randomize, frames=frames,
                 thumbnail=thumbnail,
             )]
-        total = len(chunks)
         ifd0_dummies = ((id_spec is not None and id_spec["ifd"] == "ifd0")
                         + (seq_spec is not None and seq_spec["ifd"] == "ifd0"))
         infos = []
-        for c, chunk in enumerate(chunks):
-            seq = c + 1
+        for seq, chunk_total, start, end in itertools.chain([first], chunks):
+            assert chunk_total == total  # generator yields one fixed total
+            # One chunk copy at a time: slicing all chunks up front
+            # would hold a second full payload beside ``payload``.
+            chunk = payload[start:end]
+            chunk_len = len(chunk)
             path = chunk_path(output_path, seq)
             cseed = (None if (seed is None and not no_randomize)
-                     else (0 if seed is None else seed) + c)
+                     else (0 if seed is None else seed) + seq - 1)
             meta = MetadataRandomizer(cseed).randomize()
             split_exif = {}
             if id_spec is not None and id_spec["ifd"] == "exif":
@@ -382,18 +393,22 @@ class DngStego:
                       for f in range(frames)]
             n_samples = covers[0].size
             cap = LsbCodec.capacity_bytes_total(n_samples, lsb_planes, frames)
-            if len(chunk) > cap:
+            if chunk_len > cap:
                 raise ValueError(
                     f"chunk {seq}/{total} "
-                    f"({format_kb_hi(len(chunk))}) exceeds per-file capacity "
+                    f"({format_kb_hi(chunk_len)}) exceeds per-file capacity "
                     f"{format_kb_lo(cap)} ({width}x{height} {mode} "
                     f"{bit_depth}-bit, {lsb_planes} LSB plane(s)"
                     f"{f' x {frames} frames' if frames > 1 else ''}). "
                     f"Lower --split-file to at most {format_kb_lo(cap)} or "
                     f"enlarge the geometry / add planes."
                 )
-            stegos = LsbCodec.stripe_frames(
-                covers, PayloadFrame.pack(chunk, key), lsb_planes)
+            frame = PayloadFrame.pack(chunk, key)
+            del chunk
+            stegos = LsbCodec.stripe_frames(covers, frame, lsb_planes)
+            # stripe_frames embeds in place: stegos share the covers'
+            # buffers, so drop the extra references promptly.
+            del covers, frame
             tw, th = min(4000, width), min(3000, height)
             thumb, thumb_label = ThumbnailProvider(seed=cs).get(
                 tw, th, source=thumbnail)
@@ -410,12 +425,13 @@ class DngStego:
                 bit_depth=bit_depth, container=str(stegos[0].dtype),
                 lsb_planes=lsb_planes, frames=frames,
                 thumb_label=thumb_label, bigtiff=bigtiff, cap=cap,
-                payload_len=len(chunk), meta=meta,
+                payload_len=chunk_len, meta=meta,
             )
             info.update({"chunk_seq": seq, "chunk_total": total,
                          "split_id": uid, "split_id_field": split_id_field,
                          "split_seq_field": split_seq_field})
             infos.append(info)
+            del stegos, thumb
         return infos
 
     @staticmethod

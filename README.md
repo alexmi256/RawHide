@@ -395,6 +395,12 @@ Module layout:
   `BitsPerSample` (10/12/14) with compression, so `--compression
   adobe_deflate` is only accepted with `--bit-depth 8/16` (full-width);
   packed depths always write uncompressed (still lossless → payload-safe).
+* **In-place embedding (memory)**: `LsbCodec.stripe_frames` /
+  `LsbCodec.embed_bits` embed directly into the passed cover arrays and
+  return those same objects — a cover is *consumed* by embedding, so do
+  not reuse it afterwards (re-embedding the same frame is idempotent,
+  but old pixel values are gone). Contrast `embed_bitarray`, the legacy
+  bit-array helper, which still allocates and returns a new array.
 * `requirements.txt`: `numpy`, `tifffile[all]` (`rawpy` optional, decode
   verification only). Dev-only test deps (`pytest`, `pytest-cov`) live in
   `requirements-dev.txt`.
@@ -405,7 +411,13 @@ Module layout:
   the DNG and judging photographic content is out of scope per the brief).
 * `DNGPrivateData` is a small placeholder, not an embedded RAF (real files
   carry 80–120 MB); MakerNote is omitted for the same reason.
-* `--pixelshift` (407 MP) needs ~8 GB RAM and writes a ~2.5 GB uncompressed
-  file; `--gfx-native` (489 MB file, 20 MB payload) was tested end-to-end.
+* `--pixelshift` (407 MP) writes a ~2.5 GB uncompressed file; peak
+  encode RAM is analytically ~2x the payload plus one cover buffer
+  (2.3 GB here, unmeasured at GB scale — e.g. ~4.3 GB for a 1 GB
+  payload) — covers are embedded in place and `--split-file` chunks
+  stream one at a time, so splitting keeps peak near a single chunk's
+  cost. Removing the remaining framed-payload copy (streaming frame,
+  P1) would cut roughly another 1x payload; `--gfx-native` (489 MB
+  file, 20 MB payload) was tested end-to-end.
 * Keystream XOR gives confidentiality against casual inspection, not
   authenticated encryption; wrong `--key` fails closed (magic/CRC check).

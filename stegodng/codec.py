@@ -136,6 +136,8 @@ class LsbCodec:
     @classmethod
     def embed_bits(cls, cover: np.ndarray, frame: bytes,
                    lsb_planes: int) -> np.ndarray:
+        """Embed ``frame`` into ``cover`` LSBs (in place, see
+        :meth:`stripe_frames`)."""
         n_slots = cover.size * lsb_planes
         if len(frame) * 8 > n_slots:
             raise ValueError(
@@ -162,6 +164,13 @@ class LsbCodec:
         Raises ValueError when the framed bitstream exceeds the combined
         cover slots (previous implementation silently truncated the
         excess; failing closed avoids silent data loss).
+
+        Memory: covers are embedded **in place** — the returned list
+        holds the same array objects (same buffers), so callers must
+        treat ``covers`` as consumed. This avoids a second full-frame
+        copy beside the covers (gigabytes at PixelShift scale).
+        Non-contiguous inputs fall back to a contiguous copy for that
+        cover.
         """
         farr = np.frombuffer(frame, dtype=np.uint8)
         total_bits = len(frame) * 8
@@ -176,7 +185,14 @@ class LsbCodec:
         for cover in covers:
             n_slots = cover.size * lsb_planes
             take = min(n_slots, total_bits - pos)
-            flat = cover.reshape(-1).copy()
+            flat = cover.reshape(-1)
+            if np.shares_memory(flat, cover):
+                inplace = True
+            else:
+                # Non-contiguous input: reshape copied, so embed into a
+                # contiguous copy and return it (previous behavior).
+                flat = np.ascontiguousarray(cover).reshape(-1)
+                inplace = False
             if take > 0:
                 n_used = (take + lsb_planes - 1) // lsb_planes
                 for s0 in range(0, n_used, chunk_samples):
@@ -189,7 +205,7 @@ class LsbCodec:
                     LsbCodec._embed_bits_into_window(window, bits,
                                                      lsb_planes)
                     flat[s0:s0 + ns] = window.astype(flat.dtype)
-            stegos.append(flat.reshape(cover.shape))
+            stegos.append(cover if inplace else flat.reshape(cover.shape))
             pos += take
         return stegos
 

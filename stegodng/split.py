@@ -79,6 +79,24 @@ def chunk_path(output_path: str, seq: int) -> str:
     return f"{stem}{seq:04d}{suffix}"
 
 
+def iter_chunk_bounds(payload_len: int, split_size: int):
+    """Yield ``(seq, total, start, end)`` for each chunk (1-based seq).
+
+    Lazy counterpart of ``[payload[i:i + split_size] ...]``: bounds
+    only, so callers slice (and hold) one chunk copy at a time instead
+    of materializing every chunk beside the full payload.
+    """
+    if (isinstance(split_size, bool) or not isinstance(split_size, int)
+            or split_size <= 0):
+        raise ValueError(
+            f"split_size must be a positive byte count (got {split_size!r})")
+    total = ((payload_len + split_size - 1) // split_size
+             if payload_len else 1)
+    for seq in range(1, total + 1):
+        yield seq, total, (seq - 1) * split_size, min(seq * split_size,
+                                                     payload_len)
+
+
 def parse_chunk_name(path: str) -> tuple[str, int, str] | None:
     """Split a basename into (stem, number, suffix); None if no 4-digit."""
     m = CHUNK_NAME_RE.match(os.path.basename(path))
