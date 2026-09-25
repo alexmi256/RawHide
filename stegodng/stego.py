@@ -10,6 +10,7 @@ import os
 import random
 import struct
 import warnings
+from typing import Any
 
 import numpy as np
 import tifffile
@@ -380,11 +381,11 @@ class DngStego:
                 cseed = (None if (seed is None and not no_randomize)
                          else (0 if seed is None else seed) + seq - 1)
                 meta = MetadataRandomizer(cseed).randomize()
-                split_exif = {}
+                split_exif: dict[int, Any] = {}
                 if id_spec is not None and id_spec["ifd"] == "exif":
                     split_exif[id_spec["tag"]] = uid
                 if seq_spec is not None and seq_spec["ifd"] == "exif":
-                    val = format_seq_value(split_seq_field, seq, total)
+                    val: Any = format_seq_value(split_seq_field, seq, total)
                     split_exif[seq_spec["tag"]] = (
                         [val] if isinstance(val, int) else list(val))
                 if split_exif:

@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import re
 import uuid
+from typing import Any
 
 SIZE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([a-zA-Z]*)\s*$")
 SIZE_MULTIPLIERS = {
@@ -31,7 +32,9 @@ SIZE_MULTIPLIERS = {
 # Registry of metadata fields usable for the shared chunk-set UUID.
 # ImageUniqueID (EXIF 42016) is the natural default: a genuine per-image
 # UUID field whose 32-char hex format fits a uuid4 hex exactly.
-SPLIT_ID_FIELDS = {
+# Values stay loosely typed on purpose: entries carry different shapes
+# (only some have "count"), so callers read known keys per field.
+SPLIT_ID_FIELDS: dict[str, dict[str, Any]] = {
     "ImageUniqueID": {"tag": 42016, "dtype": "ASCII", "ifd": "exif"},
     "ImageDescription": {"tag": 270, "dtype": "ASCII", "ifd": "ifd0"},
 }
@@ -40,7 +43,8 @@ SPLIT_ID_FIELDS = {
 # is the default: it exists precisely to number images in a sequence.
 # PageNumber natively stores (sequence, total); ImageDescription stores
 # "NNNN/MMMM" text.
-SPLIT_SEQ_FIELDS = {
+# Values stay loosely typed on purpose (see SPLIT_ID_FIELDS above).
+SPLIT_SEQ_FIELDS: dict[str, dict[str, Any]] = {
     # ImageNumber is TIFF/EP tag 0x9211 = 37393 decimal, living in the
     # EXIF sub-IFD (Exif.Photo.ImageNumber). A scalar: no total, so a
     # consecutive-from-0001 subset decodes fail-open (see README).
@@ -148,7 +152,8 @@ def format_seq_value(field: str, seq: int, total: int) -> object:
 def parse_seq_value(field: str, raw: object) -> tuple[int, int | None]:
     """Decode a seq field value -> (seq, total|None). Raises ValueError."""
     if field == "PageNumber":
-        vals = list(raw) if isinstance(raw, (tuple, list)) else [raw]
+        vals: list[Any] = (list(raw) if isinstance(raw, (tuple, list))
+                           else [raw])
         if len(vals) != 2:
             raise ValueError(f"PageNumber needs (seq, total), got {raw!r}")
         return int(vals[0]), int(vals[1])
@@ -160,7 +165,7 @@ def parse_seq_value(field: str, raw: object) -> tuple[int, int | None]:
                 f"(expected 'NNNN/MMMM')")
         return int(m.group(1)), int(m.group(2))
     # ImageNumber: scalar or 1-tuple
-    v = raw[0] if isinstance(raw, (tuple, list)) else raw
+    v: Any = raw[0] if isinstance(raw, (tuple, list)) else raw
     return int(v), None
 
 

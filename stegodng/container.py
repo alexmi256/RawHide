@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import struct
+from typing import Any
 
 import tifffile
 
@@ -52,8 +53,8 @@ class DngContainer:
             ifd0 = tif.pages[0]
             exif = (dict(ifd0.tags[34665].value)
                     if 34665 in ifd0.tags else {})
-            out = {"id": None, "seq": None, "total": None,
-                   "id_present": False, "seq_present": False}
+            out: dict[str, Any] = {"id": None, "seq": None, "total": None,
+                                   "id_present": False, "seq_present": False}
             if id_field != "none":
                 if id_field not in SPLIT_ID_FIELDS:
                     raise ValueError(

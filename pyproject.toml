@@ -44,6 +44,13 @@ include = ["stegodng*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
+[tool.pyrefly]
+# Shipped code only (mirrors `just lint` scope): tests intentionally pass
+# mistyped values to exercise error paths, so they stay out of the gate.
+project-includes = ["stegodng/**/*.py", "stego_dng.py"]
+# Oldest supported interpreter (matches requires-python and ruff target).
+python-version = "3.10"
+
 [tool.ruff]
 target-version = "py310"
 
