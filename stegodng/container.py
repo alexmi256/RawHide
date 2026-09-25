@@ -229,7 +229,7 @@ def _exif_values(meta: dict, thumb_w: int, thumb_h: int) -> dict[int, object]:
                 (meta["lens_spec"][2], meta["lens_spec"][3]),
                 (meta["lens_spec"][4], meta["lens_spec"][5]),
                 (meta["lens_spec"][6], meta["lens_spec"][7])],
-        42035: "FUJIFILM",
+        42035: meta.get("lens_make", "FUJIFILM"),
         42036: meta["lens"],
         42037: meta["lens_serial"],
     }

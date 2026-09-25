@@ -59,7 +59,9 @@ class DngStego:
     """Embed and recover payloads in DNG raw sensor data."""
 
     def __init__(self, profile=DEFAULT_PROFILE) -> None:
-        self.profile = profile
+        # Explicit None means "default story" (module wrappers pass
+        # through a missing profile this way).
+        self.profile = profile if profile is not None else DEFAULT_PROFILE
 
     @staticmethod
     def _rgb_to_ycbcr(thumb_rgb) -> "np.ndarray":
@@ -171,7 +173,11 @@ class DngStego:
             ifd0_extras = self._ifd0_extras(meta, n_dummies=ifd0_dummies)
             tif.write(
                 thumb_ycbcr, photometric="ycbcr", compression="jpeg",
-                software=self.profile.software, datetime=meta["datetime"],
+                # Empty Software (profiles with no observed Software
+                # string) omits tag 305 explicitly instead of relying on
+                # tifffile skipping empty strings.
+                software=self.profile.software or False,
+                datetime=meta["datetime"],
                 rowsperstrip=th,
                 subfiletype=1, subifds=frames, metadata=None, extratags=ifd0_extras,
             )
@@ -241,7 +247,8 @@ class DngStego:
         """
         self._validate_options(bit_depth, lsb_planes, frames, mode,
                                compression)
-        meta = MetadataRandomizer(0 if no_randomize else seed).randomize()
+        meta = MetadataRandomizer(0 if no_randomize else seed,
+                                  self.profile).randomize()
         if seed is None:
             seed = 0
 
@@ -380,7 +387,7 @@ class DngStego:
                 path = chunk_path(output_path, seq)
                 cseed = (None if (seed is None and not no_randomize)
                          else (0 if seed is None else seed) + seq - 1)
-                meta = MetadataRandomizer(cseed).randomize()
+                meta = MetadataRandomizer(cseed, self.profile).randomize()
                 split_exif: dict[int, Any] = {}
                 if id_spec is not None and id_spec["ifd"] == "exif":
                     split_exif[id_spec["tag"]] = uid
@@ -785,7 +792,7 @@ class DngStego:
         with tifffile.TiffWriter(output_path) as tif:
             tif.write(
                 np.ascontiguousarray(cover8), photometric="rgb",
-                software=self.profile.software, metadata=None,
+                software=self.profile.software or False, metadata=None,
             )
         return output_path
 
@@ -808,9 +815,11 @@ def encode(
     frames: int = 1,
     thumbnail: str = "random",
     progress: bool | None = None,
+    profile=None,
 ) -> dict:
     """Backwards-compatible wrapper (see :meth:`DngStego.encode`)."""
-    return _DEFAULT.encode(
+    stego = _DEFAULT if profile is None else DngStego(profile)
+    return stego.encode(
         payload, output_path, width=width, height=height, seed=seed,
         key=key, lsb_planes=lsb_planes, bit_depth=bit_depth, mode=mode,
         compression=compression, no_randomize=no_randomize, frames=frames,
@@ -853,9 +862,11 @@ def encode_split(
     split_id_field: str = "ImageUniqueID",
     split_seq_field: str = "ImageNumber",
     progress: bool | None = None,
+    profile=None,
 ) -> list[dict]:
     """Backwards-compatible wrapper (see :meth:`DngStego.encode_split`)."""
-    return _DEFAULT.encode_split(
+    stego = _DEFAULT if profile is None else DngStego(profile)
+    return stego.encode_split(
         payload, output_path, split_size, width=width, height=height,
         seed=seed, key=key, lsb_planes=lsb_planes, bit_depth=bit_depth,
         mode=mode, compression=compression, no_randomize=no_randomize,

@@ -14,6 +14,7 @@ Primary API::
 The legacy ``stego_dng`` module remains as a thin compatibility shim.
 """
 from .cli import main
+from .profiles import get_profile, list_profiles
 from .codec import (
     LsbCodec,
     capacity_bytes,
@@ -81,6 +82,8 @@ __all__ = [
     "format_kb_hi",
     "format_kb_lo",
     "generate_tiff",
+    "get_profile",
+    "list_profiles",
     "make_cover",
     "make_thumbnail",
     "SPLIT_ID_FIELDS",

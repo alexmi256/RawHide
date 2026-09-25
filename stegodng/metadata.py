@@ -37,8 +37,41 @@ class MetadataRandomizer:
     METERING_CHOICES = [2, 3, 5]  # center-weighted, spot, multi-segment
     EXPPROG_CHOICES = [1, 2, 3, 4]  # manual, program, aperture-prio, shutter-prio
 
-    def __init__(self, seed: int | None = None) -> None:
+    def __init__(self, seed: int | None = None,
+                 profile=None) -> None:
         self._rng = random.Random(seed)
+        # Per-camera pools (None -> GFX reference pools above).
+        self._profile = profile
+        self._lenses = (list(profile.lenses) if profile is not None
+                        and profile.lenses else list(self.LENSES))
+        self._isos = (list(profile.iso_choices) if profile is not None
+                      and profile.iso_choices else list(self.ISO_CHOICES))
+        self._exposures = (list(profile.exposure_choices)
+                           if profile is not None and profile.exposure_choices
+                           else list(self.EXPOSURE_CHOICES))
+        self._fnumbers = (list(profile.fnumber_choices)
+                          if profile is not None and profile.fnumber_choices
+                          else list(self.FNUMBER_CHOICES))
+        self._metering = (list(profile.metering_choices)
+                          if profile is not None and profile.metering_choices
+                          else list(self.METERING_CHOICES))
+        self._expprog = (list(profile.exposure_program_choices)
+                         if profile is not None
+                         and profile.exposure_program_choices
+                         else list(self.EXPPROG_CHOICES))
+        self._serial_prefixes = (list(profile.serial_prefixes)
+                                 if profile is not None
+                                 and profile.serial_prefixes
+                                 else ["92A", "94A", "93A", "95A"])
+        self._crop = (profile.crop_factor if profile is not None
+                      else 0.79)
+        self._lens_make_default = (profile.make if profile is not None
+                                   else "FUJIFILM")
+        # Serial pools: the reference profile keeps its legacy hardcoded
+        # body/lens serials (byte stability); harvested profiles use
+        # fresh random serials in observed prefix formats.
+        self._legacy_serials = (profile is None
+                                or getattr(profile, "slug", "") == "gfx_100")
 
     @staticmethod
     def _rand_serial(rng: random.Random, prefix: str = "") -> str:
@@ -49,34 +82,47 @@ class MetadataRandomizer:
     def randomize(self) -> dict:
         """Fresh metadata dict with identifiable fields randomized."""
         rng = self._rng
-        lens = rng.choice(self.LENSES)
+        lens = rng.choice(self._lenses)
+        # Profile lenses carry (model, min, max, aperture[, make]);
+        # reference LENSES are (model, min, max, aperture).
+        lens_make = ((lens[4] or self._lens_make_default)
+                     if len(lens) > 4 else self._lens_make_default)
         focal = round(rng.uniform(lens[1], lens[2]), 1)
-        iso = rng.choice(self.ISO_CHOICES)
-        exp_n, exp_d = rng.choice(self.EXPOSURE_CHOICES)
-        fnum = rng.choice(self.FNUMBER_CHOICES)
+        iso = rng.choice(self._isos)
+        exp_n, exp_d = rng.choice(self._exposures)
+        fnum = rng.choice(self._fnumbers)
+        fnum_pair = tuple(fnum) if isinstance(fnum, (list, tuple)) else (fnum, 100)
         base = _dt.datetime(2019, 1, 1) + _dt.timedelta(
             seconds=rng.randint(0, 5 * 365 * 24 * 3600)
         )
         dt = base.strftime("%Y:%m:%d %H:%M:%S")
-        serial = self._rand_serial(rng, rng.choice(["92A", "94A", "93A", "95A"]))
-        body_serial = rng.choice(["33000087", "94000525", serial])
-        lens_serial = self._rand_serial(rng, rng.choice(["75A", "86A", "35A", "19A"]))
-        r35 = int(round(focal * 0.79))  # GFX 0.79x crop factor
+        serial = self._rand_serial(rng, rng.choice(self._serial_prefixes))
+        if self._legacy_serials:
+            body_serial = rng.choice(["33000087", "94000525", serial])
+            lens_serial = self._rand_serial(
+                rng, rng.choice(["75A", "86A", "35A", "19A"]))
+        else:
+            body_serial = self._rand_serial(
+                rng, rng.choice(self._serial_prefixes))
+            lens_serial = self._rand_serial(
+                rng, rng.choice(self._serial_prefixes))
+        r35 = int(round(focal * self._crop))  # sensor crop factor
         asn_r = rng.randint(5000, 7600)   # AsShotNeutral varies with WB
         asn_b = rng.randint(4000, 5600)
         bexp = rng.randint(-60, 60)       # +/- 0.006 EV baseline tweaks
         return {
             "datetime": dt,
             "exposure_time": (exp_n, exp_d),
-            "fnumber": (fnum, 100),
-            "exposure_program": rng.choice(self.EXPPROG_CHOICES),
+            "fnumber": fnum_pair,
+            "exposure_program": rng.choice(self._expprog),
             "iso": iso,
-            "metering": rng.choice(self.METERING_CHOICES),
+            "metering": rng.choice(self._metering),
             "focal": focal,
             "focal_rational": (int(round(focal * 100)), 100),
             "focal_35mm": r35,
             "max_aperture": (int(round(lens[3] * 100)), 100),
             "lens": lens[0],
+            "lens_make": lens_make,
             "lens_spec": (
                 int(round(lens[1] * 100)), 100, int(round(lens[2] * 100)), 100,
                 int(round(lens[3] * 100)), 100, int(round(lens[3] * 100)), 100,
@@ -95,9 +141,10 @@ class MetadataRandomizer:
         }
 
 
-def randomize_metadata(seed: int | None = None) -> dict:
+def randomize_metadata(seed: int | None = None,
+                       profile=None) -> dict:
     """Backwards-compatible wrapper: fresh randomized metadata dict."""
-    return MetadataRandomizer(seed).randomize()
+    return MetadataRandomizer(seed, profile).randomize()
 
 
 # Module-level aliases for the choice pools (also re-exported by the

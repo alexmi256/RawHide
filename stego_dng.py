@@ -77,6 +77,7 @@ from stegodng.metadata import (
     MetadataRandomizer,
     randomize_metadata,
 )
+from stegodng.profiles import get_profile, list_profiles
 from stegodng.profile import (
     AUTO_MIN_H,
     AUTO_MIN_W,

@@ -249,8 +249,8 @@ class AutoSizer:
         return _max_config_str(mode, bit_depth, frames)
 
     @staticmethod
-    def risk_warnings(cfg: dict, key: bool) -> list[str]:
-        return risk_warnings(cfg, key)
+    def risk_warnings(cfg: dict, key: bool, profile=None) -> list[str]:
+        return risk_warnings(cfg, key, profile)
 
 
 
@@ -275,12 +275,16 @@ def recommend(
 
 
 
-def risk_warnings(cfg: dict, key: bool) -> list[str]:
+def risk_warnings(cfg: dict, key: bool, profile=None) -> list[str]:
     """High-density option warnings (also see README detection risks).
 
     Planes > 4, extra raw frames, sub-14-bit depths and exact-fit
-    dimensions all deviate from plausible GFX 100 II combiner output.
+    dimensions all deviate from plausible combiner output for the
+    selected camera profile.
     """
+    label = "GFX 100 II"
+    if profile is not None and getattr(profile, "display_name", ""):
+        label = profile.display_name
     out: list[str] = []
     p, depth, frames = cfg["lsb_planes"], cfg["bit_depth"], cfg["frames"]
     if p > 4:
@@ -303,11 +307,11 @@ def risk_warnings(cfg: dict, key: bool) -> list[str]:
         out.append(
             f"warning: {frames} full-resolution raw frames in one still "
             f"DNG is non-standard (burst/stack-style multi-image TIFFs "
-            f"exist, but no GFX combiner output looks like this) and "
+            f"exist, but no {label} combiner output looks like this) and "
             f"multiplies the file size ~{frames}x.")
     if depth < 14:
         out.append(
-            f"warning: {depth}-bit is below every GFX 100 II option "
+            f"warning: {depth}-bit is below every {label} option "
             f"(14/16-bit); the BitsPerSample tag alone marks the file "
             f"as unusual for this camera story.")
     if out and not key:
@@ -323,9 +327,9 @@ def risk_warnings(cfg: dict, key: bool) -> list[str]:
 
 
 
-def _risk_warnings(cfg: dict, key: bool) -> list[str]:
+def _risk_warnings(cfg: dict, key: bool, profile=None) -> list[str]:
     """Backwards-compatible alias for :func:`risk_warnings`."""
-    return risk_warnings(cfg, key)
+    return risk_warnings(cfg, key, profile)
 
 
 #: Backwards-compatible alias for :func:`recommend` (the original name).

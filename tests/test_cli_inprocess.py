@@ -77,7 +77,7 @@ def test_cli_auto_size_and_conflict(tmp_path, capsys):
     assert "non-standard dimensions" in out
 
 
-def test_cli_gfx_pixelshift_flags_mocked(tmp_path, monkeypatch, capsys):
+def test_cli_camera_profile_flags_mocked(tmp_path, monkeypatch, capsys):
     import stegodng.cli as cli_mod
     src = str(tmp_path / "in.bin")
     _write_input(src, 100)
@@ -105,11 +105,35 @@ def test_cli_gfx_pixelshift_flags_mocked(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(cli_mod, "recommend", fake_recommend)
     monkeypatch.setattr(cli_mod, "encode", fake_encode)
     assert main(["encode", "-i", src, "-o", str(tmp_path / "g.dng"),
-                 "--gfx-native", "--thumbnail", "synthetic"]) == 0
+                 "--camera-profile", "gfx_100-native",
+                 "--thumbnail", "synthetic"]) == 0
     assert seen["width"] == 11648 and seen["height"] == 8736
     assert main(["encode", "-i", src, "-o", str(tmp_path / "p.dng"),
-                 "--pixelshift", "--thumbnail", "synthetic"]) == 0
+                 "--camera-profile", "gfx_100-pixelshift",
+                 "--thumbnail", "synthetic"]) == 0
     assert seen["width"] == 23296 and seen["height"] == 17472
+    out = capsys.readouterr().out
+    assert "profile: gfx_100-native" in out
+    assert "profile: gfx_100-pixelshift" in out
+    # base profile keeps auto-sizing (no pinned geometry)
+    assert main(["encode", "-i", src, "-o", str(tmp_path / "b.dng"),
+                 "--camera-profile", "gfx_100",
+                 "--thumbnail", "synthetic"]) == 0
+    # unknown profile -> error listing choices
+    r = main(["encode", "-i", src, "-o", str(tmp_path / "u.dng"),
+              "--camera-profile", "nope-not-a-camera",
+              "--thumbnail", "synthetic"])
+    assert r == 1
+    assert "unknown camera profile" in capsys.readouterr().err
+    # subprofile pins conflict with explicit dims and auto-size
+    with pytest.raises(SystemExit):
+        main(["encode", "-i", src, "-o", str(tmp_path / "c.dng"),
+              "--camera-profile", "gfx_100-native",
+              "--width", "256", "--thumbnail", "synthetic"])
+    with pytest.raises(SystemExit):
+        main(["encode", "-i", src, "-o", str(tmp_path / "a.dng"),
+              "--camera-profile", "gfx_100-native",
+              "--auto-size", "--thumbnail", "synthetic"])
 
 
 def test_cli_bigtiff_warning_mocked(tmp_path, monkeypatch, capsys):
