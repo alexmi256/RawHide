@@ -298,3 +298,51 @@ def test_cli_decode_marks_fallback(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "recovered" in out
     assert "no chunk totals" not in out
+
+
+def test_cli_encode_default_output(tmp_path, capsys):
+    src = str(tmp_path / "inputabc.ext")
+    _write_input(src, 2000)
+    assert main(["encode", "-i", src, "--seed", "5",
+                 "--width", "256", "--height", "192",
+                 "--thumbnail", "synthetic"]) == 0
+    capsys.readouterr()
+    assert os.path.isfile(src + ".dng")
+    rec = str(tmp_path / "out.bin")
+    assert main(["decode", "-i", src + ".dng", "-o", rec]) == 0
+    with open(src, "rb") as f1, open(rec, "rb") as f2:
+        assert f1.read() == f2.read()
+
+
+def test_cli_encode_default_output_split(tmp_path, capsys):
+    src = str(tmp_path / "inputabc.ext")
+    _write_input(src, 15000, seed=8)
+    assert main(["encode", "-i", src, "--seed", "5",
+                 "--width", "512", "--height", "384",
+                 "--thumbnail", "synthetic",
+                 "--split-file", "5k"]) == 0
+    capsys.readouterr()
+    files = sorted(glob.glob(src + "????.dng"))
+    assert len(files) >= 2
+    assert files[0] == src + "0001.dng"
+    assert files[1] == src + "0002.dng"
+    rec = str(tmp_path / "out.bin")
+    assert main(["decode", "-i"] + files + ["-o", rec]) == 0
+    with open(src, "rb") as f1, open(rec, "rb") as f2:
+        assert f1.read() == f2.read()
+
+
+def test_cli_encode_default_output_split_single_chunk(tmp_path, capsys):
+    # Payload fits in one chunk: plain single file, no sequence number.
+    src = str(tmp_path / "inputabc.ext")
+    _write_input(src, 500)
+    assert main(["encode", "-i", src, "--seed", "5",
+                 "--thumbnail", "synthetic",
+                 "--split-file", "1m"]) == 0
+    capsys.readouterr()
+    assert os.path.isfile(src + ".dng")
+    assert glob.glob(src + "????.dng") == []
+    rec = str(tmp_path / "out.bin")
+    assert main(["decode", "-i", src + ".dng", "-o", rec]) == 0
+    with open(src, "rb") as f1, open(rec, "rb") as f2:
+        assert f1.read() == f2.read()

@@ -31,7 +31,10 @@ def main(argv: list[str] | None = None) -> int:
 
     e = sub.add_parser("encode", help="embed a file into a new DNG")
     e.add_argument("--input", "-i", required=True)
-    e.add_argument("--output", "-o", required=True)
+    e.add_argument("--output", "-o", required=False, default=None,
+                   help="output DNG path (default: <input>.dng; with "
+                   "--split-file the 0001-style sequence numbers are "
+                   "inserted before the .dng extension)")
     e.add_argument("--width", type=int, default=None,
                    help="raw image width (default: auto from input size)")
     e.add_argument("--height", type=int, default=None,
@@ -179,6 +182,8 @@ def main(argv: list[str] | None = None) -> int:
             for line in risk_warnings(cfg, key=bool(args.key)):
                 print(line)
             key_bytes = args.key.encode() if args.key else None
+            output_path = (args.output if args.output is not None
+                           else f"{args.input}.dng")
             common = dict(
                 width=cfg["width"], height=cfg["height"], seed=args.seed,
                 key=key_bytes, lsb_planes=cfg["lsb_planes"],
@@ -189,7 +194,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             if split_size is not None:
                 infos = encode_split(
-                    payload, args.output, split_size,
+                    payload, output_path, split_size,
                     split_id=args.split_file_id,
                     split_id_field=args.split_file_metadata_id,
                     split_seq_field=args.split_file_metadata_seq,
@@ -197,7 +202,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
             else:
                 infos = [encode(
-                    payload, args.output, **common,
+                    payload, output_path, **common,
                 )]
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
