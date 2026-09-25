@@ -50,6 +50,8 @@ from .split import (
     new_split_id,
     parse_chunk_name,
     parse_size,
+    split_album_dir,
+    split_album_output,
 )
 from .stego import DngStego, decode, encode, encode_split, generate_tiff
 from .thumbnails import ThumbnailError, ThumbnailProvider, prepare
@@ -87,6 +89,8 @@ __all__ = [
     "new_split_id",
     "parse_chunk_name",
     "parse_size",
+    "split_album_dir",
+    "split_album_output",
     "randomize_metadata",
     "recommend",
     "recommend_config",

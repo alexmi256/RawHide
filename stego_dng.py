@@ -110,6 +110,8 @@ from stegodng.split import (
     parse_seq_value,
     parse_size,
     resolve_split_fields,
+    split_album_dir,
+    split_album_output,
 )
 from stegodng.stego import (
     DngStego,

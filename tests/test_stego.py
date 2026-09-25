@@ -455,7 +455,7 @@ def test_shim_delegates_to_package():
         "encode_split", "decode", "generate_tiff", "recommend_config",
         "CameraProfile", "PayloadFrame", "MetadataRandomizer",
         "CoverGenerator", "LsbCodec", "DngContainer", "AutoSizer",
-        "ThumbnailProvider", "main",
+        "ThumbnailProvider", "main", "split_album_dir", "split_album_output",
     ):
         assert hasattr(stego_dng, name), name
 
@@ -784,8 +784,12 @@ def test_cli_split_roundtrip(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "chunk 1/3" in r.stdout and "chunk 3/3" in r.stdout
     assert "bytes" not in r.stdout
-    files = sorted(glob.glob(os.path.join(str(tmp_path), "out0*.dng")))
+    # album is on by default: <output-dir>/<input-stem>/out000N.dng
+    album = os.path.join(str(tmp_path), "in")
+    assert os.path.isdir(album)
+    files = sorted(glob.glob(os.path.join(album, "out0*.dng")))
     assert len(files) == 3
+    assert not glob.glob(os.path.join(str(tmp_path), "out0*.dng"))
     r = subprocess.run(
         [sys.executable, STEGO_SCRIPT, "decode", "-i"] + files +
         ["-o", rec, "--key", "pw"], capture_output=True, text=True)
@@ -1166,7 +1170,8 @@ def test_cli_progress_split_multifile(tmp_path):
         capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     assert "Encoding chunks" in r.stderr
-    files = sorted(glob.glob(os.path.join(str(tmp_path), "out0*.dng")))
+    files = sorted(glob.glob(
+        os.path.join(str(tmp_path), "in", "out0*.dng")))
     assert len(files) == 3
     r = subprocess.run(
         [sys.executable, STEGO_SCRIPT, "decode", "-i"] + files +
@@ -1175,6 +1180,129 @@ def test_cli_progress_split_multifile(tmp_path):
     assert "Decoding chunks" in r.stderr
     with open(src_p, "rb") as f1, open(rec, "rb") as f2:
         assert f1.read() == f2.read()
+
+
+def test_split_album_dir_naming():
+    from stegodng.split import split_album_dir, split_album_output
+    assert split_album_dir("out.dng", "huge.raw") == "huge"
+    assert split_album_output("out.dng", "huge.raw") == os.path.join(
+        "huge", "out.dng")
+    assert split_album_dir("/a/b/vol.dng", "/p/huge.raw") == "/a/b/huge"
+    assert split_album_output("/a/b/vol.dng", "/p/huge.raw") == (
+        "/a/b/huge/vol.dng")
+    # only the last extension is stripped
+    assert split_album_dir("o.dng", "archive.tar.gz") == "archive.tar"
+    # no extension -> basename as-is
+    assert split_album_dir("o.dng", "noext") == "noext"
+    # dotfile input -> hidden album dir (same stem rule, no special case)
+    assert split_album_dir("o.dng", ".bashrc") == ".bashrc"
+    # output already inside a same-named dir nests literally
+    assert split_album_dir("huge/vol.dng", "huge.raw") == os.path.join(
+        "huge", "huge")
+    assert split_album_output("huge/vol.dng", "huge.raw") == os.path.join(
+        "huge", "huge", "vol.dng")
+
+
+def test_cli_split_no_album_flat(tmp_path):
+    src_p = str(tmp_path / "in.bin")
+    enc = str(tmp_path / "out.dng")
+    rec = str(tmp_path / "back.bin")
+    payload = os.urandom(50000)
+    with open(src_p, "wb") as f:
+        f.write(payload)
+    r = subprocess.run(
+        [sys.executable, STEGO_SCRIPT, "encode", "-i", src_p, "-o", enc,
+         "--seed", "5", "--width", "512", "--height", "384",
+         "--thumbnail", "synthetic", "--split-file", "20k",
+         "--no-split-file-album"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    files = sorted(glob.glob(os.path.join(str(tmp_path), "out0*.dng")))
+    assert len(files) == 3
+    assert not os.path.isdir(os.path.join(str(tmp_path), "in"))
+    r = subprocess.run(
+        [sys.executable, STEGO_SCRIPT, "decode", "-i"] + files +
+        ["-o", rec], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    with open(rec, "rb") as f:
+        assert f.read() == payload
+
+
+def test_cli_split_album_single_chunk_still_album(tmp_path):
+    src_p = str(tmp_path / "tiny.bin")
+    enc = str(tmp_path / "single.dng")
+    with open(src_p, "wb") as f:
+        f.write(b"tiny")
+    r = subprocess.run(
+        [sys.executable, STEGO_SCRIPT, "encode", "-i", src_p, "-o", enc,
+         "--seed", "5", "--width", "256", "--height", "192",
+         "--thumbnail", "synthetic", "--split-file", "20k"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    album_file = os.path.join(str(tmp_path), "tiny", "single.dng")
+    assert os.path.isfile(album_file)
+    assert not os.path.exists(enc)
+    from stegodng import DngStego
+    assert DngStego().decode(album_file) == b"tiny"
+
+
+def test_cli_split_album_ignored_without_split(tmp_path):
+    src_p = str(tmp_path / "a.bin")
+    enc = str(tmp_path / "a_out.dng")
+    with open(src_p, "wb") as f:
+        f.write(b"hello")
+    r = subprocess.run(
+        [sys.executable, STEGO_SCRIPT, "encode", "-i", src_p, "-o", enc,
+         "--seed", "5", "--width", "256", "--height", "192",
+         "--thumbnail", "synthetic"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert os.path.isfile(enc)
+    assert not os.path.exists(os.path.join(str(tmp_path), "a"))
+
+
+def test_cli_split_album_nested_output_dirs_created(tmp_path):
+    # -o a/b/vol.dng where a/b does not exist: makedirs must create
+    # the full album path.
+    src_p = str(tmp_path / "in.bin")
+    enc = str(tmp_path / "a" / "b" / "vol.dng")
+    rec = str(tmp_path / "back.bin")
+    payload = os.urandom(50000)
+    with open(src_p, "wb") as f:
+        f.write(payload)
+    assert not os.path.exists(os.path.join(str(tmp_path), "a"))
+    r = subprocess.run(
+        [sys.executable, STEGO_SCRIPT, "encode", "-i", src_p, "-o", enc,
+         "--seed", "5", "--width", "512", "--height", "384",
+         "--thumbnail", "synthetic", "--split-file", "20k"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    files = sorted(glob.glob(
+        os.path.join(str(tmp_path), "a", "b", "in", "vol0*.dng")))
+    assert len(files) == 3
+    r = subprocess.run(
+        [sys.executable, STEGO_SCRIPT, "decode", "-i"] + files +
+        ["-o", rec], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    with open(rec, "rb") as f:
+        assert f.read() == payload
+
+
+def test_cli_split_album_no_leftover_dir_on_error(tmp_path):
+    # Tiny geometry cannot fit a 20k chunk: encode fails and must not
+    # leave an empty album directory behind.
+    src_p = str(tmp_path / "in.bin")
+    enc = str(tmp_path / "out.dng")
+    with open(src_p, "wb") as f:
+        f.write(os.urandom(50000))
+    r = subprocess.run(
+        [sys.executable, STEGO_SCRIPT, "encode", "-i", src_p, "-o", enc,
+         "--seed", "5", "--width", "64", "--height", "48",
+         "--thumbnail", "synthetic", "--split-file", "20k"],
+        capture_output=True, text=True)
+    assert r.returncode == 1
+    assert "error:" in r.stderr
+    assert not os.path.exists(os.path.join(str(tmp_path), "in"))
 
 
 if __name__ == "__main__":

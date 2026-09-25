@@ -79,6 +79,32 @@ def chunk_path(output_path: str, seq: int) -> str:
     return f"{stem}{seq:04d}{suffix}"
 
 
+def split_album_dir(output_path: str, input_path: str) -> str:
+    """Directory grouping split chunks: ``<output-dir>/<input-stem>``.
+
+    ``input-stem`` is the input basename minus its last extension
+    (``/p/huge.raw`` -> ``huge``). The parent is the resolved output
+    path's directory (``""`` means the current working directory).
+    """
+    parent = os.path.dirname(output_path)
+    stem = os.path.splitext(os.path.basename(input_path))[0]
+    if not stem:
+        stem = os.path.basename(input_path) or "album"
+    return os.path.join(parent, stem) if parent else stem
+
+
+def split_album_output(output_path: str, input_path: str) -> str:
+    """Base output path relocated inside :func:`split_album_dir`.
+
+    Chunk stems still come from ``output_path`` (see :func:`chunk_path`);
+    only the directory changes.
+    """
+    return os.path.join(
+        split_album_dir(output_path, input_path),
+        os.path.basename(output_path),
+    )
+
+
 def iter_chunk_bounds(payload_len: int, split_size: int):
     """Yield ``(seq, total, start, end)`` for each chunk (1-based seq).
 
