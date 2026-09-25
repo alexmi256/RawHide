@@ -137,7 +137,7 @@ def prepare(data: bytes, tw: int, th: int) -> np.ndarray:
             else:
                 im = im.convert("RGB")
             sw, sh = im.size
-            if sw <= 0 or sh <= 0:
+            if sw <= 0 or sh <= 0:  # pragma: no cover - Pillow never yields zero-size
                 raise ValueError("empty image")
             target = tw / th
             if sw / sh > target:
@@ -156,6 +156,6 @@ def prepare(data: bytes, tw: int, th: int) -> np.ndarray:
         raise
     except Exception as exc:
         raise ThumbnailError(f"cannot decode/resize thumbnail: {exc}") from exc
-    if arr.shape != (th, tw, 3):
+    if arr.shape != (th, tw, 3):  # pragma: no cover - shape forced by resize above
         raise ThumbnailError(f"unexpected prepared shape {arr.shape}")
     return np.ascontiguousarray(arr)

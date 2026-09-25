@@ -1,0 +1,25 @@
+[project]
+name = "stegodng"
+version = "1.0.0"
+requires-python = ">=3.10"
+dependencies = ["numpy", "pillow", "tifffile"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = false
+source = ["stegodng", "stego_dng"]
+# Subprocess CLI cases are also exercised in-process (tests call main()
+# directly), so no omit is needed for cli.py. Only genuinely untestable
+# code is excluded below.
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == ['\"]__main__['\"]:",
+    # Real network fetch: hermetic tests use injected openers instead.
+    "def _default_opener",
+]

@@ -199,9 +199,9 @@ class AutoSizer:
                 for _ in range(8):  # integer-rounding backstop
                     if cap(w, h, p) >= payload_len:
                         break
-                    h += 2
+                    h += 2  # pragma: no cover - closed form fits first try
                 else:
-                    continue  # unreachable in practice; try more planes
+                    continue  # pragma: no cover - closed form fits first try
                 if w <= PIXELSHIFT_W and h <= PIXELSHIFT_H:
                     auto_fields = auto + ["width", "height"]
                     if lsb_planes is None:
