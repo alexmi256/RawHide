@@ -539,3 +539,40 @@ inspectors and the curious.
   `LensSerialNumber`, `AsShotNeutral`, `BaselineExposure`, plus fresh
   cover and thumbnail pixels. `ImageNumber` is *not* randomized — on
   split chunks it carries the deterministic sequence; plain files omit it.
+
+## 7. Development tasks and PyPI releases
+
+Task runner is [`just`](https://github.com/casey/just) (see `justfile`;
+run `just --list`). Dev dependencies first:
+
+```bash
+python -m venv .venv
+.venv/bin/pip install -r requirements-dev.txt   # pytest, ruff, build, twine, ...
+```
+
+| command | what it does |
+|---|---|
+| `just test` | `pytest tests/ -q` (extra args forwarded, e.g. `just test -k roundtrip`) |
+| `just lint` | `ruff check` on the shipped code (`stegodng/`, `stego_dng.py`) |
+| `just build` | sdist + wheel into `dist/`, then `twine check` |
+| `just publish-test` | rebuild and upload to [TestPyPI](https://test.pypi.org/project/stegodng/) |
+| `just publish` | rebuild and upload to [PyPI](https://pypi.org/project/stegodng/) |
+| `just clean` | remove `dist/`, `build/`, `*.egg-info/` |
+
+`pip install stegodng` also installs two console commands, `stegodng`
+and `stego-dng`, which accept the same `encode`/`decode`/`capacity`/
+`gen-tiff` subcommands as `python stego_dng.py`.
+
+Release flow:
+
+1. Bump the version in **both** `pyproject.toml` and
+   `stegodng/__init__.py` (`__version__`) — PyPI rejects re-uploading a
+   version that already exists.
+2. Authenticate with an API token: create one at
+   test.pypi.org / pypi.org (Account settings → API tokens), then export
+   `TWINE_USERNAME=__token__` and `TWINE_PASSWORD=<token>`
+   (or add them to `~/.pypirc`, which is git-ignored).
+3. `just publish-test`, check the project page, and install the result
+   somewhere clean:
+   `pip install --index-url https://test.pypi.org/simple/ stegodng`.
+4. `just publish` for the real release.

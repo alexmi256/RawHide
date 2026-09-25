@@ -19,8 +19,6 @@ from .sizing import recommend, risk_warnings
 from .split import (
     SPLIT_ID_FIELDS,
     SPLIT_SEQ_FIELDS,
-    chunk_path,
-    parse_chunk_name,
     parse_size,
     split_album_dir,
     split_album_output,
