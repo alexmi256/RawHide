@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 from .codec import capacity_bytes, format_kb
@@ -21,6 +22,8 @@ from .split import (
     chunk_path,
     parse_chunk_name,
     parse_size,
+    split_album_dir,
+    split_album_output,
 )
 from .stego import decode, encode, encode_split, generate_tiff
 
@@ -34,7 +37,10 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("--output", "-o", required=False, default=None,
                    help="output DNG path (default: <input>.dng; with "
                    "--split-file the 0001-style sequence numbers are "
-                   "inserted before the .dng extension)")
+                   "inserted before the .dng extension; with "
+                   "--split-file-album (on by default) chunks go in "
+                   "<output-dir>/<input-stem>/, e.g. -o vol.dng + "
+                   "-i huge.raw -> huge/vol0001.dng ...)")
     e.add_argument("--width", type=int, default=None,
                    help="raw image width (default: auto from input size)")
     e.add_argument("--height", type=int, default=None,
@@ -81,6 +87,12 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("--split-file-id", default=None, metavar="UUID",
                    help="override the generated chunk-set UUID (default: "
                    "fresh random per split)")
+    e.add_argument("--split-file-album", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="group split chunks in a directory named after the "
+                   "input file without its extension (default: on; only "
+                   "with --split-file; use --no-split-file-album to write "
+                   "chunks beside the output path)")
     e.add_argument("--no-randomize", action="store_true")
     e.add_argument("--gfx-native", action="store_true",
                    help=f"use {GFX_NATIVE_W}x{GFX_NATIVE_H}")
@@ -169,6 +181,8 @@ def main(argv: list[str] | None = None) -> int:
             except ValueError as exc:
                 print(f"error: {exc}", file=sys.stderr)
                 return 1
+        album = None
+        album_preexisted = False
         try:
             cfg = recommend(
                 split_size if split_size is not None else len(payload),
@@ -196,6 +210,11 @@ def main(argv: list[str] | None = None) -> int:
             key_bytes = args.key.encode() if args.key else None
             output_path = (args.output if args.output is not None
                            else f"{args.input}.dng")
+            if split_size is not None and args.split_file_album:
+                album = split_album_dir(output_path, args.input)
+                album_preexisted = os.path.isdir(album)
+                os.makedirs(album, exist_ok=True)
+                output_path = split_album_output(output_path, args.input)
             forced = (False if args.no_progress else
                       True if args.progress else None)
             common = dict(
@@ -220,6 +239,12 @@ def main(argv: list[str] | None = None) -> int:
                     payload, output_path, **common,
                 )]
         except ValueError as exc:
+            if (album is not None and not album_preexisted
+                    and os.path.isdir(album) and not os.listdir(album)):
+                try:
+                    os.rmdir(album)
+                except OSError:
+                    pass
             print(f"error: {exc}", file=sys.stderr)
             return 1
         if len(infos) == 1 and "chunk_seq" not in infos[0]:

@@ -142,7 +142,7 @@ def test_cli_split_paths(tmp_path, capsys):
                  "--key", "pw"]) == 0
     out = capsys.readouterr().out
     assert "chunk 1/" in out and "note: chunks share" in out
-    files = sorted(glob.glob(str(tmp_path / "sp0*.dng")))
+    files = sorted(glob.glob(str(tmp_path / "in" / "sp0*.dng")))
     assert len(files) >= 2
     rec = str(tmp_path / "back.bin")
     assert main(["decode", "-i"] + files + ["-o", rec, "--key", "pw"]) == 0
@@ -194,6 +194,27 @@ def test_cli_split_bigtiff_warning_mocked(tmp_path, monkeypatch, capsys):
     assert "BigTIFF" in capsys.readouterr().out
 
 
+def test_cli_split_album_cleaned_on_encode_error(
+        tmp_path, monkeypatch, capsys):
+    import stegodng.cli as cli_mod
+    src = str(tmp_path / "in.bin")
+    _write_input(src, 15000, seed=9)
+    enc = str(tmp_path / "out.dng")
+    album = str(tmp_path / "in")
+    assert not os.path.exists(album)
+
+    def boom(payload, path, split_size, **kw):
+        raise ValueError("boom after album created")
+
+    monkeypatch.setattr(cli_mod, "encode_split", boom)
+    r = main(["encode", "-i", src, "-o", enc, "--seed", "5",
+              "--width", "512", "--height", "384",
+              "--thumbnail", "synthetic", "--split-file", "5k"])
+    assert r == 1
+    assert "boom" in capsys.readouterr().err
+    assert not os.path.exists(album)
+
+
 def test_cli_encode_errors(tmp_path, capsys):
     src = str(tmp_path / "in.bin")
     _write_input(src, 100)
@@ -235,7 +256,7 @@ def test_cli_decode_errors_and_notes(tmp_path, capsys):
                  "--thumbnail", "synthetic",
                  "--split-file", "5k"]) == 0
     capsys.readouterr()
-    files = sorted(glob.glob(str(tmp_path / "o0*.dng")))
+    files = sorted(glob.glob(str(tmp_path / "in" / "o0*.dng")))
     # Multi-file decode without totals -> advisory note.
     assert main(["decode", "-i"] + files + ["-o", rec]) == 0
     assert "no chunk totals" in capsys.readouterr().out
@@ -287,7 +308,7 @@ def test_cli_decode_marks_fallback(tmp_path, monkeypatch, capsys):
                  "--thumbnail", "synthetic",
                  "--split-file", "5k"]) == 0
     capsys.readouterr()
-    files = sorted(glob.glob(str(tmp_path / "o0*.dng")))
+    files = sorted(glob.glob(str(tmp_path / "in" / "o0*.dng")))
     assert len(files) >= 2
     rec = str(tmp_path / "r.bin")
     monkeypatch.setattr(cli_mod, "decode", lambda *a, **k: b"data")
@@ -322,10 +343,12 @@ def test_cli_encode_default_output_split(tmp_path, capsys):
                  "--thumbnail", "synthetic",
                  "--split-file", "5k"]) == 0
     capsys.readouterr()
-    files = sorted(glob.glob(src + "????.dng"))
+    album = os.path.join(str(tmp_path), "inputabc")
+    base = os.path.join(album, "inputabc.ext.dng")
+    files = sorted(glob.glob(base.replace(".dng", "") + "????.dng"))
     assert len(files) >= 2
-    assert files[0] == src + "0001.dng"
-    assert files[1] == src + "0002.dng"
+    assert files[0] == base.replace(".dng", "") + "0001.dng"
+    assert files[1] == base.replace(".dng", "") + "0002.dng"
     rec = str(tmp_path / "out.bin")
     assert main(["decode", "-i"] + files + ["-o", rec]) == 0
     with open(src, "rb") as f1, open(rec, "rb") as f2:
@@ -333,16 +356,17 @@ def test_cli_encode_default_output_split(tmp_path, capsys):
 
 
 def test_cli_encode_default_output_split_single_chunk(tmp_path, capsys):
-    # Payload fits in one chunk: plain single file, no sequence number.
+    # Payload fits in one chunk: plain single file inside the album dir.
     src = str(tmp_path / "inputabc.ext")
     _write_input(src, 500)
     assert main(["encode", "-i", src, "--seed", "5",
                  "--thumbnail", "synthetic",
                  "--split-file", "1m"]) == 0
     capsys.readouterr()
-    assert os.path.isfile(src + ".dng")
-    assert glob.glob(src + "????.dng") == []
+    album_file = os.path.join(str(tmp_path), "inputabc", "inputabc.ext.dng")
+    assert os.path.isfile(album_file)
+    assert glob.glob(album_file.replace(".dng", "") + "????.dng") == []
     rec = str(tmp_path / "out.bin")
-    assert main(["decode", "-i", src + ".dng", "-o", rec]) == 0
+    assert main(["decode", "-i", album_file, "-o", rec]) == 0
     with open(src, "rb") as f1, open(rec, "rb") as f2:
         assert f1.read() == f2.read()

@@ -127,19 +127,30 @@ All user-facing sizes (output, errors, `capacity`) are kilobytes.
 ### 2.3 Splitting one payload across files
 
 ```bash
-# ≤100 MB of payload per DNG, DCF-style numbered files
+# ≤100 MB of payload per DNG, DCF-style numbered files in an album dir
 python stego_dng.py encode -i huge.raw --split-file 100m --seed 7
-# -> huge.raw0001.dng huge.raw0002.dng ...
+# -> huge/huge.raw0001.dng huge/huge.raw0002.dng ...
 
-# explicit -o still works: -o vol.dng -> vol0001.dng vol0002.dng ...
+# explicit -o still works: -o vol.dng -> huge/vol0001.dng huge/vol0002.dng ...
+# (album dir is <output-dir>/<input-stem>; chunk stems come from -o)
 python stego_dng.py encode -i huge.raw -o vol.dng --split-file 100m --seed 7
-python stego_dng.py decode -i vol0001.dng vol0002.dng -o huge.raw
+python stego_dng.py decode -i huge/vol0001.dng huge/vol0002.dng -o huge.raw
+
+# flat layout (no album dir)
+python stego_dng.py encode -i huge.raw -o vol.dng --split-file 100m \
+  --no-split-file-album --seed 7
+# -> vol0001.dng vol0002.dng ...
 ```
 
 - `--split-file SIZE` accepts `500k`, `100m`, `1g` (also `2G`, `64KB`,
   or bare bytes) and caps payload bytes per DNG.
 - Without `-o`, the default is `<input>.dng` with sequence numbers
   inserted before the extension.
+- `--split-file-album` (on by default; `--no-split-file-album` disables)
+  groups chunks in `<output-dir>/<input-stem>/`, where `<input-stem>` is
+  the input basename minus its last extension (`huge.raw` -> `huge`).
+  Only takes effect with `--split-file` (a single-chunk payload still
+  lands inside the album dir).
 - Each chunk is an independent framed payload (own header/CRC), so a
   short last chunk needs no padding. If everything fits in one chunk,
   output is a plain single DNG with no split markers.
@@ -203,7 +214,7 @@ silences them. The Python API takes the same tri-state:
 | flag | default | what it does |
 |---|---|---|
 | `-i, --input` | (required) | payload file to embed |
-| `-o, --output` | `<input>.dng` | output DNG path; with `--split-file`, `0001`-style numbers go before the extension |
+| `-o, --output` | `<input>.dng` | output DNG path; with `--split-file`, `0001`-style numbers go before the extension; with `--split-file-album` (on) chunks move into `<output-dir>/<input-stem>/` |
 | `--width, --height` | auto | raw frame size; one-sided values complete via 4:3; pinned geometry only bumps planes |
 | `--gfx-native` | off | shortcut for `11648x8736` (~102 MP sensor scale) |
 | `--pixelshift` | off | shortcut for `23296x17472` (~407 MP combiner scale, GB-size file, needs lots of RAM) |
@@ -218,6 +229,7 @@ silences them. The Python API takes the same tri-state:
 | `--no-randomize` | off | keep reference metadata as-is instead of re-rolling identifiable fields |
 | `--thumbnail` | random | `random` (Commons photo, noise fallback offline), `synthetic` (built-in gradient), or path to an image |
 | `--split-file SIZE` | off | split into chunks of at most SIZE per DNG (`500k`, `100m`, `1g`, `2G`, `64KB`, bare bytes) |
+| `--split-file-album, --no-split-file-album` | on | group split chunks in `<output-dir>/<input-stem>/` (only with `--split-file`) |
 | `--split-file-metadata-id` | ImageUniqueID | metadata field for the shared chunk UUID (`ImageDescription`, or `none` for filenames only) |
 | `--split-file-metadata-seq` | ImageNumber | metadata field for the chunk number (`PageNumber`, `ImageDescription`, or `none`); see §3.3 |
 | `--split-file-id UUID` | fresh random | override the generated chunk-set UUID (handy for tests) |
@@ -268,8 +280,9 @@ usage: stego_dng.py encode [-h] --input INPUT [--output OUTPUT]
                            [--thumbnail THUMBNAIL] [--split-file SIZE]
                            [--split-file-metadata-id {ImageDescription,ImageUniqueID,none}]
                            [--split-file-metadata-seq {ImageDescription,ImageNumber,PageNumber,none}]
-                           [--split-file-id UUID] [--no-randomize]
-                           [--gfx-native] [--pixelshift]
+                           [--split-file-id UUID]
+                           [--split-file-album | --no-split-file-album]
+                           [--no-randomize] [--gfx-native] [--pixelshift]
                            [--raw-frames {1,2,3,4,5,6,7,8}] [--auto-size]
                            [--progress] [--no-progress]
 
@@ -278,7 +291,9 @@ options:
   --input, -i INPUT
   --output, -o OUTPUT   output DNG path (default: <input>.dng; with --split-
                         file the 0001-style sequence numbers are inserted
-                        before the .dng extension)
+                        before the .dng extension; with --split-file-album (on
+                        by default) chunks go in <output-dir>/<input-stem>/,
+                        e.g. -o vol.dng + -i huge.raw -> huge/vol0001.dng ...)
   --width WIDTH         raw image width (default: auto from input size)
   --height HEIGHT       raw image height (default: auto from input size)
   --seed SEED
@@ -316,6 +331,11 @@ options:
                         filenames)
   --split-file-id UUID  override the generated chunk-set UUID (default: fresh
                         random per split)
+  --split-file-album, --no-split-file-album
+                        group split chunks in a directory named after the
+                        input file without its extension (default: on; only
+                        with --split-file; use --no-split-file-album to write
+                        chunks beside the output path)
   --no-randomize
   --gfx-native          use 11648x8736
   --pixelshift          use 23296x17472 (needs lots of RAM)
