@@ -17,348 +17,142 @@ pytest tests/ -q                           # roundtrip tests
 pytest tests/ -q --cov=stegodng --cov=stego_dng --cov-report=term-missing  # coverage
 ```
 
-## 1. Research findings
+## 1. What it does
 
-### 1.1 TIFF/EP and DNG
+- **Hides bytes in raw pixels.** The payload is framed (`DNGS` magic +
+  version + flags + 64-bit length + CRC32, XOR keystream when `--key` is
+  given) and written into the low N bit planes (`--lsb-planes 1–16`) of
+  the raw SubIFD, spread over all tiles and channels.
+- **Looks like a combiner DNG.** Every output has the same skeleton:
+  IFD0 Baseline-JPEG thumbnail plus one or more raw SubIFDs, with EXIF,
+  XMP, and DNG tags copied from GFX 100 reference values.
+- **Capacity is predictable.** Usable bytes per file are approximately:
 
-* DNG (Adobe Digital Negative, ISO 12234-4) is a TIFF/EP profile: a classic
-  TIFF container (`II*\0`, IFD tag directory) plus mandated metadata
-  (DNGVersion, ColorMatrix, BlackLevel, …) and EXIF/XMP sub-IFDs.
-* TIFF/EP itself defines `SubIFDs` (tag 330), CFA layout tags
-  (`CFARepeatPatternDim` 33421, `CFAPattern` 33422), `CFAPlaneColor` (50710)
-  and `CFALayout` (50711) — the hooks that describe mosaic sensor data.
-* Compression tag 7 = JPEG. DNG readers must support baseline DCT JPEG for
-  thumbnails; raw data additionally uses lossless JPEG, and since DNG 1.4
-  also Deflate (tag 8, uncompressed = 1).
+  `samples × planes × frames / 8 − 18`
 
-### 1.2 What the sample files actually contain (`images/`)
+  where samples = width × height × channels (3 for `linear`, 1 for `cfa`).
 
-Analyzed with `tiffdump`, `exiv2 -pa` and `tifffile`:
-
-| file | size | finding |
-|---|---|---|
-| `DSCF0143.raf` … (GFX 100 II) | ~199 MB | `FUJIFILMCCD-RAW` header, embedded JPEG/EXIF preview at offset 0x94, proprietary compressed mosaic |
-| `image1-original.RAF`, `DSF0349.RAF` (GFX 100) | 70–116 MB | same layout, older firmware (`Ver3.00`) |
-| `image1-pixelshift.DNG`, `DSF0350.DNG`, `DSCF1294.DNG`, `fujifilm_gfx_100_pixel_shift_*.dng` | 1.0–1.6 GB | Pixel Shift Combiner output (see below) |
-
-Every combiner DNG has the **same two-IFD skeleton**:
-
-* **IFD0 — JPEG thumbnail**: 4000×3000, 8-bit YCbCr (`Photometric = 6`),
-  `Compression = 7`, single strip, `NewSubfileType = 1` (reduced preview).
-  Plus `Make = FUJIFILM`, `Model = GFX 100`,
-  `Software = FUJIFILM Pixel Shift Combiner`, `DateTime`, `SubIFDs → offset`,
-  12288-byte `XMP` (Rating 0 + space padding), `ExifTag → offset`, DNG tags
-  (`DNGVersion 1.4.0.0`, `UniqueCameraModel`, `ColorMatrix1/2`,
-  `AsShotNeutral`, `CameraSerialNumber`, `LensInfo`, huge `DNGPrivateData`
-  81–121 MB, `CalibrationIlluminant 17/21`).
-* **SubIFD — the raw image**: **23296×17472 (407 MP)**, 16-bit × 3 ch,
-  `PhotometricInterpretation = 34892` (LinearRaw, already demosaiced RGB),
-  tiled 128×96 (33124 tiles), `Compression = 7` (lossless JPEG),
-  `BlackLevel 255/256`, `WhiteLevel 65535`, `DefaultScale/Crop`,
-  `AntiAliasStrength`, `BestQualityScale`, 256-byte `OpcodeList3`.
-* **EXIF sub-IFD**: exposure (`ExposureTime`, `FNumber`, `ISOSpeedRatings`,
-  `ShutterSpeedValue`, `BrightnessValue`, …), timestamps, focus/drive info,
-  Fuji MakerNote (~1.2 KB), `BodySerialNumber`, `LensSpecification/Make/
-  Model/SerialNumber`.
-* **RAF → DNG conversion**: the GFX bodies write RAF, not DNG.
-  `DNGPrivateData` starts with `FUJIFILM…<name>.RAF` followed by a full
-  `FUJIFILMCCD-RAW` stream — i.e. the combiner **embeds the source RAF**
-  inside the DNG (priv-data length ≈ on-disk RAF size: 111 MB vs 70–116 MB).
-
-### 1.3 Animation / frames in DNG/TIFF — verdict
-
-TIFF supports multi-page files (`NextIFD` chains), SubIFD trees
-(DNG thumbnails/full raw), and SubIFD chains. There is **no video/
-animation timeline** in still DNG (CinemaDNG = sequence of DNGs, out of
-scope). So "frames" give us *layout* options, not temporal hiding:
-
-1. ✅ **Used**: IFD0 thumbnail + SubIFD raw (exactly like the combiner).
-2. ⚠️ **Documented alternative**: an extra hidden page/SubIFD carrying an
-   encrypted blob — trivially detectable by `exiv2`/tag dump, so it is
-   *not* the primary channel (a forensic `tiffdump` lists every IFD).
-3. ❌ Rejected: stuffing everything into one metadata tag (detectable,
-   size-limited, violates the brief).
-
-### 1.4 Bit depth — verdict
-
-* Combiner output is **16-bit** (`BitsPerSample 16 16 16`,
-  `WhiteLevel 65535`) even though the sensor ADC is 14/16-bit — headroom
-  that an LSB scheme exploits almost invisibly.
-* The tool supports `--bit-depth 8, 10, 12, 14, 16` (default 16).
-  Each depth is written as a **real packed `BitsPerSample`** tag
-  (8 → uint8 container; 10/12/14 → uint16 container with packed BPS;
-  verified with `exiv2` + `tifffile`), with matching `WhiteLevel`
-  (`2**depth - 1`) and scaled `BlackLevel` (256 @ 16-bit reference).
-  The synthetic cover is rescaled per depth so exposure stays constant
-  instead of saturating, and values are quantized to packed steps so
-  files round-trip exactly. `rawpy`/LibRaw opens every depth in both
-  `linear` and `cfa` modes.
-* Key point: **capacity scales with `--lsb-planes`, not with bit depth**
-  (`samples × planes / 8 − 18` bytes). Depth controls plausibility and
-  file size (packed 12-bit raw ≈ 25% smaller than 16-bit), while planes
-  1–16 trade stealth for up to 16× capacity (see §1.6 for the
-  detection cost of 5+). Depths below 14 are
-  spec-legal TIFF/DNG but less plausible as GFX 100 II output (the body
-  offers 14/16-bit), so prefer 14/16 for the cover story.
-* Deliberately **not** offered: 24/32-bit *integer* (`BitsPerSample`
-  24/32) — verified that LibRaw rejects such DNGs
-  (`LibRawFileUnsupportedError`), so files would fail the "opens in a
-  real RAW decoder" check. 32-bit *float* (DNG 1.4 HDR) is rawpy-readable
-  but needs a separate mantissa-bit codec — documented future work, not
-  implemented.
-
-### 1.5 Embedding options (as requested)
-
-| # | channel | payload home | stealth | implemented |
+| geometry | 1 plane | 2 planes | 4 planes | 16 planes |
 |---|---|---|---|---|
-| 1 | **LSB substitution in raw samples** (1–16 planes, 8/10/12/14/16-bit, spread over all tiles/channels, optional SHA-256 keystream; at 16 planes samples are pure payload, no cover remains) | raw SubIFD pixels | high (1–2) → moderate (3–4) → low (5–8) → none (9–16) — survives only lossless codecs | ✅ primary (`encode`/`decode`) |
-| 5 | **Multiple raw frames** (`--raw-frames 1–8`): full-res SubIFDs sharing one file, payload striped across them (burst/stack style) | N raw SubIFDs | very low — no still-DNG camera output looks like this | ✅ (`encode`/`decode` handle striping) |
-| 2 | Hidden extra IFD/SubIFD frame | file structure | low — listed by any TIFF tool | documented only |
-| 3 | `DNGPrivateData` / MakerNote / XMP padding blob | metadata | low — single-field anomaly | placeholder-size field only |
-| 4 | sub-16-bit slack (e.g. 14-bit values in packed container) | raw pixels | very high | ✅ via `--bit-depth 14` (also 8/10/12) |
+| 2048×1536 (default auto pick) | ~1.2 MB | ~2.4 MB | ~4.7 MB | ~18.9 MB |
+| 4000×3000 | ~4.5 MB | ~9.0 MB | ~18.0 MB | ~72.0 MB |
+| 11648×8736 (`--gfx-native`) | ~38.2 MB | ~76.3 MB | ~153 MB | ~611 MB |
+| 23296×17472 (`--pixelshift`) | ~153 MB | ~305 MB | ~611 MB | ~2.44 GB |
 
-Framing: `DNGS` magic + version + flags + u64 length + CRC32, then payload
-(XOR keystream when `--key` is given). Capacity:
-`samples × planes / 8 − 18` bytes.
+  Table uses decimal MB/GB (1 MB = 1,000,000 bytes); the CLI itself
+  reports KiB (1 KB = 1024 bytes, see `capacity` command).
 
-| geometry | mode | 1 plane | 2 planes | 4 planes | 16 planes |
-|---|---|---|---|---|---|
-| 2048×1536 (default demo) | linear RGB | ~1.1 MB | ~2.3 MB | ~4.7 MB | ~18.9 MB |
-| 4000×3000 | linear RGB | ~4.5 MB | ~9 MB | ~18 MB | ~72 MB |
-| 11648×8736 (`--gfx-native`, GFX 100 II) | linear RGB | ~38 MB | ~76 MB | ~152 MB | ~582 MB |
-| 23296×17472 (`--pixelshift`, 407 MP) | linear RGB | ~145 MB | ~291 MB | ~610 MB | ~2.3 GB |
-| any geometry | linear RGB, N `--raw-frames` | ×N | ×N | ×N | ×N (max: 8-frame pixelshift/16-plane ≈ 18.2 GiB) |
-| any | CFA mosaic (1 sample/px) | ÷3 of linear | ÷3 | ÷3 | ÷3 |
+  `--raw-frames 1–8` multiplies any row by N. `cfa` mosaic mode carries
+  1 sample/px, so divide linear capacities by 3.
 
-### 1.6 Density: what cameras actually vary, and what we implemented
+- **Decode needs almost nothing.** Plane count is auto-detected
+  (magic + CRC trial over 1–16); only `--key` must match. Explicit
+  `--lsb-planes` switches decode to strict mode.
+- **Big payloads can split.** `--split-file SIZE` stripes one input
+  across numbered DNGs with a shared UUID + sequence in metadata.
+- **Every file looks different.** Cover pixels, thumbnail picture, and
+  identifiable EXIF fields are re-rolled per encode (seeded by `--seed`).
+  See §6 for the full field list.
+- **Covers and previews are synthetic by default.** The raw is a
+  gradient + noise field; the IFD0 JPEG is a random Commons photo
+  (with offline noise fallback), a built-in gradient, or your own image.
 
-Capacity is `samples × planes × frames / 8 − 18` bytes, so density comes
-from exactly three knobs — and they are the same knobs real cameras and
-the DNG spec use:
+## 2. Usage
 
-1. **Resolution (samples).** The combiner's 23296×17472 output is already
-   extreme (407 MP); presets span demo → combiner-scale → gfx-native →
-   pixelshift, plus exact-fit `--auto-size` and free `--width/--height`.
-2. **Bit depth (bits per sample).** GFX 100 II bodies offer 14/16-bit;
-   the tool writes real packed 8/10/12/14/16-bit `BitsPerSample`.
-3. **Channel count.** Combiner output is demosaiced LinearRaw (3
-   samples/px); `cfa` mosaic mode carries 1 sample/px (÷3 capacity).
-4. **Lossless compression — useless here, by measurement.** Random
-   (and especially encrypted) payload bits are incompressible;
-   `--compression adobe_deflate` saved only ~16% on a 2-plane test file,
-   so it stays an opt-in for modest savings, never a density strategy.
-5. **Multiple raw frames (`--raw-frames 1–8`).** Multi-image TIFFs are
-   established practice (focus/exposure stacks ship as multi-page TIFFs;
-   burst modes and CinemaDNG store frame sequences), but multiple
-   *full-resolution raw SubIFDs in one still DNG* is non-standard — no
-   GFX combiner output looks like this. Payload is striped bit-wise
-   across frames in write order; `decode` concatenates frame bitstreams.
-   File size grows ~linearly per frame.
-6. **BigTIFF (DNG 1.6) as an enabler, not a strategy.** Past ~4 GB
-   (e.g. pixelshift ×2+ frames) the writer switches to 64-bit BigTIFF
-   and the EXIF/LinearRaw patch steps handle both layouts (verified at
-   byte level). Caveat: exiv2 cannot parse BigTIFF at all; tifffile and
-   rawpy can.
-
-Deliberately **not** implemented, with reasons:
-
-* **DNG 1.4 32-bit float (HDR).** Genuinely used for HDR merges and some
-  phone HDR paths, and rawpy-readable — but hiding data means touching
-  mantissa bits only, i.e. *fewer* payload bits per stored byte than
-  integer full-replace. A stealth niche, never a density win.
-* **24/32-bit integer.** LibRaw rejects such DNGs outright (verified),
-  so files fail the real-decoder check.
-* **DNG 1.7 JPEG XL.** Lossy modes destroy LSBs by design.
-
-Detection-risk summary (every one of these also prints a CLI `warning:`
-at encode time when triggered):
-
-| option | telltales an inspector sees |
-|---|---|
-| `--lsb-planes 5–8` | cover heavily degraded; bit-plane statistics skewed |
-| `--lsb-planes 9–15` | raw renders as degraded noise; histogram flat |
-| `--lsb-planes 16` | **no cover at all** — samples are pure payload; trivially exposed by any bit-plane/entropy check (use `--key` so at least contents are opaque) |
-| `--raw-frames 2–8` | N full-res SubIFDs in `tiffdump`/`exiv2`; ~N× file size |
-| `--bit-depth 8/10/12` | `BitsPerSample` below every GFX 100 II option (14/16) |
-| `--auto-size` | dimensions match no camera preset (e.g. 462×348) |
-| packed depth + deflate | rejected outright (tifffile limitation) |
-
-### 1.7 Thumbnails: how desktops show DNGs (researched)
-
-Neither Windows Explorer nor Nautilus renders the 16-bit raw for an
-icon — both show the **embedded IFD0 JPEG preview**, which is exactly
-what this tool writes (Baseline JPEG, YCbCr, same layout as the
-combiner files):
-
-* **Windows Explorer** cannot parse DNG natively; thumbnails come from
-  WIC codecs (Microsoft's *Raw Image Extension* from the Store, vendor
-  codec packs, or the legacy Adobe DNG Codec). The codec reads the IFD0
-  preview, never the raw mosaic.
-* **Ubuntu Nautilus** never parses images itself: it shells out to
-  registered `.thumbnailer` helpers (for RAW typically
-  `gnome-raw-thumbnailer`, which extracts the embedded preview, or the
-  darktable/RawTherapee thumbnailers). No RAW thumbnailer is installed
-  in this container, so verify on a real desktop; any thumbnailer that
-  handles combiner DNGs handles ours — same IFD0 construction.
-* **Recommended size.** The DNG spec only requires *a* thumbnail in
-  IFD0; viewers downscale it to 128–512 px cache entries regardless.
-  We keep combiner parity: up to 4000×3000 (capped by image dims), same
-  aspect as the raw frame. Verified: IFD0 extracts with `tifffile` and
-  decodes with Pillow to the exact frame size with faithful colors.
-
-The *picture* inside that JPEG defaults to a random photo from
-Wikimedia Commons (`Special:Random/Image` → redirect resolved to the
-`File:` page → pixels via `Special:FilePath?width=` server-side
-downscale, non-photo types skipped with another pick). Chain verified
-live, including the redirect hops. Behavior notes:
-
-* source is center-cropped to the thumbnail frame aspect and
-  Lanczos-resized — never stretched;
-* any fetch/decode failure (offline included) falls back to a small
-  generated noise image after 3 attempts (~10 s timeout each), so
-  offline encodes keep working — pass `--thumbnail synthetic` to skip
-  the network entirely, or `--thumbnail PATH` for your own picture;
-* found and fixed while doing this: tifffile stores YCbCr JPEG planes
-  verbatim, so the old code's RGB input decoded with swapped chroma
-  (regression test: solid-red thumbnail decodes red-dominant).
-
-## 2. Metadata: static vs randomized
-
-Static fields are copied verbatim from the combiner samples
-(`ColorMatrix1/2`, `CalibrationIlluminant 17/21`, `AnalogBalance`,
-`OpcodeList3` 256-byte blob, `Make`, `Model`, `Software`, XMP skeleton…).
-Every `encode` re-rolls the identifiable fields (seeded by `--seed`):
-
-randomized: `DateTime` (+`DateTimeOriginal/Digitized`, `OffsetTime*`,
-`SubSecTime*`), `ExposureTime`/`ShutterSpeedValue`, `FNumber`/`ApertureValue`,
-`ExposureProgram`, `ISOSpeedRatings`, `MeteringMode`, `FocalLength`
-(+35 mm equiv, consistent GF lens pick from 8 real lenses),
-`MaxApertureValue`, `BrightnessValue`, `ExposureBiasValue`,
-`CameraSerialNumber`, `BodySerialNumber`, `LensSerialNumber`,
-`AsShotNeutral`, `BaselineExposure`, plus fresh cover and
-thumbnail pixels. No GPS tags are written (samples have none).
-(`ImageNumber` is *not* randomized — on split chunks it carries the
-deterministic chunk sequence; plain files omit it.)
-
-## 3. Usage
+### 2.1 Basic encode / decode
 
 ```bash
-# embed: omit sizing flags and the smallest fitting config is auto-chosen
-python stego_dng.py encode -i secret.bin --seed 42  # -> secret.bin.dng (-o optional)
-python stego_dng.py encode -i secret.bin -o out.dng --seed 42  # explicit output
-# ... or exact-fit dimensions for the smallest possible file (see tradeoff below)
-python stego_dng.py encode -i secret.bin -o small.dng --auto-size --seed 42
-# ... or pin any subset explicitly (the rest still auto-fits)
+# smallest fitting preset is auto-chosen; -o optional (<input>.dng)
+python stego_dng.py encode -i secret.bin --seed 42
+python stego_dng.py encode -i secret.bin -o out.dng --seed 42
+
+# encrypted payload
 python stego_dng.py encode -i secret.bin -o big.dng --gfx-native --seed 7 --key s3cret
+
+# mosaic layout, packed depth, 2 planes
 python stego_dng.py encode -i secret.bin -o cfa.dng --mode cfa --bit-depth 14 --lsb-planes 2
-python stego_dng.py encode -i secret.bin -o max.dng --gfx-native --bit-depth 16 --lsb-planes 4  # max stealth-off capacity
-python stego_dng.py encode -i huge.bin -o stack.dng --auto-size --raw-frames 4 --lsb-planes 16 --key s3cret  # max density, max risk
-python stego_dng.py encode -i secret.bin -o mypic.dng --thumbnail photo.jpg  # own preview picture
-# split a big payload: ≤100 MB per DNG, DCF-style numbered files
-python stego_dng.py encode -i huge.raw --split-file 100m --seed 7
-# -> huge.raw0001.dng huge.raw0002.dng ... (shared UUID + sequence in metadata)
-# (explicit -o still works: -o vol.dng -> vol0001.dng vol0002.dng ...)
-python stego_dng.py decode -i vol0001.dng vol0002.dng -o huge.raw
 
-# progress bars: encode/decode show tqdm bars on a TTY (per-chunk
-# `Embedding`/`Extracting` bars plus an outer `Encoding chunks` /
-# `Decoding chunks` file counter for --split-file sets); pass
-# --progress to force them on when piped, --no-progress to silence.
-# The Python API takes the same tri-state: progress=True/False/None
-# (None = auto/TTY only, the default).
-python stego_dng.py encode -i secret.bin -o out.dng --progress
-# extract (--lsb-planes auto-detected; only --key must match)
+# own preview picture instead of a random/synthetic one
+python stego_dng.py encode -i secret.bin -o mypic.dng --thumbnail photo.jpg
+
+# extract (planes auto-detected; only --key must match)
 python stego_dng.py decode -i out.dng -o recovered.bin
-# opt-in safety cap on the declared payload per file (default: image
-# capacity, so any file this tool can encode also decodes)
-python stego_dng.py decode -i out.dng -o recovered.bin --max-bytes 500m
 
-# helpers
-python stego_dng.py capacity --width 23296 --height 17472 --lsb-planes 4
-python stego_dng.py gen-tiff -o cover.tif --width 1024 --height 768
+# safety cap on the declared payload per file (default: image capacity)
+python stego_dng.py decode -i out.dng -o recovered.bin --max-bytes 500m
 ```
 
-Auto-sizing (`recommend_config()`): with no sizing flags, `encode` walks
-`2048x1536 -> 4000x3000 -> 11648x8736 (gfx-native) -> 23296x17472
-(pixelshift)`, picking the smallest geometry — and within it the fewest
-LSB planes (1-16, capped by the bit depth) — that fits the input
-(defaults: `linear`, 16-bit; `--raw-frames` multiplies capacity).
-Pinning `--width/--height` keeps your geometry and only bumps planes;
-pinning `--lsb-planes` keeps your stealth level and only grows geometry.
-A one-sided `--width`/`--height` completes via the 4:3 GFX aspect.
-`--auto-size` instead computes the smallest even 4:3 width/height holding
-the payload (floored at 64x48), ignoring the presets entirely — files get
-much smaller (a 58.6 KB payload: 1.3 MB file vs 20.3 MB at the auto
-2048x1536 preset), but arbitrary dimensions like 462x348 match no real
-GFX output and may look unusual under inspection. That stealth-vs-size
-tradeoff is the user's call; every `--auto-size` run prints a warning
-saying so. `--auto-size` cannot be combined with
-`--width/--height/--gfx-native/--pixelshift`.
-If nothing fits, the error states the payload size, the relevant maximum
-(absolute single-frame max: 23296x17472 linear 16-bit, 16 planes =
-2,384,928.0 KB; `--raw-frames 8` multiplies any capacity ×8)
-and suggests larger geometry / more planes / auto-sizing / splitting the
-input. `decode` needs no sizing flags: it tries 1-16 planes and accepts the
-one passing the magic+CRC check (explicit `--lsb-planes` = strict mode).
-`decode` bounds the accepted payload by the image capacity, so every
-encodable file decodes by default; `--max-bytes SIZE` (same `1g`/`100m`/
-`500k`/bare-count syntax as `--split-file`) opts into a smaller safety cap per
-file, and the API's `max_bytes=None` default behaves the same (pass an int
-to cap). For untrusted files, pass an explicit `--max-bytes`/`max_bytes`
-to bound the allocation before the capacity check runs. When a header match
-is rejected by that cap or by capacity, the error names the limit instead
-of the generic wrong-key hint.
+### 2.2 Sizing
 
-All user-facing sizes (encode/decode/capacity output and errors) are
-reported in kilobytes.
+With no sizing flags, `encode` picks the smallest preset — and within it
+the fewest LSB planes — that fits the input:
 
-### Splitting one payload across files
+`2048x1536 -> 4000x3000 -> 11648x8736 (gfx-native) -> 23296x17472 (pixelshift)`
 
-`--split-file SIZE` (kilobytes/megabytes/gigabytes: `500k`, `100m`,
-`1g`, also `2G`, `64KB`, or bare bytes) caps the payload bytes per DNG.
-`-o` is optional: without it the output defaults to `<input>.dng`
-(e.g. `secret.bin` -> `secret.bin.dng`); with `--split-file` the
-sequence numbers are inserted before that extension (e.g. `huge.raw`
--> `huge.raw0001.dng`, `huge.raw0002.dng`, …).
-With an explicit `-o out.dng`, chunks become `out0001.dng`,
-`out0002.dng`, … — 4-digit sequences
-from 0001 in the spirit of DCF camera filenames. Each chunk is an
-independent framed payload (own header/CRC), so a short last chunk
-needs no padding and no resolution tricks; a corrupt chunk fails on its
-own CRC. If everything fits in one chunk, output is a plain single DNG
-with no split markers at all — i.e. `<input>.dng` on the default path
-(or the exact `-o` path), not a `0001`-numbered file.
+Defaults inside that search are `linear`, 16-bit, 1 frame.
+The chosen config is printed as an `auto-config ...` line.
 
-Chunk bookkeeping lives in two metadata fields (split-only; plain files
-omit them):
+```bash
+# exact-fit dimensions for the smallest possible file (see tradeoff below)
+python stego_dng.py encode -i secret.bin -o small.dng --auto-size --seed 42
 
-| flag | default | alternatives | `none` |
-|---|---|---|---|
-| `--split-file-metadata-id` | `ImageUniqueID` (EXIF 42016: a genuine per-image UUID field; a UUID4 hex fits its 32-char format natively) | `ImageDescription` | shared set UUID unwritten |
-| `--split-file-metadata-seq` | `ImageNumber` (TIFF/EP tag 0x9211 = 37393 decimal in EXIF: exists precisely to number images in a sequence; renders in exiv2 only with `-u` as `0x9211`, recognized by name in ExifTool) | `PageNumber` (stores sequence+total natively), `ImageDescription` (`0003/0012` text) | sequence unwritten |
+# maximum plausible single-frame density
+python stego_dng.py encode -i secret.bin -o max.dng --gfx-native --bit-depth 16 --lsb-planes 4
 
-Fail-open warning: `ImageNumber` stores a scalar with **no total**, so
-decoding a consecutive-from-0001 subset (e.g. chunks 1–2 of 3) succeeds
-and silently returns truncated data — pinned by test, not accidental.
-Use `PageNumber` when a missing tail must fail closed (decode then
-rejects subsets against the declared total).
+# maximum absolute density (noisy, non-standard, encrypt it)
+python stego_dng.py encode -i huge.bin -o stack.dng --auto-size --raw-frames 4 --lsb-planes 16 --key s3cret
+```
 
-Tradeoff to know: the shared UUID *links* the chunks (its purpose —
-renamed files still reassemble by UUID order), which a forensic pass
-can also see; `none`/`none` leaves sequencing purely to filenames.
-`--split-file-id` overrides the generated UUID (handy for tests).
+Rules of thumb:
 
-Decode takes several `-i` files and verifies the set: metadata (when
-present) must agree on one UUID with 1..N sequences and matching
-totals, otherwise filenames must be one stem with consecutive numbers
-from 0001. Mixed sets (some files marked, some not), gaps
-(`test0001` + `test0003` → missing `0002`), and starts past 0001 all
-fail with the missing numbers spelled out. Without totals (fields
-`none`), the given files are assumed complete — a forgotten file is on
-you. One lone chunk decodes with a partial-data warning.
+- Pinning `--width/--height` keeps your geometry and only bumps planes.
+- Pinning `--lsb-planes` keeps your stealth level and only grows geometry.
+- A one-sided `--width`/`--height` completes via the 4:3 GFX aspect.
+- `--auto-size` computes the smallest even 4:3 frame holding the payload
+  (floored at 64x48). Files get much smaller (a 58.6 KB payload: ~1.3 MB
+  vs ~20.3 MB at the 2048x1536 preset), but dimensions like 462x348 match
+  no real GFX output. Every `--auto-size` run prints a warning; the
+  tradeoff is yours.
+- `--auto-size` cannot be combined with
+  `--width/--height/--gfx-native/--pixelshift`.
+- If nothing fits, the error states the payload size, the relevant
+  maximum, and suggests larger geometry, more planes, more frames,
+  auto-sizing, or splitting.
+- `decode` bounds the accepted payload by image capacity, so every
+  encodable file decodes by default. For untrusted files, pass an
+  explicit `--max-bytes` to bound the allocation first.
 
-Python API (package `stegodng`; `stego_dng.py` remains as a thin
-compatibility shim re-exporting the old names):
+All user-facing sizes (output, errors, `capacity`) are kilobytes.
+
+### 2.3 Splitting one payload across files
+
+```bash
+# ≤100 MB of payload per DNG, DCF-style numbered files
+python stego_dng.py encode -i huge.raw --split-file 100m --seed 7
+# -> huge.raw0001.dng huge.raw0002.dng ...
+
+# explicit -o still works: -o vol.dng -> vol0001.dng vol0002.dng ...
+python stego_dng.py encode -i huge.raw -o vol.dng --split-file 100m --seed 7
+python stego_dng.py decode -i vol0001.dng vol0002.dng -o huge.raw
+```
+
+- `--split-file SIZE` accepts `500k`, `100m`, `1g` (also `2G`, `64KB`,
+  or bare bytes) and caps payload bytes per DNG.
+- Without `-o`, the default is `<input>.dng` with sequence numbers
+  inserted before the extension.
+- Each chunk is an independent framed payload (own header/CRC), so a
+  short last chunk needs no padding. If everything fits in one chunk,
+  output is a plain single DNG with no split markers.
+- Chunks share a UUID and carry a sequence number in metadata (see §3.3).
+  Decode verifies the set: one UUID, sequences 1..N, matching totals when
+  the field stores them. Gaps, mixed sets, and starts past 0001 fail with
+  the missing numbers spelled out. Without totals, the given files are
+  assumed complete. One lone chunk decodes with a partial-data warning.
+
+### 2.4 Python API
+
+Package `stegodng`; `stego_dng.py` is a thin compatibility shim
+re-exporting the old names.
 
 ```python
 from stegodng import DngStego, AutoSizer
@@ -384,64 +178,344 @@ Module layout:
 | `stego.py` | `DngStego` | `encode` / `decode` / `generate_tiff` orchestration |
 | `progress.py` | — | tqdm helpers (stderr bars, `True`/`False`/`None`=auto) |
 | `cli.py` | — | `encode` / `decode` / `capacity` / `gen-tiff` commands |
-| `thumbnails.py` | `ThumbnailProvider` | random-Commons / synthetic / file preview pictures, aspect crop + resize, noise fallback |
+| `thumbnails.py` | `ThumbnailProvider` | random-Commons / synthetic / file preview pictures |
 
+### 2.5 Helpers and progress bars
 
-## 4. Implementation notes
+```bash
+python stego_dng.py capacity --width 23296 --height 17472 --lsb-planes 4
+python stego_dng.py gen-tiff -o cover.tif --width 1024 --height 768
 
-* Writer: `tifffile.TiffWriter` (IFD0 JPEG thumbnail + SubIFD raw, tiled
-  128×96 like the combiner) → in-place patch of SubIFD
+# force progress bars on when piped (default: TTY only)
+python stego_dng.py encode -i secret.bin -o out.dng --progress
+```
+
+Encode/decode show tqdm bars on a TTY (per-chunk `Embedding`/`Extracting`
+bars plus an outer `Encoding chunks` / `Decoding chunks` counter for
+`--split-file` sets). `--progress` forces them on, `--no-progress`
+silences them. The Python API takes the same tri-state:
+`progress=True/False/None` (`None` = auto, the default).
+
+## 3. Options reference
+
+### 3.1 `encode` flags
+
+| flag | default | what it does |
+|---|---|---|
+| `-i, --input` | (required) | payload file to embed |
+| `-o, --output` | `<input>.dng` | output DNG path; with `--split-file`, `0001`-style numbers go before the extension |
+| `--width, --height` | auto | raw frame size; one-sided values complete via 4:3; pinned geometry only bumps planes |
+| `--gfx-native` | off | shortcut for `11648x8736` (~102 MP sensor scale) |
+| `--pixelshift` | off | shortcut for `23296x17472` (~407 MP combiner scale, GB-size file, needs lots of RAM) |
+| `--auto-size` | off | compute the smallest even 4:3 frame that fits; smallest files, non-standard dims |
+| `--lsb-planes 1–16` | fewest fitting | payload bit planes per sample; capacity scales linearly; 3+ visibly degrade, 9+ destroy most cover, 16 = pure payload |
+| `--bit-depth 8/10/12/14/16` | 16 | packed `BitsPerSample`; controls plausibility and file size, not capacity per plane |
+| `--mode linear\|cfa` | linear | demosaiced RGB (3 samples/px) vs mosaic (1 sample/px, ÷3 capacity) |
+| `--raw-frames 1–8` | 1 | full-res raw SubIFDs in one file; capacity ×N, file size ~×N, non-standard for still DNGs |
+| `--compression` | none | `none` (widest support) or `adobe_deflate` (lossless, only with 8/16-bit) |
+| `--key` | none | passphrase; header + body are XOR-masked with a SHA-256 keystream |
+| `--seed` | random | seeds cover pixels, thumbnail choice, and metadata re-rolling |
+| `--no-randomize` | off | keep reference metadata as-is instead of re-rolling identifiable fields |
+| `--thumbnail` | random | `random` (Commons photo, noise fallback offline), `synthetic` (built-in gradient), or path to an image |
+| `--split-file SIZE` | off | split into chunks of at most SIZE per DNG (`500k`, `100m`, `1g`, `2G`, `64KB`, bare bytes) |
+| `--split-file-metadata-id` | ImageUniqueID | metadata field for the shared chunk UUID (`ImageDescription`, or `none` for filenames only) |
+| `--split-file-metadata-seq` | ImageNumber | metadata field for the chunk number (`PageNumber`, `ImageDescription`, or `none`); see §3.3 |
+| `--split-file-id UUID` | fresh random | override the generated chunk-set UUID (handy for tests) |
+| `--progress / --no-progress` | auto (TTY) | force progress bars on / off |
+
+### 3.2 `decode` flags
+
+| flag | default | what it does |
+|---|---|---|
+| `-i, --input` | (required, repeatable) | one DNG, or several chunk files to concatenate |
+| `-o, --output` | (required) | recovered payload path |
+| `--key` | none | must match the encode passphrase; wrong key fails on magic/CRC |
+| `--lsb-planes 1–16` | auto-detect | try 1–16 planes, accept the one passing magic+CRC; explicit value = strict mode |
+| `--max-bytes SIZE` | image capacity | safety cap on the declared payload per file (`1g`, `500m`, `64KB`, bare count); pass an explicit cap for untrusted files |
+| `--split-file-metadata-id` | ImageUniqueID | chunk-UUID field; must match the encode setting |
+| `--split-file-metadata-seq` | ImageNumber | chunk-sequence field; must match the encode setting |
+| `--progress / --no-progress` | auto (TTY) | force progress bars on / off |
+
+`capacity` takes `--width/--height/--mode/--lsb-planes/--raw-frames` and
+prints sample count + KB capacity. `gen-tiff` takes `-o/--width/--height/
+--seed` and writes a plain TIFF cover (no payload).
+
+### 3.3 Split bookkeeping fields
+
+| flag | default | alternatives | `none` |
+|---|---|---|---|
+| `--split-file-metadata-id` | `ImageUniqueID` (EXIF 42016: genuine per-image UUID field) | `ImageDescription` | shared set UUID unwritten |
+| `--split-file-metadata-seq` | `ImageNumber` (TIFF/EP 0x9211: image-sequence tag, but no total) | `PageNumber` (sequence+total, fails closed), `ImageDescription` (`0003/0012` text) | sequence unwritten |
+
+Fail-open warning: `ImageNumber` stores a scalar with **no total**, so
+decoding a consecutive-from-0001 subset (e.g. chunks 1–2 of 3) succeeds
+and silently returns truncated data. Use `PageNumber` when a missing tail
+must fail closed. `--split-file-id` overrides the generated UUID.
+
+### 3.4 Full `--help` output
+
+Regenerated with `COLUMNS=80`; if these blocks ever disagree with
+`python stego_dng.py <cmd> --help`, trust the live CLI — the tables in
+§3.1/§3.2 are the human-readable summary.
+
+```text
+usage: stego_dng.py encode [-h] --input INPUT [--output OUTPUT]
+                           [--width WIDTH] [--height HEIGHT] [--seed SEED]
+                           [--key KEY]
+                           [--lsb-planes {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16}]
+                           [--bit-depth {8,10,12,14,16}] [--mode {linear,cfa}]
+                           [--compression {none,adobe_deflate}]
+                           [--thumbnail THUMBNAIL] [--split-file SIZE]
+                           [--split-file-metadata-id {ImageDescription,ImageUniqueID,none}]
+                           [--split-file-metadata-seq {ImageDescription,ImageNumber,PageNumber,none}]
+                           [--split-file-id UUID] [--no-randomize]
+                           [--gfx-native] [--pixelshift]
+                           [--raw-frames {1,2,3,4,5,6,7,8}] [--auto-size]
+                           [--progress] [--no-progress]
+
+options:
+  -h, --help            show this help message and exit
+  --input, -i INPUT
+  --output, -o OUTPUT   output DNG path (default: <input>.dng; with --split-
+                        file the 0001-style sequence numbers are inserted
+                        before the .dng extension)
+  --width WIDTH         raw image width (default: auto from input size)
+  --height HEIGHT       raw image height (default: auto from input size)
+  --seed SEED
+  --key KEY             passphrase for payload encryption
+  --lsb-planes {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16}
+                        LSB planes used (default: fewest fitting the input;
+                        capacity scales linearly; 3+ degrade the cover, 9+
+                        destroy most of it, 16 = samples are pure payload)
+  --bit-depth {8,10,12,14,16}
+                        packed BitsPerSample of the raw SubIFD (default: 16)
+  --mode {linear,cfa}   raw layout (default: linear)
+  --compression {none,adobe_deflate}
+                        raw SubIFD compression (none = widest viewer support;
+                        adobe_deflate only with bit_depth 8/16)
+  --thumbnail THUMBNAIL
+                        preview picture: 'random' (Wikimedia Commons photo,
+                        noise fallback offline), 'synthetic' (built-in
+                        gradient), or a path to an image file
+  --split-file SIZE     split the payload into chunks of at most SIZE per DNG
+                        (e.g. 1g, 100m, 500k, 2G, 64KB, or bytes); files are
+                        named <stem>0001<suffix> ... (DCF-style 4-digit
+                        sequence)
+  --split-file-metadata-id {ImageDescription,ImageUniqueID,none}
+                        metadata field for the UUID shared by all chunks of
+                        one split (default ImageUniqueID: a genuine EXIF UUID
+                        field; ImageDescription also available; 'none' writes
+                        nothing and relies on filenames)
+  --split-file-metadata-seq {ImageDescription,ImageNumber,PageNumber,none}
+                        metadata field for the chunk sequence number (default
+                        ImageNumber: TIFF/EP's image-sequence tag, but it
+                        carries no total so a consecutive subset decodes
+                        without error; PageNumber stores sequence+total
+                        natively and fails closed, ImageDescription stores
+                        'NNNN/MMMM' text; 'none' writes nothing and relies on
+                        filenames)
+  --split-file-id UUID  override the generated chunk-set UUID (default: fresh
+                        random per split)
+  --no-randomize
+  --gfx-native          use 11648x8736
+  --pixelshift          use 23296x17472 (needs lots of RAM)
+  --raw-frames {1,2,3,4,5,6,7,8}
+                        full-resolution raw SubIFDs sharing one file
+                        (burst/stack style, 1-8); capacity scales with frames
+                        but so does file size, and multiple raw frames are
+                        non-standard for still DNGs)
+  --auto-size           compute the smallest 4:3 width/height fitting the
+                        input (smaller files, but non-standard dimensions may
+                        look unusual under inspection; cannot be combined with
+                        --width/--height/--gfx-native/--pixelshift)
+  --progress            force progress bars on (by default they show on a TTY
+                        and stay quiet when output is piped)
+  --no-progress         disable progress bars
+```
+
+```text
+usage: stego_dng.py decode [-h] --input INPUT [INPUT ...] --output OUTPUT
+                           [--key KEY]
+                           [--lsb-planes {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16}]
+                           [--max-bytes SIZE]
+                           [--split-file-metadata-id {ImageDescription,ImageUniqueID,none}]
+                           [--split-file-metadata-seq {ImageDescription,ImageNumber,PageNumber,none}]
+                           [--progress] [--no-progress]
+
+options:
+  -h, --help            show this help message and exit
+  --input, -i INPUT [INPUT ...]
+                        one DNG, or several chunk files to concatenate
+                        (verified via split metadata, else 0001-style names)
+  --output, -o OUTPUT
+  --key KEY
+  --lsb-planes {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16}
+                        LSB planes used at encode time (default: auto-detect)
+  --max-bytes SIZE      safety cap on the accepted declared payload per file
+                        (e.g. 1g, 500m, 64KB, or bare count; default: image
+                        capacity, so any file this tool can encode also
+                        decodes; pass an explicit cap for untrusted files)
+  --split-file-metadata-id {ImageDescription,ImageUniqueID,none}
+                        metadata field holding the shared chunk-set UUID (must
+                        match the encode setting)
+  --split-file-metadata-seq {ImageDescription,ImageNumber,PageNumber,none}
+                        metadata field holding the chunk sequence (must match
+                        the encode setting)
+  --progress            force progress bars on (by default they show on a TTY
+                        and stay quiet when output is piped)
+  --no-progress         disable progress bars
+```
+
+## 4. How it works
+
+- **Container.** `tifffile.TiffWriter` writes IFD0 (tiled Baseline-JPEG
+  thumbnail, YCbCr, 128×96 tiling like the combiner) plus the raw
+  SubIFD(s). Post-write patching flips SubIFD
   `PhotometricInterpretation` 2 → 34892 (LinearRaw; tifffile can only
-  *write* that geometry as RGB) → EXIF Sub-IFD appended at EOF and linked
-  via tag 34665 (tifffile filters IFD-pointer tags, so a same-size dummy
-  private tag is repurposed — no byte shifting). CFA mode additionally
-  writes `CFAPlaneColor`/`CFALayout`, which LibRaw requires.
-* **Lossless only**: the raw SubIFD defaults to *uncompressed*. Reason
-  found by experiment: the LibRaw in this environment decodes uncompressed
-  DNG fine but fails on Adobe-Deflate DNG (`unexpected EOF`); lossy JPEG
-  would destroy LSBs by design. `--compression adobe_deflate` remains as
-  an opt-in (still lossless → payload-safe, tifffile-decodable).
-* Verified: `tiffdump` layout ≈ reference, `exiv2 -pa` shows the full
-  Maker/EXIF/DNG/XMP set, `rawpy.imread` + postprocess succeeds for both
-  `linear` and `cfa` outputs at every supported depth (8/10/12/14/16) and
-  1–16 LSB planes and 1–8 frames, and `decode(encode(x)) == x` for all
-  combinations
-  (see `tests/test_stego.py`).
-* Constraint found by experiment: tifffile cannot combine packed
-  `BitsPerSample` (10/12/14) with compression, so `--compression
-  adobe_deflate` is only accepted with `--bit-depth 8/16` (full-width);
-  packed depths always write uncompressed (still lossless → payload-safe).
-* **In-place embedding (memory)**: `LsbCodec.stripe_frames` /
-  `LsbCodec.embed_bits` embed directly into the passed cover arrays and
-  return those same objects — a cover is *consumed* by embedding, so do
-  not reuse it afterwards (re-embedding the same frame is idempotent,
-  but old pixel values are gone). Contrast `embed_bitarray`, the legacy
-  bit-array helper, which still allocates and returns a new array.
-* `requirements.txt`: `numpy`, `pillow`, `tifffile[all]`, `tqdm`
-  (`rawpy` optional, decode verification only). Dev-only test deps
-  (`pytest`, `pytest-cov`) live in `requirements-dev.txt`.
-* **Progress bars** (`tqdm`, stderr so stdout stays parseable): single
-  files show one `Embedding`/`Extracting` bitstream bar; `--split-file`
-  sets add an outer `Encoding chunks`/`Decoding chunks` file counter
-  with nested per-chunk bars. Disabled automatically when stderr is not
-  a TTY (`progress=None` default); force with `--progress` /
-  `progress=True`, silence with `--no-progress` / `progress=False`.
-  Bars never alter output bytes (verified: identical raw arrays across
-  all progress modes).
+  *write* that geometry as RGB), appends an EXIF SubIFD at EOF, and links
+  it via tag 34665 (tifffile filters IFD-pointer tags, so a same-size
+  dummy private tag is repurposed — no byte shifting). CFA mode
+  additionally writes `CFAPlaneColor`/`CFALayout`, which LibRaw requires.
+  All offset handling is BigTIFF-aware.
+- **Cover.** The raw starts as a synthetic gradient + noise field,
+  rescaled per bit depth so exposure stays constant, quantized to packed
+  steps so files round-trip exactly. `LsbCodec` embeds in place
+  (the cover array is consumed — do not reuse it afterwards).
+- **Codec and framing.** Payload → 18-byte header + body → LSB planes of
+  every sample, striped bit-wise across frames in write order. `decode`
+  concatenates frame bitstreams and accepts the first plane count passing
+  magic + CRC. Capacity comes only from samples × planes × frames;
+  bit depth changes file size and plausibility, not bytes per plane.
+- **Lossless only.** The raw defaults to uncompressed: the LibRaw in this
+  environment fails on Adobe-Deflate DNG, and any lossy codec would
+  destroy LSBs by design. `--compression adobe_deflate` is an opt-in
+  (still lossless, tifffile-decodable). Packed depths (10/12/14) cannot
+  combine with compression (tifffile limitation), so they always write
+  uncompressed.
+- **Thumbnails.** The IFD0 JPEG is what desktops actually show (see §6).
+  Sources: `random` (Commons photo, center-cropped and Lanczos-resized,
+  3 attempts then noise fallback so offline encodes keep working),
+  `synthetic` (built-in gradient), or a file path. RGB is converted to
+  YCbCr before writing — tifffile stores JPEG planes verbatim, so writing
+  RGB directly swaps chroma.
+- **Sizing.** `AutoSizer.recommend()` walks presets smallest-first and
+  picks the fewest planes that fit; `--auto-size` instead solves for the
+  smallest even 4:3 frame. `frames` is never auto-bumped, only validated.
+  `--lsb-planes` may not exceed `--bit-depth` (values would overflow the
+  declared `WhiteLevel`).
+- **Split sets.** One input → N independent framed chunks, 4-digit
+  DCF-style names (`vol0001.dng` …), shared UUID + per-file sequence in
+  the configured metadata fields (or filenames only with `none`/`none`).
+- **Keystream.** Optional `--key` XOR-masks header and body with a
+  SHA-256 counter stream. It hides contents from casual LSB inspection;
+  it is not authenticated encryption. A wrong key fails closed on
+  magic/CRC.
+- **Verification.** `tiffdump` layout ≈ reference, `exiv2 -pa` shows the
+  full Maker/EXIF/DNG/XMP set, `rawpy.imread` + postprocess succeeds for
+  `linear` and `cfa` at every depth/plane/frame combination, and
+  `decode(encode(x)) == x` across the matrix (see `tests/test_stego.py`).
+- **Dependencies.** `numpy`, `pillow`, `tifffile[all]`, `tqdm`
+  (`requirements.txt`); `rawpy` is optional, decode checks only.
+  Test-only deps (`pytest`, `pytest-cov`) live in `requirements-dev.txt`.
+- **Byte stability.** `DngStego.encode()` output is byte-stable for fixed
+  inputs (modulo offset tags 273/279/324/325/330/34665, which legitimately
+  shift with JPEG size).
 
 ## 5. Limitations / out of scope
 
-* No real sensor data: the cover is a synthetic gradient + noise (opening
-  the DNG and judging photographic content is out of scope per the brief).
-* `DNGPrivateData` is a small placeholder, not an embedded RAF (real files
-  carry 80–120 MB); MakerNote is omitted for the same reason.
-* `--pixelshift` (407 MP) writes a ~2.5 GB uncompressed file; peak
-  encode RAM is analytically ~2x the payload plus one cover buffer
-  (2.3 GB here, unmeasured at GB scale — e.g. ~4.3 GB for a 1 GB
-  payload) — covers are embedded in place and `--split-file` chunks
-  stream one at a time, so splitting keeps peak near a single chunk's
-  cost. Removing the remaining framed-payload copy (streaming frame,
-  P1) would cut roughly another 1x payload; `--gfx-native` (489 MB
-  file, 20 MB payload) was tested end-to-end.
-* Keystream XOR gives confidentiality against casual inspection, not
-  authenticated encryption; wrong `--key` fails closed (magic/CRC check).
+- **No real sensor data.** The cover is synthetic gradient + noise.
+  Judging photographic content is out of scope — but anyone opening the
+  raw in a viewer sees a test pattern, not a photograph. High plane
+  counts make that worse (see detection table below).
+- **Thin metadata story.** `DNGPrivateData` is a small placeholder, not
+  the 80–120 MB embedded RAF of real combiner files; MakerNote is
+  omitted; no GPS tags are written (samples have none). An inspector
+  comparing priv-data size against a real combiner DNG notices instantly.
+- **Huge files, huge RAM.** `--pixelshift` writes a ~2.5 GB uncompressed
+  file. Peak encode RAM is ~2x payload plus one cover buffer (~4.3 GB for
+  a 1 GB payload); covers embed in place and `--split-file` streams one
+  chunk at a time, so splitting keeps peak near a single chunk's cost.
+  Only `--gfx-native` (489 MB file, 20 MB payload) was tested end-to-end
+  at scale; pixelshift-scale RAM figures are analytical.
+- **Weak encryption.** The `--key` XOR keystream gives confidentiality
+  against casual inspection, not authenticated encryption. Use real
+  encryption (e.g. age/gpg) before embedding if the payload needs it;
+  wrong keys still fail closed via magic/CRC.
+- **Lossy pipelines destroy payloads.** Any JPEG recompression, resize,
+  or RAW-editor export of the raw wipes LSBs. Only lossless handling
+  preserves data; `adobe_deflate` is safe, lossy JPEG is not.
+- **Tooling gaps.** `exiv2` cannot parse BigTIFF at all (files past ~4 GB,
+  e.g. pixelshift ×2+ frames); use `tifffile`/`rawpy` there. LibRaw
+  rejects Deflate DNGs in this environment and rejects >16-bit integer
+  DNGs outright — hence no 24/32-bit integer option and the uncompressed
+  default. Packed depth + deflate is rejected (tifffile limitation).
+- **Forensic visibility.** LSB data is invisible at a glance but not to
+  analysis. Every risky option prints a CLI `warning:` at encode time:
+
+| option | what an inspector sees |
+|---|---|
+| `--lsb-planes 1–2` | near-invisible; normal bit-plane statistics |
+| `--lsb-planes 3–4` | cover degraded; low-bit entropy elevated |
+| `--lsb-planes 5–8` | heavily degraded cover; skewed bit-plane statistics |
+| `--lsb-planes 9–15` | raw renders as degraded noise; flat histogram |
+| `--lsb-planes 16` | **no cover at all** — pure payload; trivially exposed by any entropy check (use `--key` so contents stay opaque) |
+| `--raw-frames 2–8` | N full-res SubIFDs in `tiffdump`; ~N× file size; no still-DNG camera output looks like this |
+| `--bit-depth 8/10/12` | `BitsPerSample` below every GFX 100 II option (14/16) |
+| `--auto-size` | dimensions match no camera preset (e.g. 462×348) |
+| split shared UUID | links the chunk set (its purpose); `none`/`none` leaves only filenames |
+
+- **Out of scope by design:** video/animation timelines (still DNG has
+  none — CinemaDNG is a file sequence), hidden extra-IFD blobs as a
+  primary channel (listed by any TIFF tool), single-metadata-tag dumps
+  (detectable, size-limited), 32-bit float HDR mantissa hiding, and DNG
+  1.7 JPEG XL (lossy modes kill LSBs).
+
+## 6. Background details
+
+Condensed notes on *why* the defaults look the way they do.
+Everything above is sufficient to use the tool; this section is for
+inspectors and the curious.
+
+- **DNG in one paragraph.** DNG (ISO 12234-4) is a TIFF/EP profile:
+  classic TIFF container (`II*\0`, IFD tag directory) plus mandated
+  metadata (`DNGVersion`, `ColorMatrix`, `BlackLevel`, …) and EXIF/XMP
+  sub-IFDs. TIFF/EP defines `SubIFDs` (330), CFA tags (33421/33422,
+  50710/50711), and compression 7 (JPEG) / 8 (Deflate, since DNG 1.4).
+- **Reference samples (`images/`, read-only).** GFX RAFs (~70–199 MB,
+  `FUJIFILMCCD-RAW` + embedded preview) and Pixel Shift Combiner DNGs
+  (1.0–1.6 GB) were inspected with `tiffdump`, `exiv2 -pa`, `tifffile`.
+  Every combiner DNG shares one skeleton: IFD0 4000×3000 YCbCr JPEG
+  preview + 23296×17472 16-bit × 3ch LinearRaw SubIFD (tiled 128×96,
+  lossless JPEG) + EXIF with exposure/focus/Fuji MakerNote + 81–121 MB
+  `DNGPrivateData` that embeds the source RAF. The tool mimics the
+  skeleton, not the RAF embedding.
+- **Why LinearRaw LSB.** Still DNG has no animation timeline, so
+  "frames" only offer layout options; an extra hidden IFD is listed by
+  any TIFF tool, and single-tag blobs are size-limited and obvious.
+  The 16-bit raw headroom is the channel that survives casual viewing.
+- **Density knobs considered, not all kept.** Resolution, bit depth,
+  channel count, and frame count all scale capacity; lossless Deflate
+  does not (measured ~16% on a 2-plane test — random/encrypted bits are
+  incompressible), so it stays opt-in. Past ~4 GB the writer switches to
+  BigTIFF (DNG 1.6). Deliberately excluded: DNG 1.4 32-bit float HDR
+  (mantissa-only hiding = fewer bits per byte), 24/32-bit integer
+  (LibRaw rejects it), JPEG XL lossy (destroys LSBs).
+- **What viewers show.** Windows Explorer (WIC/Raw Extension codec) and
+  Nautilus (`gnome-raw-thumbnailer` and friends) render the embedded
+  IFD0 JPEG preview, never the raw mosaic — which is why the thumbnail
+  picture matters more than the cover for casual inspection. Viewers
+  downscale to 128–512 px regardless, but we keep combiner parity (up to
+  4000×3000, same aspect as the raw).
+- **Metadata: static vs re-rolled.** Calibration fields are copied
+  verbatim (`ColorMatrix1/2`, `CalibrationIlluminant 17/21`,
+  `AnalogBalance`, 256-byte `OpcodeList3`, `Make`/`Model`/`Software`, XMP
+  skeleton). Every `encode` re-rolls the identifiable fields (seeded by
+  `--seed`): `DateTime` (+`DateTimeOriginal/Digitized`, `OffsetTime*`,
+  `SubSecTime*`), `ExposureTime`/`ShutterSpeedValue`,
+  `FNumber`/`ApertureValue`, `ExposureProgram`, `ISOSpeedRatings`,
+  `MeteringMode`, `FocalLength` (+ 35 mm equiv, consistent GF lens pick
+  from 8 real lenses), `MaxApertureValue`, `BrightnessValue`,
+  `ExposureBiasValue`, `CameraSerialNumber`, `BodySerialNumber`,
+  `LensSerialNumber`, `AsShotNeutral`, `BaselineExposure`, plus fresh
+  cover and thumbnail pixels. `ImageNumber` is *not* randomized — on
+  split chunks it carries the deterministic sequence; plain files omit it.
