@@ -11,6 +11,8 @@ import math
 import numpy as np
 
 from .framing import PayloadFrame
+from .progress import bar as _progress_bar
+from .progress import enabled as _progress_enabled
 
 
 def format_kb(n: int) -> str:
@@ -149,7 +151,9 @@ class LsbCodec:
 
     @staticmethod
     def stripe_frames(covers: list[np.ndarray], frame: bytes,
-                      lsb_planes: int) -> list[np.ndarray]:
+                      lsb_planes: int, progress: bool | None = None,
+                      desc: str = "Embedding",
+                      position: int = 0) -> list[np.ndarray]:
         """Unpack a framed payload and stripe its bits over frame covers
         in write order (one shared helper so single- and split-file
         encodes cannot drift apart).
@@ -182,36 +186,43 @@ class LsbCodec:
         chunk_samples = LsbCodec._chunk_samples(lsb_planes)
         stegos: list[np.ndarray] = []
         pos = 0
-        for cover in covers:
-            n_slots = cover.size * lsb_planes
-            take = min(n_slots, total_bits - pos)
-            flat = cover.reshape(-1)
-            if np.shares_memory(flat, cover):
-                inplace = True
-            else:
-                # Non-contiguous input: reshape copied, so embed into a
-                # contiguous copy and return it (previous behavior).
-                flat = np.ascontiguousarray(cover).reshape(-1)
-                inplace = False
-            if take > 0:
-                n_used = (take + lsb_planes - 1) // lsb_planes
-                for s0 in range(0, n_used, chunk_samples):
-                    s1 = min(s0 + chunk_samples, n_used)
-                    b0 = pos + s0 * lsb_planes
-                    b1 = min(pos + s1 * lsb_planes, pos + take)
-                    bits = LsbCodec._bits_for_range(farr, b0, b1 - b0)
-                    ns = (bits.size + lsb_planes - 1) // lsb_planes
-                    window = flat[s0:s0 + ns].astype(np.uint32)
-                    LsbCodec._embed_bits_into_window(window, bits,
-                                                     lsb_planes)
-                    flat[s0:s0 + ns] = window.astype(flat.dtype)
-            stegos.append(cover if inplace else flat.reshape(cover.shape))
-            pos += take
+        show = _progress_enabled(progress)
+        with _progress_bar(total=total_bits, desc=desc, unit="bit",
+                            disable=not show, position=position,
+                            leave=False) as pbar:
+            for cover in covers:
+                n_slots = cover.size * lsb_planes
+                take = min(n_slots, total_bits - pos)
+                flat = cover.reshape(-1)
+                if np.shares_memory(flat, cover):
+                    inplace = True
+                else:
+                    # Non-contiguous input: reshape copied, so embed into a
+                    # contiguous copy and return it (previous behavior).
+                    flat = np.ascontiguousarray(cover).reshape(-1)
+                    inplace = False
+                if take > 0:
+                    n_used = (take + lsb_planes - 1) // lsb_planes
+                    for s0 in range(0, n_used, chunk_samples):
+                        s1 = min(s0 + chunk_samples, n_used)
+                        b0 = pos + s0 * lsb_planes
+                        b1 = min(pos + s1 * lsb_planes, pos + take)
+                        bits = LsbCodec._bits_for_range(farr, b0, b1 - b0)
+                        ns = (bits.size + lsb_planes - 1) // lsb_planes
+                        window = flat[s0:s0 + ns].astype(np.uint32)
+                        LsbCodec._embed_bits_into_window(window, bits,
+                                                         lsb_planes)
+                        flat[s0:s0 + ns] = window.astype(flat.dtype)
+                        pbar.update(b1 - b0)
+                stegos.append(cover if inplace else flat.reshape(cover.shape))
+                pos += take
         return stegos
 
     @staticmethod
     def extract_stream(raws: list[np.ndarray], lsb_planes: int,
-                       total_bits: int) -> bytes:
+                       total_bits: int, progress: bool | None = None,
+                       desc: str = "Extracting",
+                       position: int = 0) -> bytes:
         """Gather ``total_bits`` LSBs across ordered raw frames -> bytes.
 
         Streaming counterpart of :meth:`stripe_frames`: extracts in
@@ -226,37 +237,42 @@ class LsbCodec:
         remaining = total_bits
         chunk_samples = LsbCodec._chunk_samples(lsb_planes)
         done = False
-        for raw in raws:
-            if done:
-                break
-            flat = raw.reshape(-1)
-            take = min(raw.size * lsb_planes, remaining)
-            n_used = (take + lsb_planes - 1) // lsb_planes
-            for s0 in range(0, n_used, chunk_samples):
-                s1 = min(s0 + chunk_samples, n_used)
-                length = min(s1 * lsb_planes, take) - s0 * lsb_planes
-                ns = (length + lsb_planes - 1) // lsb_planes
-                seg = flat[s0:s0 + ns]
-                bits = np.empty(length, dtype=np.uint8)
-                for p in range(lsb_planes):
-                    view = bits[p::lsb_planes]
-                    if view.size == 0:
-                        continue
-                    view[:] = ((seg[:view.size] >> np.uint32(p))
-                               & np.uint32(1)).astype(np.uint8)
-                if pending.size:
-                    bits = np.concatenate((pending, bits))
-                    pending = np.empty(0, dtype=np.uint8)
-                n_full = (bits.size // 8) * 8
-                if n_full:
-                    out[out_pos:out_pos + n_full // 8] = np.packbits(
-                        bits[:n_full]).tobytes()
-                    out_pos += n_full // 8
-                if n_full < bits.size:
-                    pending = bits[n_full:].copy()
-            remaining -= take
-            if remaining <= 0:
-                done = True
+        show = _progress_enabled(progress)
+        with _progress_bar(total=total_bits, desc=desc, unit="bit",
+                            disable=not show, position=position,
+                            leave=False) as pbar:
+            for raw in raws:
+                if done:
+                    break
+                flat = raw.reshape(-1)
+                take = min(raw.size * lsb_planes, remaining)
+                n_used = (take + lsb_planes - 1) // lsb_planes
+                for s0 in range(0, n_used, chunk_samples):
+                    s1 = min(s0 + chunk_samples, n_used)
+                    length = min(s1 * lsb_planes, take) - s0 * lsb_planes
+                    ns = (length + lsb_planes - 1) // lsb_planes
+                    seg = flat[s0:s0 + ns]
+                    bits = np.empty(length, dtype=np.uint8)
+                    for p in range(lsb_planes):
+                        view = bits[p::lsb_planes]
+                        if view.size == 0:
+                            continue
+                        view[:] = ((seg[:view.size] >> np.uint32(p))
+                                   & np.uint32(1)).astype(np.uint8)
+                    if pending.size:
+                        bits = np.concatenate((pending, bits))
+                        pending = np.empty(0, dtype=np.uint8)
+                    n_full = (bits.size // 8) * 8
+                    if n_full:
+                        out[out_pos:out_pos + n_full // 8] = np.packbits(
+                            bits[:n_full]).tobytes()
+                        out_pos += n_full // 8
+                    if n_full < bits.size:
+                        pending = bits[n_full:].copy()
+                    pbar.update(length)
+                remaining -= take
+                if remaining <= 0:
+                    done = True
         if pending.size:  # pragma: no cover - total_bits is byte-multiple
             raise ValueError("bitstream ended mid-byte")
         return bytes(out)

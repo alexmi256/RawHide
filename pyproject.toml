@@ -2,7 +2,7 @@
 name = "stegodng"
 version = "1.0.0"
 requires-python = ">=3.10"
-dependencies = ["numpy", "pillow", "tifffile"]
+dependencies = ["numpy", "pillow", "tifffile", "tqdm"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

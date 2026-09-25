@@ -35,6 +35,8 @@ from .split import (
     parse_chunk_name,
     resolve_split_fields,
 )
+from .progress import bar as _progress_bar
+from .progress import enabled as _progress_enabled
 from .profile import (
     DEFAULT_PROFILE,
     MAX_FRAMES,
@@ -227,6 +229,7 @@ class DngStego:
         no_randomize: bool = False,
         frames: int = 1,
         thumbnail: str = "random",
+        progress: bool | None = None,
     ) -> dict:
         """Embed `payload` into a new DNG file. Returns info dict.
 
@@ -253,7 +256,8 @@ class DngStego:
                 f"{f' x {frames} frames' if frames > 1 else ''})"
             )
         stegos = LsbCodec.stripe_frames(
-            covers, PayloadFrame.pack(payload, key), lsb_planes)
+            covers, PayloadFrame.pack(payload, key), lsb_planes,
+            progress=progress)
         # stripe_frames embeds in place: stegos share the covers'
         # buffers, so drop the extra references promptly.
         del covers
@@ -318,6 +322,7 @@ class DngStego:
         split_id: str | None = None,
         split_id_field: str = "ImageUniqueID",
         split_seq_field: str = "ImageNumber",
+        progress: bool | None = None,
     ) -> list[dict]:
         """Split `payload` into ≤`split_size`-byte chunks across DNG files.
 
@@ -357,81 +362,87 @@ class DngStego:
                 key=key, lsb_planes=lsb_planes, bit_depth=bit_depth,
                 mode=mode, compression=compression,
                 no_randomize=no_randomize, frames=frames,
-                thumbnail=thumbnail,
+                thumbnail=thumbnail, progress=progress,
             )]
         ifd0_dummies = ((id_spec is not None and id_spec["ifd"] == "ifd0")
                         + (seq_spec is not None and seq_spec["ifd"] == "ifd0"))
         infos = []
-        for seq, chunk_total, start, end in itertools.chain([first], chunks):
-            assert chunk_total == total  # generator yields one fixed total
-            # One chunk copy at a time: slicing all chunks up front
-            # would hold a second full payload beside ``payload``.
-            chunk = payload[start:end]
-            chunk_len = len(chunk)
-            path = chunk_path(output_path, seq)
-            cseed = (None if (seed is None and not no_randomize)
-                     else (0 if seed is None else seed) + seq - 1)
-            meta = MetadataRandomizer(cseed).randomize()
-            split_exif = {}
-            if id_spec is not None and id_spec["ifd"] == "exif":
-                split_exif[id_spec["tag"]] = uid
-            if seq_spec is not None and seq_spec["ifd"] == "exif":
-                val = format_seq_value(split_seq_field, seq, total)
-                split_exif[seq_spec["tag"]] = (
-                    [val] if isinstance(val, int) else list(val))
-            if split_exif:
-                meta["split_exif"] = split_exif
-            if cseed is None:
-                # Unseeded run: fresh random base per chunk so chunks share
-                # neither cover pixels nor fallback thumbnails (identical
-                # high bits across chunks would be an obvious tell).
-                cs = random.randrange(1 << 30)
-            else:
-                cs = cseed
-            covers = [CoverGenerator(cs + f).cover(height, width, mode,
-                                                   bit_depth)
-                      for f in range(frames)]
-            n_samples = covers[0].size
-            cap = LsbCodec.capacity_bytes_total(n_samples, lsb_planes, frames)
-            if chunk_len > cap:
-                raise ValueError(
-                    f"chunk {seq}/{total} "
-                    f"({format_kb_hi(chunk_len)}) exceeds per-file capacity "
-                    f"{format_kb_lo(cap)} ({width}x{height} {mode} "
-                    f"{bit_depth}-bit, {lsb_planes} LSB plane(s)"
-                    f"{f' x {frames} frames' if frames > 1 else ''}). "
-                    f"Lower --split-file to at most {format_kb_lo(cap)} or "
-                    f"enlarge the geometry / add planes."
+        show = _progress_enabled(progress)
+        with _progress_bar(total=total, desc="Encoding chunks", unit="file",
+                            disable=not show) as outer:
+            for seq, chunk_total, start, end in itertools.chain([first], chunks):
+                assert chunk_total == total  # generator yields one fixed total
+                # One chunk copy at a time: slicing all chunks up front
+                # would hold a second full payload beside ``payload``.
+                chunk = payload[start:end]
+                chunk_len = len(chunk)
+                path = chunk_path(output_path, seq)
+                cseed = (None if (seed is None and not no_randomize)
+                         else (0 if seed is None else seed) + seq - 1)
+                meta = MetadataRandomizer(cseed).randomize()
+                split_exif = {}
+                if id_spec is not None and id_spec["ifd"] == "exif":
+                    split_exif[id_spec["tag"]] = uid
+                if seq_spec is not None and seq_spec["ifd"] == "exif":
+                    val = format_seq_value(split_seq_field, seq, total)
+                    split_exif[seq_spec["tag"]] = (
+                        [val] if isinstance(val, int) else list(val))
+                if split_exif:
+                    meta["split_exif"] = split_exif
+                if cseed is None:
+                    # Unseeded run: fresh random base per chunk so chunks share
+                    # neither cover pixels nor fallback thumbnails (identical
+                    # high bits across chunks would be an obvious tell).
+                    cs = random.randrange(1 << 30)
+                else:
+                    cs = cseed
+                covers = [CoverGenerator(cs + f).cover(height, width, mode,
+                                                       bit_depth)
+                          for f in range(frames)]
+                n_samples = covers[0].size
+                cap = LsbCodec.capacity_bytes_total(n_samples, lsb_planes, frames)
+                if chunk_len > cap:
+                    raise ValueError(
+                        f"chunk {seq}/{total} "
+                        f"({format_kb_hi(chunk_len)}) exceeds per-file capacity "
+                        f"{format_kb_lo(cap)} ({width}x{height} {mode} "
+                        f"{bit_depth}-bit, {lsb_planes} LSB plane(s)"
+                        f"{f' x {frames} frames' if frames > 1 else ''}). "
+                        f"Lower --split-file to at most {format_kb_lo(cap)} or "
+                        f"enlarge the geometry / add planes."
+                    )
+                frame = PayloadFrame.pack(chunk, key)
+                del chunk
+                stegos = LsbCodec.stripe_frames(
+                    covers, frame, lsb_planes, progress=show,
+                    desc=f"Embedding chunk {seq}/{total}", position=1)
+                # stripe_frames embeds in place: stegos share the covers'
+                # buffers, so drop the extra references promptly.
+                del covers, frame
+                tw, th = min(4000, width), min(3000, height)
+                thumb, thumb_label = ThumbnailProvider(seed=cs).get(
+                    tw, th, source=thumbnail)
+                bigtiff = self._write_container(
+                    path, stegos=stegos, thumb_rgb=thumb, meta=meta,
+                    width=width, height=height, mode=mode, bit_depth=bit_depth,
+                    compression=compression, frames=frames, tw=tw, th=th,
+                    ifd0_dummies=ifd0_dummies,
                 )
-            frame = PayloadFrame.pack(chunk, key)
-            del chunk
-            stegos = LsbCodec.stripe_frames(covers, frame, lsb_planes)
-            # stripe_frames embeds in place: stegos share the covers'
-            # buffers, so drop the extra references promptly.
-            del covers, frame
-            tw, th = min(4000, width), min(3000, height)
-            thumb, thumb_label = ThumbnailProvider(seed=cs).get(
-                tw, th, source=thumbnail)
-            bigtiff = self._write_container(
-                path, stegos=stegos, thumb_rgb=thumb, meta=meta,
-                width=width, height=height, mode=mode, bit_depth=bit_depth,
-                compression=compression, frames=frames, tw=tw, th=th,
-                ifd0_dummies=ifd0_dummies,
-            )
-            self._write_split_tags(path, id_spec, seq_spec, split_id_field,
-                                   split_seq_field, uid, seq, total)
-            info = self._file_info(
-                path, width=width, height=height, mode=mode,
-                bit_depth=bit_depth, container=str(stegos[0].dtype),
-                lsb_planes=lsb_planes, frames=frames,
-                thumb_label=thumb_label, bigtiff=bigtiff, cap=cap,
-                payload_len=chunk_len, meta=meta,
-            )
-            info.update({"chunk_seq": seq, "chunk_total": total,
-                         "split_id": uid, "split_id_field": split_id_field,
-                         "split_seq_field": split_seq_field})
-            infos.append(info)
-            del stegos, thumb
+                self._write_split_tags(path, id_spec, seq_spec, split_id_field,
+                                       split_seq_field, uid, seq, total)
+                info = self._file_info(
+                    path, width=width, height=height, mode=mode,
+                    bit_depth=bit_depth, container=str(stegos[0].dtype),
+                    lsb_planes=lsb_planes, frames=frames,
+                    thumb_label=thumb_label, bigtiff=bigtiff, cap=cap,
+                    payload_len=chunk_len, meta=meta,
+                )
+                info.update({"chunk_seq": seq, "chunk_total": total,
+                             "split_id": uid, "split_id_field": split_id_field,
+                             "split_seq_field": split_seq_field})
+                infos.append(info)
+                del stegos, thumb
+                outer.update(1)
         return infos
 
     @staticmethod
@@ -461,6 +472,9 @@ class DngStego:
         key: bytes | None,
         lsb_planes: int,
         max_bytes: int | None = None,
+        progress: bool | None = None,
+        desc: str = "Extracting",
+        position: int = 0,
     ) -> bytes:
         """Single-plane-count decode attempt across ordered raw frames.
 
@@ -492,7 +506,9 @@ class DngStego:
         if total_bits > total_slots:
             raise _DecodeLimitError(
                 "declared payload exceeds image capacity")
-        stream = LsbCodec.extract_stream(raws, lsb_planes, total_bits)
+        stream = LsbCodec.extract_stream(raws, lsb_planes, total_bits,
+                                             progress=progress, desc=desc,
+                                             position=position)
         payload, _ = PayloadFrame.unpack(stream, key)
         return payload
 
@@ -504,6 +520,7 @@ class DngStego:
         max_bytes: int | None = None,
         split_id_field: str = "ImageUniqueID",
         split_seq_field: str = "ImageNumber",
+        progress: bool | None = None,
     ) -> bytes:
         """Extract a payload from one DNG, or concatenate chunked DNGs.
 
@@ -526,7 +543,8 @@ class DngStego:
         if not paths:
             raise ValueError("no input files given")
         if len(paths) == 1:
-            payload = self._decode_one(paths[0], key, lsb_planes, max_bytes)
+            payload = self._decode_one(paths[0], key, lsb_planes, max_bytes,
+                                       progress=progress)
             markers = DngContainer(paths[0]).split_markers(split_id_field,
                                                            split_seq_field)
             if markers["seq_present"] or markers["id_present"]:
@@ -540,7 +558,8 @@ class DngStego:
         return self._decode_many(paths, key=key, lsb_planes=lsb_planes,
                                  max_bytes=max_bytes,
                                  id_field=split_id_field,
-                                 seq_field=split_seq_field)
+                                 seq_field=split_seq_field,
+                                 progress=progress)
 
     def _decode_one(
             self,
@@ -548,6 +567,9 @@ class DngStego:
         key: bytes | None = None,
         lsb_planes: int | None = None,
         max_bytes: int | None = None,
+        progress: bool | None = None,
+        desc: str = "Extracting",
+        position: int = 0,
     ) -> bytes:
         """Decode a single DNG (chunk or whole payload)."""
         if lsb_planes is not None and not (1 <= lsb_planes <= MAX_LSB_PLANES):
@@ -559,7 +581,10 @@ class DngStego:
         limit_err: ValueError | None = None
         for p in candidates:
             try:
-                return self._decode_with_planes(raws, key, p, max_bytes)
+                return self._decode_with_planes(raws, key, p, max_bytes,
+                                                    progress=progress,
+                                                    desc=desc,
+                                                    position=position)
             except ValueError as exc:
                 # A magic match with a bad length means the right plane was
                 # found but the payload was rejected (cap/capacity). Surface
@@ -582,7 +607,8 @@ class DngStego:
 
     def _decode_many(self, paths: list[str], *, key: bytes | None,
                      lsb_planes: int | None, max_bytes: int | None,
-                     id_field: str, seq_field: str) -> bytes:
+                     id_field: str, seq_field: str,
+                     progress: bool | None = None) -> bytes:
         """Verify a chunk set (metadata, else filenames) and concatenate."""
         markers = []
         for p in paths:
@@ -640,11 +666,18 @@ class DngStego:
         else:
             ordered = self._order_by_names(paths)
         out = bytearray()
-        for p in ordered:
-            try:
-                out += self._decode_one(p, key, lsb_planes, max_bytes)
-            except ValueError as exc:
-                raise ValueError(f"{p}: {exc}") from exc
+        show = _progress_enabled(progress)
+        with _progress_bar(total=len(ordered), desc="Decoding chunks",
+                            unit="file", disable=not show) as outer:
+            for i, p in enumerate(ordered, 1):
+                try:
+                    out += self._decode_one(p, key, lsb_planes, max_bytes,
+                                            progress=show,
+                                            desc=f"Extracting chunk {i}/{len(ordered)}",
+                                            position=1 if show else 0)
+                except ValueError as exc:
+                    raise ValueError(f"{p}: {exc}") from exc
+                outer.update(1)
         return bytes(out)
 
     @staticmethod
@@ -774,13 +807,14 @@ def encode(
     no_randomize: bool = False,
     frames: int = 1,
     thumbnail: str = "random",
+    progress: bool | None = None,
 ) -> dict:
     """Backwards-compatible wrapper (see :meth:`DngStego.encode`)."""
     return _DEFAULT.encode(
         payload, output_path, width=width, height=height, seed=seed,
         key=key, lsb_planes=lsb_planes, bit_depth=bit_depth, mode=mode,
         compression=compression, no_randomize=no_randomize, frames=frames,
-        thumbnail=thumbnail,
+        thumbnail=thumbnail, progress=progress,
     )
 
 
@@ -791,11 +825,13 @@ def decode(
     max_bytes: int | None = None,
     split_id_field: str = "ImageUniqueID",
     split_seq_field: str = "ImageNumber",
+    progress: bool | None = None,
 ) -> bytes:
     """Backwards-compatible wrapper (see :meth:`DngStego.decode`)."""
     return _DEFAULT.decode(
         input_path, key=key, lsb_planes=lsb_planes, max_bytes=max_bytes,
-        split_id_field=split_id_field, split_seq_field=split_seq_field)
+        split_id_field=split_id_field, split_seq_field=split_seq_field,
+        progress=progress)
 
 
 def encode_split(
@@ -816,6 +852,7 @@ def encode_split(
     split_id: str | None = None,
     split_id_field: str = "ImageUniqueID",
     split_seq_field: str = "ImageNumber",
+    progress: bool | None = None,
 ) -> list[dict]:
     """Backwards-compatible wrapper (see :meth:`DngStego.encode_split`)."""
     return _DEFAULT.encode_split(
@@ -823,7 +860,8 @@ def encode_split(
         seed=seed, key=key, lsb_planes=lsb_planes, bit_depth=bit_depth,
         mode=mode, compression=compression, no_randomize=no_randomize,
         frames=frames, thumbnail=thumbnail, split_id=split_id,
-        split_id_field=split_id_field, split_seq_field=split_seq_field)
+        split_id_field=split_id_field, split_seq_field=split_seq_field,
+        progress=progress)
 
 
 def generate_tiff(
