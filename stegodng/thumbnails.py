@@ -81,13 +81,12 @@ class ThumbnailProvider:
             with open(source, "rb") as f:
                 data = f.read()
             return prepare(data, tw, th), f"file:{source}"
-        last: Exception | None = None
         for _ in range(max(1, self.max_attempts)):
             try:
                 data, name = self._fetch_random_bytes(tw)
                 return prepare(data, tw, th), f"commons:{name}"
-            except Exception as exc:  # noqa: BLE001 - any failure -> retry/fallback
-                last = exc
+            except Exception:  # noqa: BLE001 - any failure -> retry/fallback
+                pass
         return self.noise(tw, th), "synthetic-noise-fallback"
 
     def noise(self, tw: int, th: int) -> np.ndarray:

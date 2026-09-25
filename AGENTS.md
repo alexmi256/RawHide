@@ -33,6 +33,11 @@ is the operator's guide for changing code.
   (`numpy`, `pillow`, `tifffile[all]`; `rawpy` optional, decode checks only).
   Test deps (pytest + pytest-cov) live in `requirements-dev.txt`:
   `.venv/bin/pip install -r requirements-dev.txt`.
+- Task runner is `just` (`justfile`, `just --list`): `just test` wraps
+  pytest (args forwarded), `just lint` runs `ruff check` on the shipped
+  code (`stegodng/`, `stego_dng.py`; error-level rules in
+  `[tool.ruff.lint]`), `just build` builds sdist+wheel and runs
+  `twine check`. Release flow is documented in `README.md` §7.
 - Quick smoke: `.venv/bin/python stego_dng.py capacity --width 2048 --height 1536`
 
 ## Testing

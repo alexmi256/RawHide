@@ -1,11 +1,62 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "stegodng"
 version = "1.0.0"
+description = "Embed binary payloads in the raw sensor data of DNG files mimicking Fujifilm GFX 100 Pixel Shift Combiner output"
+readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["numpy", "pillow", "tifffile", "tqdm"]
+license = "MIT"
+authors = [{ name = "AM", email = "alexmi3.14@gmail.com" }]
+keywords = ["steganography", "dng", "tiff", "raw", "fujifilm"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Multimedia :: Graphics",
+    "Topic :: Security :: Cryptography",
+]
+dependencies = ["numpy", "pillow", "tifffile[all]", "tqdm"]
+
+[project.urls]
+Homepage = "https://github.com/alexmi256/RawHide"
+Repository = "https://github.com/alexmi256/RawHide"
+
+[project.scripts]
+stegodng = "stegodng.cli:main"
+stego-dng = "stegodng.cli:main"
+
+[tool.setuptools]
+py-modules = ["stego_dng"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["stegodng*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+# Error-level rules only (syntax/statement/runtime errors + pyflakes).
+# Style rules (E501, isort, format) are intentionally off: the existing
+# codebase predates linting and reformatting it is out of scope.
+select = ["E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# Thin backwards-compat shim: every import is a deliberate re-export
+# (pinned by test_shim_delegates_to_package).
+"stego_dng.py" = ["F401", "F811"]
 
 [tool.coverage.run]
 branch = false

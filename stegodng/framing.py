@@ -93,7 +93,7 @@ class PayloadFrame:
             raise ValueError(
                 "magic not found - wrong key, wrong LSB depth or no payload"
             )
-        ver, flags = header[4], header[5]
+        ver, _flags = header[4], header[5]
         if ver != cls.VERSION:
             raise ValueError(f"unsupported frame version {ver}")
         (pay_len,) = struct.unpack(">Q", header[6:14])

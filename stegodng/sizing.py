@@ -20,8 +20,6 @@ from .framing import PayloadFrame
 from .profile import (
     AUTO_MIN_H,
     AUTO_MIN_W,
-    GFX_NATIVE_H,
-    GFX_NATIVE_W,
     MAX_FRAMES,
     MAX_LSB_PLANES,
     PIXELSHIFT_H,

@@ -637,7 +637,6 @@ class DngStego:
             elif n_any == 0:
                 ordered = self._order_by_names(paths)
             else:
-                complete = [p for p, m in zip(paths, markers) if _has(m)]
                 partial = [p for p, m in zip(paths, markers)
                            if not _has(m) and _has_any(m)]
                 if len(partial) == len(paths):
