@@ -9,7 +9,7 @@ randomization so a batch of files does not share identical fingerprints.
 ## TL;DR
 
 ```bash
-pip install -r requirements.txt            # numpy, tifffile[all]
+pip install -r requirements.txt            # numpy, pillow, tifffile[all], tqdm
 pip install -r requirements-dev.txt        # pytest + pytest-cov (dev)
 python stego_dng.py encode -i secret.bin -o out.dng --seed 42
 python stego_dng.py decode -i out.dng -o recovered.bin
@@ -260,6 +260,13 @@ python stego_dng.py encode -i huge.raw --split-file 100m --seed 7
 # (explicit -o still works: -o vol.dng -> vol0001.dng vol0002.dng ...)
 python stego_dng.py decode -i vol0001.dng vol0002.dng -o huge.raw
 
+# progress bars: encode/decode show tqdm bars on a TTY (per-chunk
+# `Embedding`/`Extracting` bars plus an outer `Encoding chunks` /
+# `Decoding chunks` file counter for --split-file sets); pass
+# --progress to force them on when piped, --no-progress to silence.
+# The Python API takes the same tri-state: progress=True/False/None
+# (None = auto/TTY only, the default).
+python stego_dng.py encode -i secret.bin -o out.dng --progress
 # extract (--lsb-planes auto-detected; only --key must match)
 python stego_dng.py decode -i out.dng -o recovered.bin
 # opt-in safety cap on the declared payload per file (default: image
@@ -375,6 +382,7 @@ Module layout:
 | `sizing.py` | `AutoSizer` | smallest-fit search, max-capacity errors, risk warnings |
 | `split.py` | — | chunk sizing/naming, split-field registries, seq parse/format |
 | `stego.py` | `DngStego` | `encode` / `decode` / `generate_tiff` orchestration |
+| `progress.py` | — | tqdm helpers (stderr bars, `True`/`False`/`None`=auto) |
 | `cli.py` | — | `encode` / `decode` / `capacity` / `gen-tiff` commands |
 | `thumbnails.py` | `ThumbnailProvider` | random-Commons / synthetic / file preview pictures, aspect crop + resize, noise fallback |
 
@@ -409,9 +417,17 @@ Module layout:
   not reuse it afterwards (re-embedding the same frame is idempotent,
   but old pixel values are gone). Contrast `embed_bitarray`, the legacy
   bit-array helper, which still allocates and returns a new array.
-* `requirements.txt`: `numpy`, `tifffile[all]` (`rawpy` optional, decode
-  verification only). Dev-only test deps (`pytest`, `pytest-cov`) live in
-  `requirements-dev.txt`.
+* `requirements.txt`: `numpy`, `pillow`, `tifffile[all]`, `tqdm`
+  (`rawpy` optional, decode verification only). Dev-only test deps
+  (`pytest`, `pytest-cov`) live in `requirements-dev.txt`.
+* **Progress bars** (`tqdm`, stderr so stdout stays parseable): single
+  files show one `Embedding`/`Extracting` bitstream bar; `--split-file`
+  sets add an outer `Encoding chunks`/`Decoding chunks` file counter
+  with nested per-chunk bars. Disabled automatically when stderr is not
+  a TTY (`progress=None` default); force with `--progress` /
+  `progress=True`, silence with `--no-progress` / `progress=False`.
+  Bars never alter output bytes (verified: identical raw arrays across
+  all progress modes).
 
 ## 5. Limitations / out of scope
 

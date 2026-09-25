@@ -147,9 +147,14 @@ def _rand_serial(rng, prefix: str = "") -> str:
 
 
 def _decode_with_planes(raw, key: bytes | None, lsb_planes: int,
-                        max_bytes: int | None = None) -> bytes:
+                        max_bytes: int | None = None,
+                        progress: bool | None = None,
+                        desc: str = "Extracting",
+                        position: int = 0) -> bytes:
     """Original single-frame signature; the class takes frame lists."""
-    return DngStego._decode_with_planes([raw], key, lsb_planes, max_bytes)
+    return DngStego._decode_with_planes([raw], key, lsb_planes, max_bytes,
+                                        progress=progress, desc=desc,
+                                        position=position)
 
 
 # Reference profile as a plain dict (original ``STATIC`` shape).

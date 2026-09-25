@@ -97,6 +97,11 @@ def main(argv: list[str] | None = None) -> int:
                    "input (smaller files, but non-standard dimensions may "
                    "look unusual under inspection; cannot be combined with "
                    "--width/--height/--gfx-native/--pixelshift)")
+    e.add_argument("--progress", action="store_true",
+                   help="force progress bars on (by default they show on "
+                   "a TTY and stay quiet when output is piped)")
+    e.add_argument("--no-progress", action="store_true",
+                   help="disable progress bars")
 
     d = sub.add_parser("decode", help="extract a file from DNG(s)")
     d.add_argument("--input", "-i", required=True, nargs="+",
@@ -120,6 +125,11 @@ def main(argv: list[str] | None = None) -> int:
                    choices=tuple(sorted(SPLIT_SEQ_FIELDS) + ["none"]),
                    help="metadata field holding the chunk sequence "
                    "(must match the encode setting)")
+    d.add_argument("--progress", action="store_true",
+                   help="force progress bars on (by default they show on "
+                   "a TTY and stay quiet when output is piped)")
+    d.add_argument("--no-progress", action="store_true",
+                   help="disable progress bars")
 
     c = sub.add_parser("capacity", help="print capacity for a geometry")
     c.add_argument("--width", type=int, default=2048)
@@ -143,6 +153,8 @@ def main(argv: list[str] | None = None) -> int:
                                or args.gfx_native or args.pixelshift):
             ap.error("--auto-size cannot be combined with "
                      "--width/--height/--gfx-native/--pixelshift")
+        if args.no_progress and args.progress:
+            ap.error("--progress and --no-progress are mutually exclusive")
         w, h = args.width, args.height
         if args.gfx_native:
             w, h = GFX_NATIVE_W, GFX_NATIVE_H
@@ -184,6 +196,8 @@ def main(argv: list[str] | None = None) -> int:
             key_bytes = args.key.encode() if args.key else None
             output_path = (args.output if args.output is not None
                            else f"{args.input}.dng")
+            forced = (False if args.no_progress else
+                      True if args.progress else None)
             common = dict(
                 width=cfg["width"], height=cfg["height"], seed=args.seed,
                 key=key_bytes, lsb_planes=cfg["lsb_planes"],
@@ -191,6 +205,7 @@ def main(argv: list[str] | None = None) -> int:
                 compression=args.compression,
                 no_randomize=args.no_randomize, frames=cfg["frames"],
                 thumbnail=args.thumbnail,
+                progress=forced,
             )
             if split_size is not None:
                 infos = encode_split(
@@ -248,6 +263,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"meta: {info['metadata']['datetime']} ISO{info['metadata']['iso']} "
               f"{info['metadata']['lens']} S/N {info['metadata']['camera_serial']}")
     elif args.cmd == "decode":
+        if args.no_progress and args.progress:
+            ap.error("--progress and --no-progress are mutually exclusive")
         try:
             max_bytes = None
             if args.max_bytes is not None:
@@ -263,6 +280,8 @@ def main(argv: list[str] | None = None) -> int:
                 max_bytes=max_bytes,
                 split_id_field=args.split_file_metadata_id,
                 split_seq_field=args.split_file_metadata_seq,
+                progress=(False if args.no_progress else
+                          True if args.progress else None),
             )
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)

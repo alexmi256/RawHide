@@ -1071,5 +1071,111 @@ def test_cli_max_bytes_flag(tmp_path):
     assert r.returncode == 1
 
 
+def test_progress_roundtrip_single(tmp_path):
+    from stegodng import DngStego
+    payload = os.urandom(3000)
+    out = str(tmp_path / "prog.dng")
+    stego = DngStego()
+    for mode in (False, None, True):
+        info = stego.encode(payload, out, width=256, height=192, seed=5,
+                            thumbnail="synthetic", progress=mode)
+        assert info["payload_len"] == len(payload)
+        assert stego.decode(out, progress=mode) == payload
+    # byte-stable across progress modes
+    from stegodng import DngContainer
+    arrs = []
+    for mode in (False, None, True):
+        p = str(tmp_path / f"stable_{mode}.dng")
+        stego.encode(payload, p, width=256, height=192, seed=99,
+                     thumbnail="synthetic", progress=mode)
+        arrs.append(DngContainer(p).raw_frames()[0].copy())
+    assert (arrs[0] == arrs[1]).all() and (arrs[1] == arrs[2]).all()
+
+
+def test_progress_split_multifile(tmp_path):
+    from stegodng import DngStego
+    payload = os.urandom(60000)
+    d = str(tmp_path)
+    infos = DngStego().encode_split(
+        payload, os.path.join(d, "pm.dng"), 20000, width=512, height=384,
+        seed=5, thumbnail="synthetic", split_id="progrestuid",
+        progress=True)
+    assert len(infos) == 3
+    files = [i["path"] for i in infos]
+    assert DngStego().decode(files, progress=True) == payload
+    assert DngStego().decode(files, progress=False) == payload
+
+
+def test_cli_progress_flags(tmp_path):
+    src_p = str(tmp_path / "in.bin")
+    enc = str(tmp_path / "o.dng")
+    rec = str(tmp_path / "out.bin")
+    with open(src_p, "wb") as f:
+        f.write(os.urandom(3000))
+    # --progress forces bars even when piped (stderr, stdout stays clean)
+    r = subprocess.run(
+        [sys.executable, STEGO_SCRIPT, "encode", "-i", src_p, "-o", enc,
+         "--seed", "5", "--width", "256", "--height", "192",
+         "--thumbnail", "synthetic", "--progress"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert "Embedding" in r.stderr
+    assert "bytes" not in r.stdout.replace(str(tmp_path), "")
+    r = subprocess.run(
+        [sys.executable, STEGO_SCRIPT, "decode", "-i", enc, "-o", rec,
+         "--progress"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert "Extracting" in r.stderr
+    with open(src_p, "rb") as f1, open(rec, "rb") as f2:
+        assert f1.read() == f2.read()
+    # --no-progress silences
+    r = subprocess.run(
+        [sys.executable, STEGO_SCRIPT, "encode", "-i", src_p, "-o", enc,
+         "--seed", "5", "--width", "256", "--height", "192",
+         "--thumbnail", "synthetic", "--no-progress"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert "Embedding" not in r.stderr
+    # mutually exclusive
+    r = subprocess.run(
+        [sys.executable, STEGO_SCRIPT, "encode", "-i", src_p, "-o", enc,
+         "--progress", "--no-progress", "--thumbnail", "synthetic"],
+        capture_output=True, text=True)
+    assert r.returncode != 0
+    assert "mutually exclusive" in r.stderr
+    r = subprocess.run(
+        [sys.executable, STEGO_SCRIPT, "decode", "-i", enc, "-o", rec,
+         "--progress", "--no-progress"],
+        capture_output=True, text=True)
+    assert r.returncode != 0
+    assert "mutually exclusive" in r.stderr
+
+
+def test_cli_progress_split_multifile(tmp_path):
+    src_p = str(tmp_path / "in.bin")
+    enc = str(tmp_path / "out.dng")
+    rec = str(tmp_path / "back.bin")
+    with open(src_p, "wb") as f:
+        f.write(os.urandom(50000))
+    r = subprocess.run(
+        [sys.executable, STEGO_SCRIPT, "encode", "-i", src_p, "-o", enc,
+         "--seed", "5", "--width", "512", "--height", "384",
+         "--thumbnail", "synthetic", "--split-file", "20k",
+         "--progress"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert "Encoding chunks" in r.stderr
+    files = sorted(glob.glob(os.path.join(str(tmp_path), "out0*.dng")))
+    assert len(files) == 3
+    r = subprocess.run(
+        [sys.executable, STEGO_SCRIPT, "decode", "-i"] + files +
+        ["-o", rec, "--progress"], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert "Decoding chunks" in r.stderr
+    with open(src_p, "rb") as f1, open(rec, "rb") as f2:
+        assert f1.read() == f2.read()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
