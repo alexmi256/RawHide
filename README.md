@@ -23,9 +23,12 @@ pytest tests/ -q --cov=stegodng --cov=stego_dng --cov-report=term-missing  # cov
   version + flags + 64-bit length + CRC32, XOR keystream when `--key` is
   given) and written into the low N bit planes (`--lsb-planes 1–16`) of
   the raw SubIFD, spread over all tiles and channels.
-- **Looks like a combiner DNG.** Every output has the same skeleton:
-  IFD0 Baseline-JPEG thumbnail plus one or more raw SubIFDs, with EXIF,
-  XMP, and DNG tags copied from GFX 100 reference values.
+- **Looks like a converted-camera DNG.** Every output has the same
+  skeleton: IFD0 Baseline-JPEG thumbnail plus one or more raw SubIFDs,
+  with EXIF, XMP, and DNG tags stamped from the selected
+  `--camera-profile` (default: GFX 100 combiner values). The cover story
+  is "whatever RAW the user converted to DNG" — see §3.5 for the
+  ~300 harvested camera profiles and their fidelity limits.
 - **Capacity is predictable.** Usable bytes per file are approximately:
 
   `samples × planes × frames / 8 − 18`
@@ -36,8 +39,8 @@ pytest tests/ -q --cov=stegodng --cov=stego_dng --cov-report=term-missing  # cov
 |---|---|---|---|---|
 | 2048×1536 (default auto pick) | ~1.2 MB | ~2.4 MB | ~4.7 MB | ~18.9 MB |
 | 4000×3000 | ~4.5 MB | ~9.0 MB | ~18.0 MB | ~72.0 MB |
-| 11648×8736 (`--gfx-native`) | ~38.2 MB | ~76.3 MB | ~153 MB | ~611 MB |
-| 23296×17472 (`--pixelshift`) | ~153 MB | ~305 MB | ~611 MB | ~2.44 GB |
+| 11648×8736 (`gfx_100-native`) | ~38.2 MB | ~76.3 MB | ~153 MB | ~611 MB |
+| 23296×17472 (`gfx_100-pixelshift`) | ~153 MB | ~305 MB | ~611 MB | ~2.44 GB |
 
   Table uses decimal MB/GB (1 MB = 1,000,000 bytes); the CLI itself
   reports KiB (1 KB = 1024 bytes, see `capacity` command).
@@ -66,8 +69,8 @@ pytest tests/ -q --cov=stegodng --cov=stego_dng --cov-report=term-missing  # cov
 python stego_dng.py encode -i secret.bin --seed 42
 python stego_dng.py encode -i secret.bin -o out.dng --seed 42
 
-# encrypted payload
-python stego_dng.py encode -i secret.bin -o big.dng --gfx-native --seed 7 --key s3cret
+# encrypted payload, GFX native sensor geometry
+python stego_dng.py encode -i secret.bin -o big.dng --camera-profile gfx_100-native --seed 7 --key s3cret
 
 # mosaic layout, packed depth, 2 planes
 python stego_dng.py encode -i secret.bin -o cfa.dng --mode cfa --bit-depth 14 --lsb-planes 2
@@ -87,17 +90,20 @@ python stego_dng.py decode -i out.dng -o recovered.bin --max-bytes 500m
 With no sizing flags, `encode` picks the smallest preset — and within it
 the fewest LSB planes — that fits the input:
 
-`2048x1536 -> 4000x3000 -> 11648x8736 (gfx-native) -> 23296x17472 (pixelshift)`
+`2048x1536 -> 4000x3000 -> 11648x8736 (gfx_100-native) -> 23296x17472 (gfx_100-pixelshift)`
 
 Defaults inside that search are `linear`, 16-bit, 1 frame.
 The chosen config is printed as an `auto-config ...` line.
+Pick a different camera cover story with `--camera-profile` (see §3.5);
+the base slug keeps this auto-sizing, a `-native`/`-pixelshift` suffix
+pins that camera's geometry instead.
 
 ```bash
 # exact-fit dimensions for the smallest possible file (see tradeoff below)
 python stego_dng.py encode -i secret.bin -o small.dng --auto-size --seed 42
 
 # maximum plausible single-frame density
-python stego_dng.py encode -i secret.bin -o max.dng --gfx-native --bit-depth 16 --lsb-planes 4
+python stego_dng.py encode -i secret.bin -o max.dng --camera-profile gfx_100-native --bit-depth 16 --lsb-planes 4
 
 # maximum absolute density (noisy, non-standard, encrypt it)
 python stego_dng.py encode -i huge.bin -o stack.dng --auto-size --raw-frames 4 --lsb-planes 16 --key s3cret
@@ -114,7 +120,7 @@ Rules of thumb:
   no real GFX output. Every `--auto-size` run prints a warning; the
   tradeoff is yours.
 - `--auto-size` cannot be combined with
-  `--width/--height/--gfx-native/--pixelshift`.
+  `--width/--height/--camera-profile` subprofiles.
 - If nothing fits, the error states the payload size, the relevant
   maximum, and suggests larger geometry, more planes, more frames,
   auto-sizing, or splitting.
@@ -215,9 +221,8 @@ silences them. The Python API takes the same tri-state:
 |---|---|---|
 | `-i, --input` | (required) | payload file to embed |
 | `-o, --output` | `<input>.dng` | output DNG path; with `--split-file`, `0001`-style numbers go before the extension; with `--split-file-album` (on) chunks move into `<output-dir>/<input-stem>/` |
-| `--width, --height` | auto | raw frame size; one-sided values complete via 4:3; pinned geometry only bumps planes |
-| `--gfx-native` | off | shortcut for `11648x8736` (~102 MP sensor scale) |
-| `--pixelshift` | off | shortcut for `23296x17472` (~407 MP combiner scale, GB-size file, needs lots of RAM) |
+| `--width, --height` | auto | raw frame size; one-sided values complete via 4:3; pinned geometry only bumps planes; cannot be combined with a `--camera-profile` subprofile |
+| `--camera-profile SLUG[-SUB]` | `gfx_100` | camera cover story: Make/Model/lenses/pools stamped into the file; base slug keeps auto-sizing, `-native` pins that camera's sensor geometry, `-pixelshift` (GFX 100 only) pins `23296x17472` (GB-size file, needs lots of RAM); unknown names list choices; see §3.5 |
 | `--auto-size` | off | compute the smallest even 4:3 frame that fits; smallest files, non-standard dims |
 | `--lsb-planes 1–16` | fewest fitting | payload bit planes per sample; capacity scales linearly; 3+ visibly degrade, 9+ destroy most cover, 16 = pure payload |
 | `--bit-depth 8/10/12/14/16` | 16 | packed `BitsPerSample`; controls plausibility and file size, not capacity per plane |
@@ -264,7 +269,45 @@ decoding a consecutive-from-0001 subset (e.g. chunks 1–2 of 3) succeeds
 and silently returns truncated data. Use `PageNumber` when a missing tail
 must fail closed. `--split-file-id` overrides the generated UUID.
 
-### 3.4 Full `--help` output
+### 3.4 Camera profiles
+
+`--camera-profile` selects the cover story stamped into the file:
+Make/Model/Software, DNG calibration, lens pool, and the ISO/exposure/
+aperture pools the per-file randomization draws from.
+
+```bash
+# Sony body, auto-sized like the default ...
+python stego_dng.py encode -i secret.bin -o sony.dng --camera-profile sony_ilce_7rm5 --seed 7
+# ... or pinned to its native sensor geometry
+python stego_dng.py encode -i secret.bin -o sony.dng --camera-profile sony_ilce_7rm5-native --seed 7
+# GFX 100 pixel-shift combiner scale (was --pixelshift)
+python stego_dng.py encode -i big.bin -o ps.dng --camera-profile gfx_100-pixelshift --seed 7
+```
+
+- The base slug (e.g. `gfx_100`, `canon_eos_r5`) auto-sizes and only
+  changes *what camera the file claims to be*.
+- A `-SUB` suffix pins geometry: every harvested profile offers
+  `-native` (decoded-RAW dimensions incl. masked margins);
+  `gfx_100` additionally offers `-pixelshift` (23296×17472).
+  Subprofiles conflict with `--width/--height/--auto-size`.
+- Profiles live in `stegodng/profiles/<slug>/` (`profile.json` +
+  `README.md`): camera name, sample metadata extracted from
+  `dpreview-raw` files, static vs randomized fields, subprofile
+  definitions, and calibration fidelity notes. `PROFILES.md` in the
+  same directory indexes all profiles and the skipped models.
+  Python API: `DngStego(get_profile("sony_ilce_7rm5"))`;
+  `list_profiles()` lists slugs. Regenerate the whole tree from samples
+  with `tools/` (see `tools/README.md`); the `-native` pin is the most
+  common decoded geometry per model (hi-res composites excluded).
+- Fidelity is honest, not perfect: DNG-native cameras contribute real
+  `ColorMatrix`/`BlackLevel`/`WhiteLevel`/opcode data; proprietary-RAW
+  cameras (CR3, NEF, ARW, RAF, RW2, ORF, ...) fall back to the GFX
+  reference calibration with an `exif-plus-fallback` marker — an
+  inspector comparing against Adobe DNG Converter output for that body
+  would spot the mismatch. The per-profile README says exactly what an
+  inspector would observe.
+
+### 3.5 Full `--help` output
 
 Regenerated with `COLUMNS=80`; if these blocks ever disagree with
 `python stego_dng.py <cmd> --help`, trust the live CLI — the tables in
@@ -282,7 +325,7 @@ usage: stego_dng.py encode [-h] --input INPUT [--output OUTPUT]
                            [--split-file-metadata-seq {ImageDescription,ImageNumber,PageNumber,none}]
                            [--split-file-id UUID]
                            [--split-file-album | --no-split-file-album]
-                           [--no-randomize] [--gfx-native] [--pixelshift]
+                           [--no-randomize] [--camera-profile CAMERA_PROFILE]
                            [--raw-frames {1,2,3,4,5,6,7,8}] [--auto-size]
                            [--progress] [--no-progress]
 
@@ -337,8 +380,13 @@ options:
                         with --split-file; use --no-split-file-album to write
                         chunks beside the output path)
   --no-randomize
-  --gfx-native          use 11648x8736
-  --pixelshift          use 23296x17472 (needs lots of RAM)
+  --camera-profile CAMERA_PROFILE
+                        camera cover story: a profile slug with an optional
+                        '-subprofile' suffix (e.g. gfx_100-pixelshift,
+                        gfx_100-native, sony_ilce_7rm5-native). The base slug
+                        keeps auto-sizing; a subprofile pins that camera's
+                        native (or pixel-shift) geometry. Run with an unknown
+                        name to list available profiles.
   --raw-frames {1,2,3,4,5,6,7,8}
                         full-resolution raw SubIFDs sharing one file
                         (burst/stack style, 1-8); capacity scales with frames
@@ -347,7 +395,7 @@ options:
   --auto-size           compute the smallest 4:3 width/height fitting the
                         input (smaller files, but non-standard dimensions may
                         look unusual under inspection; cannot be combined with
-                        --width/--height/--gfx-native/--pixelshift)
+                        --width/--height/--camera-profile subprofiles)
   --progress            force progress bars on (by default they show on a TTY
                         and stay quiet when output is piped)
   --no-progress         disable progress bars
@@ -451,11 +499,11 @@ options:
   the 80–120 MB embedded RAF of real combiner files; MakerNote is
   omitted; no GPS tags are written (samples have none). An inspector
   comparing priv-data size against a real combiner DNG notices instantly.
-- **Huge files, huge RAM.** `--pixelshift` writes a ~2.5 GB uncompressed
+- **Huge files, huge RAM.** `gfx_100-pixelshift` writes a ~2.5 GB uncompressed
   file. Peak encode RAM is ~2x payload plus one cover buffer (~4.3 GB for
   a 1 GB payload); covers embed in place and `--split-file` streams one
   chunk at a time, so splitting keeps peak near a single chunk's cost.
-  Only `--gfx-native` (489 MB file, 20 MB payload) was tested end-to-end
+  Only `gfx_100-native` (489 MB file, 20 MB payload) was tested end-to-end
   at scale; pixelshift-scale RAM figures are analytical.
 - **Weak encryption.** The `--key` XOR keystream gives confidentiality
   against casual inspection, not authenticated encryption. Use real
@@ -480,7 +528,7 @@ options:
 | `--lsb-planes 9–15` | raw renders as degraded noise; flat histogram |
 | `--lsb-planes 16` | **no cover at all** — pure payload; trivially exposed by any entropy check (use `--key` so contents stay opaque) |
 | `--raw-frames 2–8` | N full-res SubIFDs in `tiffdump`; ~N× file size; no still-DNG camera output looks like this |
-| `--bit-depth 8/10/12` | `BitsPerSample` below every GFX 100 II option (14/16) |
+| `--bit-depth 8/10/12` | `BitsPerSample` below the profile camera's native options (usually 14/16) |
 | `--auto-size` | dimensions match no camera preset (e.g. 462×348) |
 | split shared UUID | links the chunk set (its purpose); `none`/`none` leaves only filenames |
 
@@ -526,15 +574,16 @@ inspectors and the curious.
   picture matters more than the cover for casual inspection. Viewers
   downscale to 128–512 px regardless, but we keep combiner parity (up to
   4000×3000, same aspect as the raw).
-- **Metadata: static vs re-rolled.** Calibration fields are copied
-  verbatim (`ColorMatrix1/2`, `CalibrationIlluminant 17/21`,
-  `AnalogBalance`, 256-byte `OpcodeList3`, `Make`/`Model`/`Software`, XMP
-  skeleton). Every `encode` re-rolls the identifiable fields (seeded by
+- **Metadata: static vs re-rolled.** Calibration fields are fixed per
+  camera profile (`ColorMatrix1/2`, `CalibrationIlluminant 17/21`,
+  `AnalogBalance`, `OpcodeList3`, `Make`/`Model`/`Software`, XMP
+  skeleton; see `stegodng/profiles/<slug>/README.md` for what was
+  harvested vs hardcoded). Every `encode` re-rolls the identifiable fields (seeded by
   `--seed`): `DateTime` (+`DateTimeOriginal/Digitized`, `OffsetTime*`,
   `SubSecTime*`), `ExposureTime`/`ShutterSpeedValue`,
   `FNumber`/`ApertureValue`, `ExposureProgram`, `ISOSpeedRatings`,
-  `MeteringMode`, `FocalLength` (+ 35 mm equiv, consistent GF lens pick
-  from 8 real lenses), `MaxApertureValue`, `BrightnessValue`,
+  `MeteringMode`, `FocalLength` (+ 35 mm equiv, consistent lens pick
+  from the profile's observed lens pool), `MaxApertureValue`, `BrightnessValue`,
   `ExposureBiasValue`, `CameraSerialNumber`, `BodySerialNumber`,
   `LensSerialNumber`, `AsShotNeutral`, `BaselineExposure`, plus fresh
   cover and thumbnail pixels. `ImageNumber` is *not* randomized — on

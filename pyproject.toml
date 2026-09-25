@@ -41,6 +41,12 @@ py-modules = ["stego_dng"]
 where = ["."]
 include = ["stegodng*"]
 
+# Camera profile data (harvested per-camera metadata + docs) ships with
+# the package so --camera-profile works from an install, not just a
+# checkout.
+[tool.setuptools.package-data]
+"stegodng.profiles" = ["*/profile.json", "*/README.md", "PROFILES.md"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 

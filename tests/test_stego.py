@@ -456,6 +456,7 @@ def test_shim_delegates_to_package():
         "CameraProfile", "PayloadFrame", "MetadataRandomizer",
         "CoverGenerator", "LsbCodec", "DngContainer", "AutoSizer",
         "ThumbnailProvider", "main", "split_album_dir", "split_album_output",
+        "get_profile", "list_profiles",
     ):
         assert hasattr(stego_dng, name), name
 
@@ -1303,6 +1304,224 @@ def test_cli_split_album_no_leftover_dir_on_error(tmp_path):
     assert r.returncode == 1
     assert "error:" in r.stderr
     assert not os.path.exists(os.path.join(str(tmp_path), "in"))
+
+
+def test_camera_profile_registry():
+    from stegodng.profiles import get_profile, list_profiles, resolve
+    slugs = list_profiles()
+    assert slugs == sorted(slugs) and "gfx_100" in slugs
+    gfx = get_profile("gfx_100")
+    assert gfx.model == "GFX 100"
+    assert gfx.subprofiles["native"] == (11648, 8736)
+    assert gfx.subprofiles["pixelshift"] == (23296, 17472)
+    p, sub = resolve("gfx_100")
+    assert p.slug == "gfx_100" and sub is None
+    p, sub = resolve("gfx_100-native")
+    assert sub == "native" and p.subprofiles[sub] == (11648, 8736)
+    with pytest.raises(ValueError, match="unknown camera profile"):
+        get_profile("nope-not-a-camera")
+    with pytest.raises(ValueError, match="unknown camera profile"):
+        resolve("nope-not-a-camera")
+    with pytest.raises(ValueError, match="unknown sub-profile"):
+        resolve("gfx_100-nosuchsub")
+
+
+def test_camera_profile_from_dict_defaults():
+    from stegodng.profile import DEFAULT_PROFILE, CameraProfile
+    p = CameraProfile.from_dict({"slug": "x", "make": "ACME",
+                                 "model": "X1"})
+    assert p.color_matrix1 == list(DEFAULT_PROFILE.color_matrix1)
+    assert p.opcode_list3 == DEFAULT_PROFILE.opcode_list3
+    assert p.dng_version == DEFAULT_PROFILE.dng_version
+    assert p.lenses is None and p.subprofiles == {}
+    p2 = CameraProfile.from_dict({
+        "slug": "y", "make": "ACME", "model": "X2",
+        "color_matrix1": [[1, 2]] * 9, "opcode_list3_hex": "00ff",
+        "dng_version": [1, 2, 0, 0],
+        "lenses": [["L1", 24.0, 70.0, 2.8, "ACME"]],
+        "iso_choices": [100, 200],
+        "exposure_choices": [[1, 125]],
+        "fnumber_choices": [[800, 100]],
+        "metering_choices": [5],
+        "exposure_program_choices": [3],
+        "subprofiles": {"native": {"width": 100, "height": 80,
+                                   "description": "n"}},
+    })
+    assert p2.color_matrix1 == [(1, 2)] * 9
+    assert p2.opcode_list3 == b"\x00\xff"
+    assert p2.dng_version == b"\x01\x02\x00\x00"
+    assert p2.subprofiles == {"native": (100, 80)}
+
+
+def test_camera_profile_data_valid():
+    import json
+    from stegodng.profiles import list_profiles
+    base = os.path.join(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))),
+        "stegodng", "profiles")
+    required = {"schema", "slug", "display_name", "make", "model",
+                "software", "calibration_source", "subprofiles"}
+    for slug in list_profiles():
+        if slug == "gfx_100":
+            continue  # built-in reference, no data dir
+        d = os.path.join(base, slug)
+        with open(os.path.join(d, "profile.json")) as f:
+            data = json.load(f)
+        assert required <= set(data), slug
+        assert data["slug"] == slug
+        assert os.path.isfile(os.path.join(d, "README.md")), slug
+        sub = data["subprofiles"]
+        for name, g in sub.items():
+            assert g["width"] > 0 and g["height"] > 0, (slug, name)
+
+
+def test_camera_profile_encode_roundtrip(tmp_path):
+    import tifffile
+    from stegodng import DngStego
+    from stegodng.profiles import get_profile, list_profiles
+    others = [s for s in list_profiles() if s != "gfx_100"]
+    if not others:
+        pytest.skip("no harvested profiles present")
+    profile = get_profile(others[0])
+    payload = os.urandom(2000)
+    out = str(tmp_path / "prof.dng")
+    stego = DngStego(profile)
+    info = stego.encode(payload, out, width=256, height=192, seed=11,
+                        thumbnail="synthetic")
+    assert stego.decode(out) == payload
+    with tifffile.TiffFile(out) as tif:
+        tags = tif.pages[0].tags
+        assert str(tags[271].value) == profile.make
+        assert str(tags[272].value) == profile.model
+    assert info["metadata"]["lens_make"] == (
+        (profile.lenses[0][4] or profile.make)
+        if profile.lenses else profile.make)
+
+
+def test_camera_profile_empty_lens_make_falls_back(tmp_path):
+    # canon_eos_5d_mark_iv lenses carry no observed LensMake (""); the
+    # randomizer must fall back to the profile make, never emit "".
+    from stegodng import DngStego
+    from stegodng.metadata import MetadataRandomizer
+    from stegodng.profiles import get_profile
+    profile = get_profile("canon_eos_5d_mark_iv")
+    assert profile.lenses, "expected harvested lenses"
+    assert all(l[4] == "" for l in profile.lenses)
+    for seed in (0, 1, 2):
+        meta = MetadataRandomizer(seed, profile).randomize()
+        assert meta["lens_make"] == profile.make == "Canon"
+    payload = os.urandom(1500)
+    out = str(tmp_path / "canon.dng")
+    info = DngStego(profile).encode(payload, out, width=256, height=192,
+                                    seed=4, thumbnail="synthetic")
+    assert DngStego(profile).decode(out) == payload
+    assert info["metadata"]["lens_make"] == "Canon"
+
+
+def test_camera_profile_lens_ranges_match_names():
+    # Regression: Canon "f/2.8" slash apertures once failed to parse and
+    # every lens fell back to the model's global focal extremes.
+    import json
+    base = os.path.join(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))),
+        "stegodng", "profiles")
+    with open(os.path.join(base, "canon_eos_5d_mark_iv",
+                            "profile.json")) as f:
+        lenses = json.load(f)["lenses"]
+    by_name = {l[0]: l for l in lenses}
+    assert by_name["EF16-35mm f/2.8L III USM"][1:4] == [16.0, 35.0, 2.8]
+    assert by_name["EF28mm f/2.8 IS USM"][1:4] == [28.0, 28.0, 2.8]
+    assert by_name["TAMRON SP 150-600mm F/5-6.3 Di VC USD G2 A022"][1:4] == \
+        [150.0, 600.0, 5.0]
+    assert by_name["100-400mm F5-6.3 DG OS HSM | Contemporary 017"][1:4] == \
+        [100.0, 400.0, 5.0]
+
+
+def test_registry_skips_corrupt_entries(tmp_path, monkeypatch):
+    import stegodng.profiles as reg
+    bad = tmp_path / "bad"
+    bad.mkdir()
+    (bad / "profile.json").write_text(
+        '{"slug": "bad", "subprofiles": {"native": {"w": 1}}}')
+    nonjson = tmp_path / "nonjson"
+    nonjson.mkdir()
+    (nonjson / "profile.json").write_text("not json{{{")
+    nondict = tmp_path / "nondict"
+    nondict.mkdir()
+    (nondict / "profile.json").write_text("[1, 2]")
+    monkeypatch.setattr(reg, "_DATA_DIR", tmp_path)
+    monkeypatch.setattr(reg, "_CACHE", None)
+    slugs = reg.list_profiles()
+    assert slugs == ["gfx_100"]
+    assert "bad" not in slugs
+
+
+def test_from_dict_rejects_bad_subprofiles():
+    from stegodng.profile import CameraProfile
+    with pytest.raises(ValueError, match="width/height"):
+        CameraProfile.from_dict({"slug": "x", "subprofiles": {
+            "native": {"w": 1}}})
+    with pytest.raises(ValueError, match="positive"):
+        CameraProfile.from_dict({"slug": "x", "subprofiles": {
+            "native": {"width": 0, "height": 10}}})
+    with pytest.raises(ValueError, match="must be a dict"):
+        CameraProfile.from_dict({"slug": "x", "subprofiles": ["native"]})
+
+
+def test_resolve_longest_slug_wins(monkeypatch):
+    from stegodng.profile import CameraProfile
+    import stegodng.profiles as reg
+    fake = {
+        "x": CameraProfile(slug="x",
+                           subprofiles={"y-z": (4, 4), "native": (8, 8)}),
+    }
+    monkeypatch.setattr(reg, "_CACHE", dict(fake))
+    p, sub = reg.resolve("x-y-z")
+    assert p.slug == "x" and sub == "y-z"
+    p, sub = reg.resolve("x-native")
+    assert sub == "native"
+    with pytest.raises(ValueError, match="unknown sub-profile"):
+        reg.resolve("x-nope")
+
+
+def test_dngstego_none_profile_is_default(tmp_path):
+    from stegodng import DngStego, encode
+    payload = os.urandom(500)
+    out1 = str(tmp_path / "n.dng")
+    out2 = str(tmp_path / "d.dng")
+    DngStego(None).encode(payload, out1, width=256, height=192, seed=9,
+                          thumbnail="synthetic")
+    encode(payload, out2, width=256, height=192, seed=9,
+           thumbnail="synthetic")
+    with open(out1, "rb") as f1, open(out2, "rb") as f2:
+        assert f1.read() == f2.read()
+
+
+def test_cli_camera_profile_roundtrip(tmp_path):
+    import tifffile
+    from stegodng.profiles import list_profiles
+    others = [s for s in list_profiles() if s != "gfx_100"]
+    if not others:
+        pytest.skip("no harvested profiles present")
+    slug = others[0]
+    src_p = str(tmp_path / "in.bin")
+    enc = str(tmp_path / "p.dng")
+    rec = str(tmp_path / "out.bin")
+    with open(src_p, "wb") as f:
+        f.write(os.urandom(1500))
+    r = subprocess.run(
+        [sys.executable, STEGO_SCRIPT, "encode", "-i", src_p, "-o", enc,
+         "--seed", "5", "--width", "256", "--height", "192",
+         "--thumbnail", "synthetic", "--camera-profile", slug],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert f"profile: {slug}" in r.stdout
+    r = subprocess.run(
+        [sys.executable, STEGO_SCRIPT, "decode", "-i", enc, "-o", rec],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    with open(src_p, "rb") as f1, open(rec, "rb") as f2:
+        assert f1.read() == f2.read()
 
 
 if __name__ == "__main__":

@@ -8,13 +8,10 @@ import sys
 from .codec import capacity_bytes, format_kb
 from .container import DngContainer
 from .profile import (
-    GFX_NATIVE_H,
-    GFX_NATIVE_W,
     MAX_FRAMES,
     MAX_LSB_PLANES,
-    PIXELSHIFT_H,
-    PIXELSHIFT_W,
 )
+from .profiles import resolve as resolve_profile
 from .sizing import recommend, risk_warnings
 from .split import (
     SPLIT_ID_FIELDS,
@@ -92,10 +89,13 @@ def main(argv: list[str] | None = None) -> int:
                    "with --split-file; use --no-split-file-album to write "
                    "chunks beside the output path)")
     e.add_argument("--no-randomize", action="store_true")
-    e.add_argument("--gfx-native", action="store_true",
-                   help=f"use {GFX_NATIVE_W}x{GFX_NATIVE_H}")
-    e.add_argument("--pixelshift", action="store_true",
-                   help=f"use {PIXELSHIFT_W}x{PIXELSHIFT_H} (needs lots of RAM)")
+    e.add_argument("--camera-profile", default="gfx_100",
+                   help="camera cover story: a profile slug with an optional "
+                   "'-subprofile' suffix (e.g. gfx_100-pixelshift, "
+                   "gfx_100-native, sony_ilce_7rm5-native). The base slug "
+                   "keeps auto-sizing; a subprofile pins that camera's "
+                   "native (or pixel-shift) geometry. Run with an unknown "
+                   "name to list available profiles.")
     e.add_argument("--raw-frames", type=int, default=1,
                    choices=tuple(range(1, MAX_FRAMES + 1)),
                    help="full-resolution raw SubIFDs sharing one file "
@@ -106,7 +106,7 @@ def main(argv: list[str] | None = None) -> int:
                    help="compute the smallest 4:3 width/height fitting the "
                    "input (smaller files, but non-standard dimensions may "
                    "look unusual under inspection; cannot be combined with "
-                   "--width/--height/--gfx-native/--pixelshift)")
+                   "--width/--height/--camera-profile subprofiles)")
     e.add_argument("--progress", action="store_true",
                    help="force progress bars on (by default they show on "
                    "a TTY and stay quiet when output is piped)")
@@ -158,18 +158,28 @@ def main(argv: list[str] | None = None) -> int:
 
     args = ap.parse_args(argv)
     if args.cmd == "encode":
+        try:
+            profile, subprofile = resolve_profile(args.camera_profile)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        pinned: tuple[int, int] | None = None
+        if subprofile is not None:
+            pinned = profile.subprofiles[subprofile]
         if args.auto_size and (args.width is not None
                                or args.height is not None
-                               or args.gfx_native or args.pixelshift):
+                               or pinned is not None):
             ap.error("--auto-size cannot be combined with "
-                     "--width/--height/--gfx-native/--pixelshift")
+                     "--width/--height/--camera-profile subprofiles")
         if args.no_progress and args.progress:
             ap.error("--progress and --no-progress are mutually exclusive")
         w, h = args.width, args.height
-        if args.gfx_native:
-            w, h = GFX_NATIVE_W, GFX_NATIVE_H
-        if args.pixelshift:
-            w, h = PIXELSHIFT_W, PIXELSHIFT_H
+        if pinned is not None:
+            if w is not None or h is not None:
+                ap.error("--width/--height cannot be combined with a "
+                         "--camera-profile subprofile (it pins the "
+                         "geometry)")
+            w, h = pinned
         with open(args.input, "rb") as f:
             payload = f.read()
         split_size = None
@@ -200,10 +210,11 @@ def main(argv: list[str] | None = None) -> int:
                       f"capacity {format_kb(cfg['capacity'])} {scope}")
             if cfg["preset"] == "auto-size":
                 print(f"warning: --auto-size chose non-standard dimensions "
-                      f"{cfg['width']}x{cfg['height']} (no GFX preset "
+                      f"{cfg['width']}x{cfg['height']} (no camera preset "
                       f"matches); the file is smaller, but unusual "
                       f"dimensions may look suspicious under inspection.")
-            for line in risk_warnings(cfg, key=bool(args.key)):
+            for line in risk_warnings(cfg, key=bool(args.key),
+                                       profile=profile):
                 print(line)
             key_bytes = args.key.encode() if args.key else None
             output_path = (args.output if args.output is not None
@@ -222,7 +233,7 @@ def main(argv: list[str] | None = None) -> int:
                 compression=args.compression,
                 no_randomize=args.no_randomize, frames=cfg["frames"],
                 thumbnail=args.thumbnail,
-                progress=forced,
+                progress=forced, profile=profile,
             )
             if split_size is not None:
                 infos = encode_split(
@@ -283,6 +294,8 @@ def main(argv: list[str] | None = None) -> int:
         for info in infos:
             print(f"thumbnail: {info['path']}: {info['thumbnail']}")
         info = infos[0]
+        print(f"profile: {args.camera_profile} "
+              f"({profile.display_name or profile.model})")
         print(f"meta: {info['metadata']['datetime']} ISO{info['metadata']['iso']} "
               f"{info['metadata']['lens']} S/N {info['metadata']['camera_serial']}")
     elif args.cmd == "decode":

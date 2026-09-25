@@ -1,0 +1,45 @@
+# Sony a7C
+Profile slug: `sony_ilce_7c`  
+EXIF Make/Model: `SONY` / `ILCE-7C`
+Native geometry: 6024x4024 most common decoded dims across 6 sample(s)  
+Suggested bit depth: 14  
+CFA: unknown  
+Crop factor: 1.0  
+Calibration source: `exif-plus-fallback`
+
+## Sample metadata (from dpreview-raw)
+Representative file: `Sony a7C 2/4299348187.arw`
+Files seen: 6 (Sony a7C 2/4299348187.arw, Sony a7C 2/8329056126.arw, Sony a7C/2415281550.arw, Sony a7C/2458962151.arw, ...)
+Software strings observed: ILCE-7C v1.00
+Lenses observed: E 70-300mm F4.5-6.3 A047; FE 28-60mm F4-5.6; FE 35mm F1.8
+ISO observed: 100, 200, 400, 4000, 800
+Exposure observed: 1/125 s, 1/160 s, 1/50 s, 1/60 s, 1/80 s
+F-number observed: F1.8, F5.6, F6.3, F8
+Focal length observed: 147.0 mm, 232.0 mm, 35.0 mm, 60.0 mm
+EXIF PixelDimensions observed: 6000 x 4000
+Serial tags present: none (generic fallback (no serial tags observed))
+
+## Static fields (identical in every output file)
+- Make `SONY`, Model `ILCE-7C`, UniqueCameraModel `ILCE-7C`, Software `ILCE-7C v1.00`
+- DNGVersion default 1.4, CalibrationIlluminants 17/21
+- ColorMatrix1/2: GFX reference fallback
+- BlackLevel ref 256 (scaled per bit depth); OpcodeList3: GFX reference fallback
+
+## Randomized per file (seeded)
+- DateTime*, OffsetTime*, SubSecTime* (2019-2024 window)
+- ExposureTime pool: [[10, 8000], [10, 4000], [10, 2000], [1, 160], [1, 125], [10, 1000], [1, 80], [1, 60], [10, 500], [1, 50], [10, 250], [10, 125], [10, 60], [10, 30], [10, 21], [10, 17], [10, 16], [10, 8], [15, 10], [10, 5], [20, 10], [10, 4], [30, 10], [10, 3], [50, 10], [10, 2], [60, 10], [10, 1]]
+- FNumber pool: [[170, 100], [180, 100], [200, 100], [250, 100], [280, 100], [320, 100], [400, 100], [560, 100], [630, 100], [710, 100], [800, 100], [1100, 100], [1600, 100], [2200, 100], [3200, 100]]
+- ISO pool: [50, 64, 100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1000, 1250, 1600, 3200, 4000, 6400]
+- Lens pool (3): E 70-300mm F4.5-6.3 A047; FE 28-60mm F4-5.6; FE 35mm F1.8
+- FocalLength + 35mm equivalent (x1.0), Metering [2, 3, 5], ExposureProgram [1, 2, 3, 4]
+- Camera/lens serials (prefixes ['1A', '4E', '7B', 'C2']), ImageNumber, AsShotNeutral, BaselineExposure, Brightness, ExposureBias
+
+## Sub-profiles
+- `sony_ilce_7c-native`: pins 6024x4024 (native sensor geometry)
+
+Base `--camera-profile=sony_ilce_7c` auto-sizes like the default profile but stamps this camera's Make/Model/lenses.
+
+## Plausible-deniability notes
+Output is a converted-to-DNG story: the payload carrier claims whatever RAW the user converted. Fidelity limits an inspector could spot:
+- Color matrices / opcode list are GFX reference values, not this camera's: a forensic comparison against Adobe DNG Converter output for this body would mismatch.
+- Native geometry includes masked margins; exact active-area dimensions may differ by a few dozen pixels.
