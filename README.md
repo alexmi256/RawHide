@@ -547,13 +547,14 @@ run `just --list`). Dev dependencies first:
 
 ```bash
 python -m venv .venv
-.venv/bin/pip install -r requirements-dev.txt   # pytest, ruff, build, twine, ...
+.venv/bin/pip install -r requirements-dev.txt   # pytest, ruff, pyrefly, build, twine, ...
 ```
 
 | command | what it does |
 |---|---|
 | `just test` | `pytest tests/ -q` (extra args forwarded, e.g. `just test -k roundtrip`) |
 | `just lint` | `ruff check` on the shipped code (`stegodng/`, `stego_dng.py`) |
+| `just typecheck` | [`pyrefly`](https://pyrefly.org/) `check` on the shipped code (config in `[tool.pyrefly]`; extra args forwarded, e.g. `just typecheck --summarize-errors`) |
 | `just build` | sdist + wheel into `dist/`, then `twine check` |
 | `just publish-test` | rebuild and upload to [TestPyPI](https://test.pypi.org/project/stegodng/) |
 | `just publish` | rebuild and upload to [PyPI](https://pypi.org/project/stegodng/) |

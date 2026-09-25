@@ -7,3 +7,5 @@ build
 twine
 # Linting (used by `just lint`).
 ruff
+# Type checking (used by `just typecheck`).
+pyrefly

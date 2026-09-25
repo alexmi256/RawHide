@@ -36,6 +36,13 @@ from .cover import CoverGenerator
 
 USER_AGENT = "ImageSteg-DNG/1.0 (random-thumbnail fetcher; contact: admin@example.invalid)"
 
+# Pillow >= 9.1 keeps the filter under Image.Resampling and the stubs
+# no longer list the old Image.LANCZOS alias; fall back for older Pillows.
+if hasattr(Image, "Resampling"):
+    _LANCZOS = Image.Resampling.LANCZOS
+else:  # pragma: no cover - Pillow < 9.1
+    _LANCZOS = getattr(Image, "LANCZOS", 1)
+
 # Photo-like types Pillow reliably decodes; everything else (SVG, TIFF,
 # video, audio, archives, ...) triggers another random pick / fallback.
 ALLOWED_EXTENSIONS = frozenset(
@@ -149,7 +156,7 @@ def prepare(data: bytes, tw: int, th: int) -> np.ndarray:
                 nh = round(sw / target)
                 y0 = (sh - nh) // 2
                 im = im.crop((0, y0, sw, y0 + nh))
-            im = im.resize((tw, th), Image.LANCZOS)
+            im = im.resize((tw, th), _LANCZOS)
             arr = np.asarray(im, dtype=np.uint8)
     except ThumbnailError:
         raise

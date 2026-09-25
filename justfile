@@ -17,6 +17,11 @@ test *args="":
 lint:
     {{ python }} -m ruff check stegodng stego_dng.py
 
+# Type-check the shipped package with Pyrefly (see [tool.pyrefly] in
+# pyproject.toml; extra args are forwarded, e.g. `just typecheck --summarize-errors`).
+typecheck *args="":
+    {{ python }} -m pyrefly check {{ args }}
+
 # Build an sdist + wheel into dist/ and verify the metadata renders.
 build:
     rm -rf dist/ build/
