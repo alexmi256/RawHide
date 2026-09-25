@@ -244,7 +244,8 @@ deterministic chunk sequence; plain files omit it.)
 
 ```bash
 # embed: omit sizing flags and the smallest fitting config is auto-chosen
-python stego_dng.py encode -i secret.bin -o out.dng --seed 42
+python stego_dng.py encode -i secret.bin --seed 42  # -> secret.bin.dng (-o optional)
+python stego_dng.py encode -i secret.bin -o out.dng --seed 42  # explicit output
 # ... or exact-fit dimensions for the smallest possible file (see tradeoff below)
 python stego_dng.py encode -i secret.bin -o small.dng --auto-size --seed 42
 # ... or pin any subset explicitly (the rest still auto-fits)
@@ -254,8 +255,9 @@ python stego_dng.py encode -i secret.bin -o max.dng --gfx-native --bit-depth 16 
 python stego_dng.py encode -i huge.bin -o stack.dng --auto-size --raw-frames 4 --lsb-planes 16 --key s3cret  # max density, max risk
 python stego_dng.py encode -i secret.bin -o mypic.dng --thumbnail photo.jpg  # own preview picture
 # split a big payload: ≤100 MB per DNG, DCF-style numbered files
-python stego_dng.py encode -i huge.raw -o vol.dng --split-file 100m --seed 7
-# -> vol0001.dng vol0002.dng ... (shared UUID + sequence in metadata)
+python stego_dng.py encode -i huge.raw --split-file 100m --seed 7
+# -> huge.raw0001.dng huge.raw0002.dng ... (shared UUID + sequence in metadata)
+# (explicit -o still works: -o vol.dng -> vol0001.dng vol0002.dng ...)
 python stego_dng.py decode -i vol0001.dng vol0002.dng -o huge.raw
 
 # extract (--lsb-planes auto-detected; only --key must match)
@@ -307,12 +309,18 @@ reported in kilobytes.
 
 `--split-file SIZE` (kilobytes/megabytes/gigabytes: `500k`, `100m`,
 `1g`, also `2G`, `64KB`, or bare bytes) caps the payload bytes per DNG.
-`out.dng` becomes `out0001.dng`, `out0002.dng`, … — 4-digit sequences
+`-o` is optional: without it the output defaults to `<input>.dng`
+(e.g. `secret.bin` -> `secret.bin.dng`); with `--split-file` the
+sequence numbers are inserted before that extension (e.g. `huge.raw`
+-> `huge.raw0001.dng`, `huge.raw0002.dng`, …).
+With an explicit `-o out.dng`, chunks become `out0001.dng`,
+`out0002.dng`, … — 4-digit sequences
 from 0001 in the spirit of DCF camera filenames. Each chunk is an
 independent framed payload (own header/CRC), so a short last chunk
 needs no padding and no resolution tricks; a corrupt chunk fails on its
 own CRC. If everything fits in one chunk, output is a plain single DNG
-with no split markers at all.
+with no split markers at all — i.e. `<input>.dng` on the default path
+(or the exact `-o` path), not a `0001`-numbered file.
 
 Chunk bookkeeping lives in two metadata fields (split-only; plain files
 omit them):
