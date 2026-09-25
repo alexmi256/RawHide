@@ -251,10 +251,6 @@ def main(argv: list[str] | None = None) -> int:
                 except ValueError as exc:
                     print(f"error: {exc}", file=sys.stderr)
                     return 1
-                if max_bytes <= 0:
-                    print("error: --max-bytes must be a positive SIZE",
-                          file=sys.stderr)
-                    return 1
             payload = decode(
                 args.input,
                 key=args.key.encode() if args.key else None,
