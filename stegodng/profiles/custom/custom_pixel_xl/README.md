@@ -73,7 +73,7 @@ Raw SubIFD:
 - CFAPattern: `02 01 01 00` (BGGR)
 - CFAPlaneColor: `00 01 02`
 - BlackLevelRepeatDim: 2 x 2
-- BlackLevel: 1012.7-1017.9 per file (four rational values)
+- BlackLevel: 1009.49-1017.86 per file (four rational values)
 - WhiteLevel: 16368
 - DefaultCropOrigin: 8, 8
 - DefaultCropSize: 4032, 3020
@@ -92,8 +92,9 @@ Raw SubIFD:
 - DNGVersion [1, 3, 0, 0], DNGBackwardVersion [1, 3, 0, 0]
 - ColorMatrix1/2 and CalibrationIlluminants 17/21 from the harvest
 - BaselineNoise/BaselineSharpness/LinearResponseLimit/ShadowScale 1.0
-- BlackLevel ref 4075 (16-bit equivalent of the observed ~6.22% level);
-  OpcodeList3 empty (`00000000`)
+- BlackLevel ref 4075 (16-bit equivalent; observed per-channel range
+  ~4042-4075, ref is file 1's first channel); OpcodeList3 empty
+  (`00000000`)
 
 ## Randomized per file (seeded)
 
@@ -105,7 +106,8 @@ Raw SubIFD:
 - Lens: fixed Pixel XL built-in lens (4.7 mm, f/2.0)
 - FocalLength 4.7 mm, 35 mm equivalent 26 mm (crop factor 5.53)
 - Camera/body/lens serials (generic prefixes, since the samples carry none)
-- AsShotNeutral, BaselineExposure, Brightness, ExposureBias
+- AsShotNeutral (writer R 0.50-0.76 / B 0.40-0.56), BaselineExposure
+  (writer ±0.006 EV), Brightness, ExposureBias
 - Metering [2, 3, 5] and ExposureProgram [1, 2, 3, 4]: not observed in the
   samples, but the writer always emits these tags
 
@@ -133,6 +135,10 @@ would still see:
   `ExposureProgram`, `MeteringMode` (the samples omit all of these)
 - Orientation 1 instead of 6/3
 - No `SubjectDistance`/`SubjectDistanceRange`, no GPS
+- `BaselineExposure` is re-rolled within ±0.006 EV, while these samples are
+  +0.13 to +0.94 EV
+- `AsShotNeutral` is re-rolled as R 0.50-0.76 / B 0.40-0.56, wider than the
+  observed R 0.582-0.646 / B 0.378-0.433
 
 `OpcodeList2`, the Google MakerNote and the per-file raw digests cannot be a
 single static profile blob: they differ in every sample.

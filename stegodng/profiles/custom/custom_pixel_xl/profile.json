@@ -51,7 +51,7 @@
   "linear_response_limit": [100, 100],
   "shadow_scale": [100, 100],
   "black_level_ref": 4075,
-  "black_level_note": "per-file BlackLevel 1012.7-1017.9 at WhiteLevel 16368; ref is the 16-bit equivalent",
+  "black_level_note": "per-file per-channel BlackLevel 1009.49-1017.86 at WhiteLevel 16368 (~4042-4075 at 16-bit); ref 4075 is the representative file's first channel, at the top of that range",
   "opcode_list3_hex": "00000000",
   "opcode_list2_note": "each sample has a ~19572-byte OpcodeList2 that varies per file; no OpcodeList3",
   "native_width": 4032,

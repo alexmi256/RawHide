@@ -665,9 +665,10 @@ def main():
 def sync_staging(slugs: set) -> None:
     """Sync staged profiles into stegodng/profiles/.
 
-    Copies each staged slug dir + PROFILES.md over; removes profile dirs
-    that no longer exist upstream. Never touches __init__.py (file, not
-    dir), __pycache__ or the hand-maintained ``custom/`` namespace.
+    Copies each staged slug dir + PROFILES.md over; removes stale harvested
+    profile dirs (those containing a ``profile.json``). Never touches
+    __init__.py (file, not dir) or namespace dirs such as ``custom/``,
+    which have no direct ``profile.json``.
     """
     os.makedirs(OUT, exist_ok=True)
     for slug in sorted(slugs):
@@ -677,8 +678,8 @@ def sync_staging(slugs: set) -> None:
                  os.path.join(OUT, "PROFILES.md"))
     for child in sorted(os.listdir(OUT)):
         full = os.path.join(OUT, child)
-        if os.path.isdir(full) and child not in slugs \
-                and child not in ("__pycache__", "custom"):
+        if (os.path.isdir(full) and child not in slugs
+                and os.path.isfile(os.path.join(full, "profile.json"))):
             shutil.rmtree(full)
             print(f"removed stale profile dir: {child}")
     shutil.rmtree(STAGE, ignore_errors=True)
