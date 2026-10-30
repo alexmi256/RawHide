@@ -39,6 +39,22 @@ python3 tools/gainmap.py generate --profile custom_pixel_xl --seed 7 \
 The generator lives in `stegodng/opcodes.py`; the profile format is
 documented in `stegodng/profiles/custom/custom_pixel_xl/README.md`.
 
+## Upload/encode test payloads
+
+`make_test_payloads.sh` writes size-controlled random payloads for
+end-to-end encode/upload testing:
+
+```bash
+# one file each at 10, 20 and 30 MB
+tools/make_test_payloads.sh 10 30 10
+
+# five files each at 50, 60, ..., 150 MB, in ./payloads
+OUT_DIR=payloads tools/make_test_payloads.sh 5 50 150 10
+```
+
+Arguments are `[COUNT] START_MB MAX_MB STEP_MB`; `COUNT` defaults to 1,
+sizes are MiB, and files are named `payload_<size>mb_<n>.bin`.
+
 ## Raw digests / MakerNote
 
 `digests.py` verifies the two raw identity tags and summarizes the

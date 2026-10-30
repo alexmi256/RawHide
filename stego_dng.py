@@ -69,6 +69,7 @@ from stegodng.container import (
     XMP_LEN,
 )
 from stegodng.cover import CoverGenerator, make_cover, make_thumbnail
+from stegodng.debugmeta import debug_metadata_path, write_debug_metadata
 from stegodng.digests import (
     new_raw_image_digest,
     opcode_list_fingerprint,
