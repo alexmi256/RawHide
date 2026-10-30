@@ -14,6 +14,7 @@ is the operator's guide for changing code.
 | `stegodng/framing.py` | `PayloadFrame` (magic/len/CRC framing + keystream) |
 | `stegodng/metadata.py` | `MetadataRandomizer` (seeded per-file EXIF variety) |
 | `stegodng/cover.py` | `CoverGenerator` (synthetic raw covers + gradient thumbnails) |
+| `stegodng/debugmeta.py` | JSON debug sidecar (`--debug-metadata-output`: tag inventory + blob hashes) |
 | `stegodng/codec.py` | `LsbCodec` (LSB embed/extract, capacity, KB formatters) |
 | `stegodng/opcodes.py` | `OpcodeList2` GainMap generation/parsing (per-profile base grid) |
 | `stegodng/digests.py` | `NewRawImageDigest` / `RawDataUniqueID` (DNG SDK tile-hash rules) |
@@ -42,6 +43,10 @@ is the operator's guide for changing code.
   code (`stegodng/`, `stego_dng.py`; error-level rules in
   `[tool.ruff.lint]`), `just build` builds sdist+wheel and runs
   `twine check`. Release flow is documented in `README.md` §7.
+- A linked `git worktree` does not get the git-ignored `.venv`. Run
+  `just setup` once to link the main checkout's venv, or set
+  `PYTHON=/path/to/venv/bin/python`. `just` fails loudly when the
+  interpreter is missing instead of falling back to system Python.
 - Quick smoke: `.venv/bin/python stego_dng.py capacity --width 2048 --height 1536`
 
 ## Testing

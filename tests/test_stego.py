@@ -339,6 +339,14 @@ def test_bigtiff_patch_and_append(tmp_path):
     with tifffile.TiffFile(p) as tif:
         assert 34665 in tif.pages[0].tags
         assert len(tif.pages[0].tags[34665].value) == 43
+    # The debug sidecar's read-back inventory must stay BigTIFF-aware.
+    from stegodng.debugmeta import collect_written_file
+    snapshot = collect_written_file(p)
+    assert len(snapshot["subifds"]) == 2
+    assert len(snapshot["exif"]) == 43
+    assert snapshot["preview_jpeg"]["bytes"] > 0
+    ifd0_values = {t["tag"]: t["value"] for t in snapshot["ifd0"]}
+    assert ifd0_values[330] == subs
 
 
 def test_risk_warnings():
@@ -461,7 +469,8 @@ def test_shim_delegates_to_package():
         "parse_opcode_list2", "validate_opcode_list2", "read_exif_tags",
         "read_gps", "read_ifd", "MakernoteConfig",
         "new_raw_image_digest", "raw_data_unique_id",
-        "opcode_list_fingerprint",
+        "opcode_list_fingerprint", "debug_metadata_path",
+        "write_debug_metadata",
     ):
         assert hasattr(stego_dng, name), name
 
@@ -807,6 +816,227 @@ def test_cli_split_roundtrip(tmp_path):
         [sys.executable, STEGO_SCRIPT, "decode", "-i", files[0], files[2],
          "-o", rec], capture_output=True, text=True)
     assert r.returncode == 1 and "0002" in r.stderr
+
+
+def test_cli_debug_metadata_sidecar(tmp_path):
+    import json
+    import zlib
+
+    src = tmp_path / "in.bin"
+    payload = os.urandom(3000)
+    src.write_bytes(payload)
+    enc = tmp_path / "dbg.dng"
+    r = subprocess.run(
+        [sys.executable, STEGO_SCRIPT, "encode", "-i", str(src),
+         "-o", str(enc), "--seed", "9", "--width", "512", "--height", "384",
+         "--thumbnail", "synthetic", "--key", "pw",
+         "--debug-metadata-output"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    side = tmp_path / "dbg.json"
+    assert side.is_file()
+    assert f"debug: {side}" in r.stdout
+    text = side.read_text(encoding="utf-8")
+    doc = json.loads(text)
+    assert doc["schema"] == "stegodng-debug-metadata"
+    assert doc["schema_version"] == 1
+    summary = doc["summary"]
+    assert summary["output"] == str(enc)
+    assert summary["output_bytes"] == enc.stat().st_size
+    assert summary["width"] == 512 and summary["height"] == 384
+    assert summary["thumbnail_source"] == "synthetic-gradient"
+    assert summary["payload_bytes"] == len(payload)
+    encode = doc["encode"]
+    assert encode["options"]["seed"] == 9
+    assert encode["options"]["thumbnail"] == "synthetic"
+    assert encode["options"]["keyed"] is True
+    frame = stego_dng.PayloadFrame.pack(payload, b"pw")
+    assert encode["payload"]["bytes"] == len(payload)
+    assert encode["payload"]["total_bytes"] == len(payload)
+    assert encode["payload"]["frame_bytes"] == len(frame)
+    assert encode["payload"]["frame_crc32"] == (
+        f"{zlib.crc32(frame) & 0xFFFFFFFF:08x}")
+    assert encode["output"]["path"] == str(enc)
+    assert encode["output"]["bytes"] == enc.stat().st_size
+    assert encode["split"] is None
+    assert doc["invocation"]["input"] == str(src)
+    assert doc["invocation"]["camera_profile_requested"] == "gfx_100"
+    assert isinstance(doc["invocation"]["auto_config"]["auto"], list)
+    assert doc["thumbnail"]["source"] == "synthetic-gradient"
+    assert len(doc["thumbnail"]["crc32"]) == 8
+    assert doc["cover"]["frame_crc32_scope"] == "embedded-raw"
+    assert doc["cover"]["frames"][0]["shape"] == [384, 512, 3]
+    assert doc["metadata"]["camera_serial"]
+    ifd0 = {tag["tag"]: tag for tag in doc["file"]["ifd0"]}
+    # XMP is a 12 KB blob on disk; the sidecar carries size + CRC32 only.
+    assert ifd0[700]["value"]["bytes"] == 12288
+    assert "crc32" in ifd0[700]["value"] and "hex" not in ifd0[700]["value"]
+    assert len(doc["file"]["exif"]) == 43
+    assert doc["file"]["preview_jpeg"]["bytes"] > 0
+    # The passphrase never reaches the sidecar.
+    assert "pw" not in text
+
+
+def test_debug_metadata_api_sidecar_and_default_off(tmp_path):
+    import json
+    from stegodng import DngStego
+
+    assert stego_dng.debug_metadata_path("dir/out.dng") == "dir/out.json"
+    payload = os.urandom(500)
+    off = tmp_path / "off.dng"
+    info = DngStego().encode(payload, str(off), width=256, height=192,
+                             seed=3, thumbnail="synthetic")
+    assert "debug_metadata_path" not in info
+    assert not (tmp_path / "off.json").exists()
+
+    on = tmp_path / "on.dng"
+    info = DngStego().encode(
+        payload, str(on), width=256, height=192, seed=3,
+        thumbnail="synthetic", debug_metadata=True,
+        debug_context={"input": "payload.bin"})
+    side = tmp_path / "on.json"
+    assert info["debug_metadata_path"] == str(side)
+    doc = json.loads(side.read_text(encoding="utf-8"))
+    assert doc["metadata"]["datetime"] == info["metadata"]["datetime"]
+    assert doc["metadata"]["camera_serial"] == info["metadata"]["camera_serial"]
+    assert doc["encode"]["payload"]["bytes"] == len(payload)
+    assert doc["encode"]["output"]["bigtiff"] is False
+    assert doc["file"]["subifds"]
+    assert doc["file"]["preview_jpeg"]["crc32"]
+
+
+def test_debug_metadata_split_sidecars(tmp_path):
+    import json
+    from stegodng import DngStego
+
+    payload = os.urandom(50000)
+    infos = DngStego().encode_split(
+        payload, str(tmp_path / "vol.dng"), 20000, width=512, height=384,
+        seed=5, thumbnail="synthetic", split_id="dbgset",
+        debug_metadata=True)
+    assert len(infos) == 3
+    for info in infos:
+        side = tmp_path / f"vol{info['chunk_seq']:04d}.json"
+        assert info["debug_metadata_path"] == str(side)
+        doc = json.loads(side.read_text(encoding="utf-8"))
+        assert doc["summary"]["chunk_seq"] == info["chunk_seq"]
+        assert doc["summary"]["chunk_total"] == 3
+        split = doc["encode"]["split"]
+        assert split["chunk_seq"] == info["chunk_seq"]
+        assert split["chunk_total"] == 3
+        assert split["split_id"] == "dbgset"
+        assert split["split_id_field"] == "ImageUniqueID"
+        assert split["split_seq_field"] == "ImageNumber"
+        assert doc["encode"]["payload"]["bytes"] == info["payload_len"]
+        assert doc["encode"]["payload"]["total_bytes"] == len(payload)
+        exif = {tag["tag"]: tag["value"] for tag in doc["file"]["exif"]}
+        assert exif[37393] == info["chunk_seq"]
+        assert exif[42016] == "dbgset"
+
+
+def test_debug_metadata_default_seed_and_multi_frame(tmp_path):
+    import json
+    from stegodng.metadata import MetadataRandomizer
+
+    default_out = tmp_path / "default.dng"
+    stego_dng.encode(os.urandom(400), str(default_out), width=256,
+                     height=192, thumbnail="synthetic", debug_metadata=True)
+    doc = json.loads((tmp_path / "default.json").read_text(encoding="utf-8"))
+    assert doc["encode"]["options"]["seed"] is None
+    metadata_seed = doc["cover"]["metadata_seed"]
+    assert isinstance(metadata_seed, int)
+    # Unseeded encodes keep the legacy cover base but must record the
+    # concrete seed that produced the randomized metadata.
+    assert doc["cover"]["seed"] == 0
+    reproduced = MetadataRandomizer(metadata_seed).randomize()
+    assert doc["metadata"]["datetime"] == reproduced["datetime"]
+    assert doc["metadata"]["camera_serial"] == reproduced["camera_serial"]
+
+    multi_out = tmp_path / "multi.dng"
+    stego_dng.encode(os.urandom(4000), str(multi_out), width=256,
+                     height=192, seed=6, frames=2, thumbnail="synthetic",
+                     debug_metadata=True)
+    doc = json.loads((tmp_path / "multi.json").read_text(encoding="utf-8"))
+    assert doc["summary"]["frames"] == 2
+    assert doc["encode"]["capacity"]["frames"] == 2
+    assert doc["encode"]["capacity"]["samples_per_frame"] == 256 * 192 * 3
+    assert [frame["index"] for frame in doc["cover"]["frames"]] == [0, 1]
+    assert doc["cover"]["frames"][1]["seed"] == 7
+    assert len(doc["file"]["subifds"]) == 2
+
+
+def test_cli_debug_metadata_split_lines(tmp_path):
+    src = tmp_path / "in.bin"
+    src.write_bytes(os.urandom(50000))
+    r = subprocess.run(
+        [sys.executable, STEGO_SCRIPT, "encode", "-i", str(src),
+         "-o", str(tmp_path / "out.dng"), "--seed", "5",
+         "--width", "512", "--height", "384",
+         "--thumbnail", "synthetic", "--split-file", "20k",
+         "--debug-metadata-output"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.count("debug: ") == 3
+    sidecars = sorted(glob.glob(str(tmp_path / "in" / "out0*.json")))
+    assert len(sidecars) == 3
+
+
+def test_debug_metadata_write_and_serialize_errors(tmp_path):
+    from stegodng.debugmeta import write_debug_metadata
+
+    blocked = tmp_path / "blocked.json"
+    blocked.mkdir()
+    with pytest.raises(ValueError, match="cannot write debug metadata"):
+        write_debug_metadata(str(tmp_path / "blocked.dng"), {"a": 1})
+    with pytest.raises(ValueError, match="cannot serialize debug metadata"):
+        write_debug_metadata(str(tmp_path / "bad.dng"), {"bad": object()})
+    assert not (tmp_path / "bad.json").exists()
+    # A serialization failure must leave an earlier valid sidecar intact.
+    existing = tmp_path / "keep.json"
+    existing.write_text('{"old": true}\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="cannot serialize debug metadata"):
+        write_debug_metadata(str(tmp_path / "keep.dng"), {"bad": object()})
+    assert existing.read_text(encoding="utf-8") == '{"old": true}\n'
+
+
+def test_debug_metadata_does_not_change_encoded_bytes(tmp_path):
+    payload = os.urandom(1000)
+    plain = tmp_path / "plain.dng"
+    debug = tmp_path / "debug.dng"
+    stego_dng.encode(payload, str(plain), width=256, height=192, seed=4,
+                     thumbnail="synthetic")
+    stego_dng.encode(payload, str(debug), width=256, height=192, seed=4,
+                     thumbnail="synthetic", debug_metadata=True)
+    assert plain.read_bytes() == debug.read_bytes()
+
+
+def test_debug_metadata_hashes_binary_profile_blobs(tmp_path):
+    import json
+    from stegodng import DngStego
+    from stegodng.profiles import get_profile
+
+    profile = get_profile("custom_pixel_xl")
+    payload = b"debug blob payload" * 20
+    out = tmp_path / "pxl.dng"
+    info = DngStego(profile, level_policy="strict").encode(
+        payload, str(out), width=256, height=192, seed=5, mode="cfa",
+        lsb_planes=4, thumbnail="synthetic", debug_metadata=True)
+    doc = json.loads((tmp_path / "pxl.json").read_text(encoding="utf-8"))
+    exif = {tag["tag"]: tag for tag in doc["file"]["exif"]}
+    makernote = exif[37500]["value"]
+    assert makernote["bytes"] > 2000
+    assert "hex" not in makernote
+    assert doc["metadata"]["makernote"]["crc32"] == makernote["crc32"]
+    assert doc["file"]["gps"]
+    subifd = {tag["tag"]: tag for tag in doc["file"]["subifds"][0]}
+    assert subifd[51009]["value"]["bytes"] > 1024
+    assert "crc32" in subifd[51009]["value"]
+    adobe = doc["profile"]["fidelity"]["adobe"]
+    assert adobe["hue_sat_map_data1"]["bytes"] == 90 * 30 * 3 * 4
+    assert adobe["hue_sat_map_data1"]["crc32"]
+    ifd0 = {tag["tag"]: tag["value"] for tag in doc["file"]["ifd0"]}
+    assert len(ifd0[51111]) == 32 and len(ifd0[50781]) == 32
+    assert info["debug_metadata_path"].endswith("pxl.json")
 
 
 def test_split_imagenumber_fail_open_pinned(tmp_path):

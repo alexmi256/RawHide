@@ -34,6 +34,10 @@ from .container import (
     read_ifd,
 )
 from .cover import CoverGenerator, make_cover, make_thumbnail
+from .debugmeta import (
+    debug_metadata_path,
+    write_debug_metadata,
+)
 from .digests import (
     new_raw_image_digest,
     opcode_list_fingerprint,
@@ -106,8 +110,10 @@ __all__ = [
     "read_gps",
     "read_ifd",
     "validate_opcode_list2",
+    "write_debug_metadata",
     "capacity_bytes",
     "capacity_bytes_total",
+    "debug_metadata_path",
     "decode",
     "embed_bits",
     "encode",

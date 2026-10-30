@@ -196,6 +196,7 @@ Module layout:
 | `framing.py` | `PayloadFrame` | magic/length/CRC framing + keystream |
 | `metadata.py` | `MetadataRandomizer` | per-file metadata re-rolling |
 | `cover.py` | `CoverGenerator` | synthetic raw covers + JPEG thumbnails |
+| `debugmeta.py` | — | JSON debug sidecar: options, metadata, tag inventory, blob hashes |
 | `codec.py` | `LsbCodec` | LSB embed/extract, capacity, KB formatting |
 | `container.py` | `DngContainer` | XMP/EXIF builders, BigTIFF-aware IFD patching, raw reading |
 | `digests.py` | — | `NewRawImageDigest` / `RawDataUniqueID` (DNG SDK rules) |
@@ -225,6 +226,78 @@ bars plus an outer `Encoding chunks` / `Decoding chunks` counter for
 silences them. The Python API takes the same tri-state:
 `progress=True/False/None` (`None` = auto, the default).
 
+### 2.6 Debug metadata sidecar
+
+`--debug-metadata-output` writes one JSON document beside every encoded
+image, named after the image with its extension replaced (`out.dng` ->
+`out.json`; split chunk `out0003.dng` -> `out0003.json`):
+
+```bash
+python stego_dng.py encode -i secret.bin -o out.dng \
+    --seed 7 --thumbnail synthetic --debug-metadata-output
+# wrote out.dng (…)
+# thumbnail: out.dng: synthetic-gradient
+# debug: out.json
+```
+
+The encode output gains one `debug:` line per written file, and the
+sidecar appears beside it.
+
+The sidecar records everything the encode used or stamped into the file:
+
+- a top-level `summary` for quick side-by-side comparison: output size,
+  dimensions, bit depth, planes, frames, compression, BigTIFF flag,
+  thumbnail source, payload bytes and chunk N/M when split;
+- resolved options and seeds (`seed`, cover seed, metadata seed, planes,
+  bit depth, mode, frames, compression, profile, level policy); when
+  `--seed` is omitted the metadata seed is drawn fresh and recorded, so
+  the metadata values are reproducible from that seed (e.g. with
+  `MetadataRandomizer`) even though the CLI seed is unset;
+- payload and chunk statistics (plaintext bytes, framed bytes and CRC32,
+  chunk number/total, split UUID and field names) without the payload
+  itself; the CRC covers the framed bytes that go into the raw (XOR-masked
+  when `--key` is used), so a keyed encode does not leak a plaintext
+  fingerprint;
+- the profile's full static calibration block and randomization pools,
+  plus the effective `fidelity` settings;
+- the randomized EXIF metadata dict (`datetime`, ISO, lens, serials,
+  exposure, GPS, NoiseProfile, split markers, ...);
+- cover geometry and per-frame embedded-raw CRC32 (computed after LSB
+  embedding, so it identifies the bytes written rather than the plain
+  cover), thumbnail source description (`commons:<file>`, `file:<path>`,
+  `synthetic-gradient`, ...) and CRC32;
+- a re-read inventory of the written IFD0, EXIF, GPS and raw SubIFD tags
+  (`tag`, `name`, `type`, `count`, value), so the document shows what
+  actually landed in the container, not just the intent.
+
+`metadata` is the randomized source dict, while `file` is the written
+result: a profile that suppresses serials, lens, XMP or GPS leaves those
+values in one block only.
+
+Binary blobs are never copied into the sidecar: XMP (12 KB), the preview
+JPEG, MakerNote, opcode lists and Adobe HueSat/LookTable tables appear as
+a byte count plus a CRC32 (short values also carry `hex`; the 16-byte raw
+digests appear as hex strings). Grep or diff two sidecars to find why one
+file uploads and another does not:
+
+```bash
+jq '.summary' out.json other.json
+diff -u out.json other.json | grep -E 'bytes|crc32|value|tag'
+```
+
+Treat the sidecar as private: it includes values a profile suppresses from
+the image (serials, lens, GPS) plus the exact payload length and keyed
+flag. Keep the `.json` local and do not upload or share it with the image.
+
+JSON is deliberate: it is stdlib-only (no PyYAML dependency), has
+unambiguous types (YAML 1.1 reads `2019:01:01 12:00:00` as a sexagesimal
+integer), and is serialized with sorted keys so plain `diff` is
+meaningful. `generated_at` and the `tool` environment block differ per
+run; ignore those when comparing. The sidecar is written after the DNG,
+so a failure to write it reports an `error:` but leaves the image in
+place. The Python API uses the same flag:
+`encode(..., debug_metadata=True)` returns `info["debug_metadata_path"]`.
+
 ## 3. Options reference
 
 ### 3.1 `encode` flags
@@ -251,6 +324,7 @@ silences them. The Python API takes the same tri-state:
 | `--split-file-metadata-id` | ImageUniqueID | metadata field for the shared chunk UUID (`ImageDescription`, or `none` for filenames only) |
 | `--split-file-metadata-seq` | ImageNumber | metadata field for the chunk number (`PageNumber`, `ImageDescription`, or `none`); see §3.3 |
 | `--split-file-id UUID` | fresh random | override the generated chunk-set UUID (handy for tests) |
+| `--debug-metadata-output` | off | also write `<output>.json` with every metadata value used/written (binary blobs as size + CRC32); one sidecar per split chunk; see §2.6 |
 | `--progress / --no-progress` | auto (TTY) | force progress bars on / off |
 
 ### 3.2 `decode` flags
@@ -379,6 +453,7 @@ usage: stego_dng.py encode [-h] --input INPUT [--output OUTPUT]
                            [--key KEY]
                            [--lsb-planes {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16}]
                            [--bit-depth {8,10,12,14,16}] [--mode {linear,cfa}]
+                           [--level-policy {profile,strict,capacity}]
                            [--compression {none,adobe_deflate}]
                            [--thumbnail THUMBNAIL] [--split-file SIZE]
                            [--split-file-metadata-id {ImageDescription,ImageUniqueID,none}]
@@ -387,7 +462,8 @@ usage: stego_dng.py encode [-h] --input INPUT [--output OUTPUT]
                            [--split-file-album | --no-split-file-album]
                            [--no-randomize] [--camera-profile CAMERA_PROFILE]
                            [--raw-frames {1,2,3,4,5,6,7,8}] [--auto-size]
-                           [--progress] [--no-progress]
+                           [--debug-metadata-output] [--progress]
+                           [--no-progress]
 
 options:
   -h, --help            show this help message and exit
@@ -409,6 +485,10 @@ options:
   --bit-depth {8,10,12,14,16}
                         packed BitsPerSample of the raw SubIFD (default: 16)
   --mode {linear,cfa}   raw layout (default: linear)
+  --level-policy {profile,strict,capacity}
+                        raw level policy: profile (default), strict (effective
+                        WhiteLevel and plane cap), or capacity (full 16-bit
+                        range, up to 16 planes)
   --compression {none,adobe_deflate}
                         raw SubIFD compression (none = widest viewer support;
                         adobe_deflate only with bit_depth 8/16)
@@ -453,15 +533,17 @@ options:
                         (burst/stack style, 1-8); capacity scales with frames
                         but so does file size, and multiple raw frames are
                         non-standard for still DNGs)
-  --auto-size           prefer the profile's native sensor size when the
-                        input fits, otherwise compute the smallest 4:3 frame
+  --auto-size           prefer the profile's native sensor size when the input
+                        fits, otherwise compute the smallest 4:3 frame
                         (unusual dimensions may look suspicious; cannot be
                         combined with --width/--height/--camera-profile
                         subprofiles)
-  --level-policy {profile,strict,capacity}
-                        raw level policy: profile (default), strict
-                        (effective WhiteLevel and plane cap), or capacity
-                        (full 16-bit range, up to 16 planes)
+  --debug-metadata-output
+                        also write a JSON sidecar next to each encoded file
+                        (same name minus the extension, e.g. out.dng ->
+                        out.json) listing every metadata value used or
+                        written; binary blobs appear as size + CRC32, not as
+                        data
   --progress            force progress bars on (by default they show on a TTY
                         and stay quiet when output is piped)
   --no-progress         disable progress bars
@@ -661,15 +743,15 @@ inspectors and the curious.
 ## 7. Development tasks and PyPI releases
 
 Task runner is [`just`](https://github.com/casey/just) (see `justfile`;
-run `just --list`). Dev dependencies first:
+run `just --list`). Prepare the dev environment first:
 
 ```bash
-python -m venv .venv
-.venv/bin/pip install -r requirements-dev.txt   # pytest, ruff, pyrefly, build, twine, ...
+just setup   # create .venv + install requirements-dev.txt, or link an existing one
 ```
 
 | command | what it does |
 |---|---|
+| `just setup` | create `.venv` and install `requirements-dev.txt`, or link the main checkout's venv in a linked worktree |
 | `just test` | `pytest tests/ -q` (extra args forwarded, e.g. `just test -k roundtrip`) |
 | `just lint` | `ruff check` on the shipped code (`stegodng/`, `stego_dng.py`) |
 | `just typecheck` | [`pyrefly`](https://pyrefly.org/) `check` on the shipped code (config in `[tool.pyrefly]`; extra args forwarded, e.g. `just typecheck --summarize-errors`) |
@@ -677,6 +759,19 @@ python -m venv .venv
 | `just publish-test` | rebuild and upload to [TestPyPI](https://test.pypi.org/project/stegodng/) |
 | `just publish` | rebuild and upload to [PyPI](https://pypi.org/project/stegodng/) |
 | `just clean` | remove `dist/`, `build/`, `*.egg-info/` |
+
+A `git worktree` checkout does not include the git-ignored `.venv`. Run
+`just setup` once per worktree to link the main checkout's venv, or point
+`PYTHON` at any existing dev interpreter:
+
+```bash
+just setup
+PYTHON=/path/to/venv/bin/python just lint
+```
+
+`just` does not fall back to system Python: if the interpreter is missing
+it stops with an error instead of running the tasks without `ruff`,
+`pyrefly` or the rest of `requirements-dev.txt`.
 
 `pip install stegodng` also installs two console commands, `stegodng`
 and `stego-dng`, which accept the same `encode`/`decode`/`capacity`/

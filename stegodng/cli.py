@@ -114,6 +114,11 @@ def main(argv: list[str] | None = None) -> int:
                    "(unusual dimensions may look suspicious; cannot be "
                    "combined with --width/--height/--camera-profile "
                    "subprofiles)")
+    e.add_argument("--debug-metadata-output", action="store_true",
+                   help="also write a JSON sidecar next to each encoded "
+                   "file (same name minus the extension, e.g. out.dng -> "
+                   "out.json) listing every metadata value used or written; "
+                   "binary blobs appear as size + CRC32, not as data")
     e.add_argument("--progress", action="store_true",
                    help="force progress bars on (by default they show on "
                    "a TTY and stay quiet when output is piped)")
@@ -251,6 +256,14 @@ def main(argv: list[str] | None = None) -> int:
                 thumbnail=args.thumbnail,
                 progress=forced, profile=profile,
                 level_policy=args.level_policy,
+                debug_metadata=args.debug_metadata_output,
+                # Provenance only; never add the passphrase (argv) here.
+                debug_context=(
+                    {"input": args.input,
+                     "camera_profile_requested": args.camera_profile,
+                     "auto_config": {"preset": cfg.get("preset"),
+                                     "auto": list(cfg.get("auto") or [])}}
+                    if args.debug_metadata_output else None),
             )
             if split_size is not None:
                 infos = encode_split(
@@ -310,6 +323,8 @@ def main(argv: list[str] | None = None) -> int:
                           "orders by filename.")
         for info in infos:
             print(f"thumbnail: {info['path']}: {info['thumbnail']}")
+            if info.get("debug_metadata_path"):
+                print(f"debug: {info['debug_metadata_path']}")
         info = infos[0]
         print(f"profile: {args.camera_profile} "
               f"({profile.display_name or profile.model})")

@@ -25,6 +25,7 @@ from .container import (
     set_ifd0_tag,
 )
 from .cover import CoverGenerator
+from .debugmeta import build_debug_document, crc32_hex, write_debug_metadata
 from .digests import new_raw_image_digest, raw_data_unique_id
 from .framing import PayloadFrame
 from .metadata import MetadataRandomizer
@@ -469,6 +470,52 @@ class DngStego:
             "metadata": {k: v for k, v in meta.items() if k != "makernote"},
         }
 
+    def _debug_options(self, *, width: int, height: int,
+                       seed: int | None, key: bytes | None,
+                       lsb_planes: int, bit_depth: int, mode: str,
+                       compression: str, no_randomize: bool, frames: int,
+                       thumbnail: str) -> dict:
+        """The resolved encode knobs recorded in the debug sidecar."""
+        return {
+            "width": width,
+            "height": height,
+            "seed": seed,
+            "keyed": key is not None,
+            "lsb_planes": lsb_planes,
+            "bit_depth": bit_depth,
+            "mode": mode,
+            "compression": compression,
+            "no_randomize": no_randomize,
+            "frames": frames,
+            "thumbnail": thumbnail,
+            "camera_profile": self.profile.slug,
+            "camera_profile_name": (self.profile.display_name
+                                    or self.profile.model),
+            "level_policy": self.level_policy,
+        }
+
+    def _debug_sidecar(self, output_path: str, info: dict, *, options: dict,
+                       meta: dict, thumbnail_requested: str,
+                       thumbnail_label: str, thumbnail_rgb, stegos: list,
+                       cover_seed: int | None, metadata_seed: int | None,
+                       white_level: int | None, headroom: int,
+                       frame_crc32: str,
+                       total_payload_bytes: int | None = None,
+                       split: dict | None = None,
+                       context: dict | None = None) -> None:
+        """Build and write the sidecar; adds ``debug_metadata_path``."""
+        document = build_debug_document(
+            info=info, profile=self.profile, options=options, meta=meta,
+            thumbnail_requested=thumbnail_requested,
+            thumbnail_label=thumbnail_label, thumbnail_rgb=thumbnail_rgb,
+            stegos=stegos, cover_seed=cover_seed,
+            metadata_seed=metadata_seed, white_level=white_level,
+            headroom=headroom, frame_crc32=frame_crc32,
+            total_payload_bytes=total_payload_bytes, split=split,
+            context=context,
+        )
+        info["debug_metadata_path"] = write_debug_metadata(
+            output_path, document)
 
     def encode(
             self,
@@ -486,6 +533,8 @@ class DngStego:
         frames: int = 1,
         thumbnail: str = "random",
         progress: bool | None = None,
+        debug_metadata: bool = False,
+        debug_context: dict | None = None,
     ) -> dict:
         """Embed `payload` into a new DNG file. Returns info dict.
 
@@ -493,11 +542,22 @@ class DngStego:
         style); the framed payload is striped across them in order, so
         capacity scales ~linearly with ``frames``. Each extra frame adds a
         full raster to the file size.
+
+        ``debug_metadata`` writes a JSON sidecar beside the output (same
+        base name, ``.json``; also reported as ``debug_metadata_path`` in
+        the returned dict). ``debug_context`` is optional provenance
+        (e.g. the CLI input path) merged into that document; never put
+        secrets such as the passphrase in it.
         """
         self._validate_options(bit_depth, lsb_planes, frames, mode,
                                compression)
-        meta = MetadataRandomizer(0 if no_randomize else seed,
-                                  self.profile).randomize()
+        requested_seed = seed
+        metadata_seed = 0 if no_randomize else requested_seed
+        if metadata_seed is None:
+            # Unseeded run: draw a concrete seed so the debug sidecar can
+            # record (and reproduce) the metadata randomization.
+            metadata_seed = random.randrange(1 << 30)
+        meta = MetadataRandomizer(metadata_seed, self.profile).randomize()
         if seed is None:
             seed = 0
 
@@ -519,12 +579,13 @@ class DngStego:
                 f"{lsb_planes} LSB plane(s)"
                 f"{f' x {frames} frames' if frames > 1 else ''})"
             )
+        frame = PayloadFrame.pack(payload, key)
+        frame_crc = crc32_hex(frame) if debug_metadata else ""
         stegos = LsbCodec.stripe_frames(
-            covers, PayloadFrame.pack(payload, key), lsb_planes,
-            progress=progress)
+            covers, frame, lsb_planes, progress=progress)
         # stripe_frames embeds in place: stegos share the covers'
         # buffers, so drop the extra references promptly.
-        del covers
+        del covers, frame
 
         tw, th = self._thumbnail_size(width, height)
         thumb, thumb_label = ThumbnailProvider(seed=seed).get(
@@ -535,12 +596,28 @@ class DngStego:
             compression=compression, frames=frames, tw=tw, th=th,
             seed=0 if seed is None else seed,
         )
-        return self._file_info(
+        info = self._file_info(
             output_path, width=width, height=height, mode=mode,
             bit_depth=bit_depth, container=str(stegos[0].dtype),
             lsb_planes=lsb_planes, frames=frames, thumb_label=thumb_label,
             bigtiff=bigtiff, cap=cap, payload_len=len(payload), meta=meta,
         )
+        if debug_metadata:
+            self._debug_sidecar(
+                output_path, info,
+                options=self._debug_options(
+                    width=width, height=height, seed=requested_seed, key=key,
+                    lsb_planes=lsb_planes, bit_depth=bit_depth, mode=mode,
+                    compression=compression, no_randomize=no_randomize,
+                    frames=frames, thumbnail=thumbnail),
+                meta=meta, thumbnail_requested=thumbnail,
+                thumbnail_label=thumb_label, thumbnail_rgb=thumb,
+                stegos=stegos, cover_seed=seed,
+                metadata_seed=metadata_seed,
+                white_level=white, headroom=headroom,
+                frame_crc32=frame_crc, context=debug_context,
+            )
+        return info
 
     def _attach_makernote(self, meta: dict, seed: int) -> None:
         """Add the profile's opaque MakerNote blob to ``meta`` (if any)."""
@@ -606,6 +683,8 @@ class DngStego:
         split_id_field: str = "ImageUniqueID",
         split_seq_field: str = "ImageNumber",
         progress: bool | None = None,
+        debug_metadata: bool = False,
+        debug_context: dict | None = None,
     ) -> list[dict]:
         """Split `payload` into ≤`split_size`-byte chunks across DNG files.
 
@@ -616,6 +695,10 @@ class DngStego:
         ``split_seq_field`` (``"none"`` disables either). A payload
         fitting in one chunk yields a single plain file with no split
         markers at all. Returns one info dict per file.
+
+        ``debug_metadata`` writes one JSON sidecar per chunk (see
+        :meth:`encode`); each document records its own chunk number,
+        chunk-set UUID and per-chunk metadata.
         """
         if isinstance(split_size, bool) or not isinstance(split_size, int) \
                 or split_size <= 0:
@@ -646,6 +729,8 @@ class DngStego:
                 mode=mode, compression=compression,
                 no_randomize=no_randomize, frames=frames,
                 thumbnail=thumbnail, progress=progress,
+                debug_metadata=debug_metadata,
+                debug_context=debug_context,
             )]
         ifd0_dummies = ((id_spec is not None and id_spec["ifd"] == "ifd0")
                         + (seq_spec is not None and seq_spec["ifd"] == "ifd0"))
@@ -660,8 +745,13 @@ class DngStego:
                 chunk = payload[start:end]
                 chunk_len = len(chunk)
                 path = chunk_path(output_path, seq)
-                cseed = (None if (seed is None and not no_randomize)
-                         else (0 if seed is None else seed) + seq - 1)
+                if seed is None and not no_randomize:
+                    # Unseeded run: fresh random base per chunk so chunks
+                    # share neither cover pixels nor fallback thumbnails
+                    # (identical high bits across chunks would be a tell).
+                    cseed = random.randrange(1 << 30)
+                else:
+                    cseed = (0 if seed is None else seed) + seq - 1
                 meta = MetadataRandomizer(cseed, self.profile).randomize()
                 split_exif: dict[int, Any] = {}
                 if id_spec is not None and id_spec["ifd"] == "exif":
@@ -672,13 +762,7 @@ class DngStego:
                         [val] if isinstance(val, int) else list(val))
                 if split_exif:
                     meta["split_exif"] = split_exif
-                if cseed is None:
-                    # Unseeded run: fresh random base per chunk so chunks share
-                    # neither cover pixels nor fallback thumbnails (identical
-                    # high bits across chunks would be an obvious tell).
-                    cs = random.randrange(1 << 30)
-                else:
-                    cs = cseed
+                cs = cseed
                 white = (self.profile.effective_white(
                     bit_depth, self.level_policy)
                     if self.profile.fidelity is not None
@@ -704,6 +788,7 @@ class DngStego:
                         f"enlarge the geometry / add planes."
                     )
                 frame = PayloadFrame.pack(chunk, key)
+                frame_crc = crc32_hex(frame) if debug_metadata else ""
                 del chunk
                 stegos = LsbCodec.stripe_frames(
                     covers, frame, lsb_planes, progress=show,
@@ -732,6 +817,27 @@ class DngStego:
                 info.update({"chunk_seq": seq, "chunk_total": total,
                              "split_id": uid, "split_id_field": split_id_field,
                              "split_seq_field": split_seq_field})
+                if debug_metadata:
+                    self._debug_sidecar(
+                        path, info,
+                        options=self._debug_options(
+                            width=width, height=height, seed=seed, key=key,
+                            lsb_planes=lsb_planes, bit_depth=bit_depth,
+                            mode=mode, compression=compression,
+                            no_randomize=no_randomize, frames=frames,
+                            thumbnail=thumbnail),
+                        meta=meta, thumbnail_requested=thumbnail,
+                        thumbnail_label=thumb_label, thumbnail_rgb=thumb,
+                        stegos=stegos, cover_seed=cs,
+                        metadata_seed=cseed, white_level=white,
+                        headroom=headroom, frame_crc32=frame_crc,
+                        total_payload_bytes=len(payload),
+                        split={"chunk_seq": seq, "chunk_total": total,
+                               "split_id": uid,
+                               "split_id_field": split_id_field,
+                               "split_seq_field": split_seq_field},
+                        context=debug_context,
+                    )
                 infos.append(info)
                 del stegos, thumb
                 outer.update(1)
@@ -1101,6 +1207,8 @@ def encode(
     progress: bool | None = None,
     profile=None,
     level_policy: str = "profile",
+    debug_metadata: bool = False,
+    debug_context: dict | None = None,
 ) -> dict:
     """Backwards-compatible wrapper (see :meth:`DngStego.encode`)."""
     stego = (_DEFAULT if profile is None
@@ -1110,6 +1218,7 @@ def encode(
         key=key, lsb_planes=lsb_planes, bit_depth=bit_depth, mode=mode,
         compression=compression, no_randomize=no_randomize, frames=frames,
         thumbnail=thumbnail, progress=progress,
+        debug_metadata=debug_metadata, debug_context=debug_context,
     )
 
 
@@ -1150,6 +1259,8 @@ def encode_split(
     progress: bool | None = None,
     profile=None,
     level_policy: str = "profile",
+    debug_metadata: bool = False,
+    debug_context: dict | None = None,
 ) -> list[dict]:
     """Backwards-compatible wrapper (see :meth:`DngStego.encode_split`)."""
     stego = (_DEFAULT if profile is None
@@ -1160,7 +1271,8 @@ def encode_split(
         mode=mode, compression=compression, no_randomize=no_randomize,
         frames=frames, thumbnail=thumbnail, split_id=split_id,
         split_id_field=split_id_field, split_seq_field=split_seq_field,
-        progress=progress)
+        progress=progress, debug_metadata=debug_metadata,
+        debug_context=debug_context)
 
 
 def generate_tiff(
