@@ -50,6 +50,7 @@ include = ["stegodng*"]
     "*/README.md",
     "*/*/profile.json",
     "*/*/README.md",
+    "*/*/*.bin",
     "PROFILES.md",
 ]
 

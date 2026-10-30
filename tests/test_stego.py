@@ -456,7 +456,10 @@ def test_shim_delegates_to_package():
         "CameraProfile", "PayloadFrame", "MetadataRandomizer",
         "CoverGenerator", "LsbCodec", "DngContainer", "AutoSizer",
         "ThumbnailProvider", "main", "split_album_dir", "split_album_output",
-        "get_profile", "list_profiles",
+        "get_profile", "list_profiles", "AdobeProfile", "FidelityConfig",
+        "GainMap", "GainMapConfig", "build_opcode_list2",
+        "parse_opcode_list2", "validate_opcode_list2", "read_exif_tags",
+        "read_gps", "read_ifd",
     ):
         assert hasattr(stego_dng, name), name
 
@@ -1332,11 +1335,493 @@ def test_custom_profile_namespace():
     assert p.make == "Google" and p.model == "Pixel XL"
     assert p.unique_camera_model == "Google Pixel XL"
     assert p.cfa_pattern == "BGGR"
-    assert p.subprofiles["native"] == (4032, 3020)
+    assert p.subprofiles["native"] == (4048, 3036)
     # The harvested 16-bit-equivalent BlackLevel must stay below white.
     assert 0 < p.black_level(16) < p.white_level(16)
     prof, sub = resolve("custom_pixel_xl-native")
     assert prof.slug == "custom_pixel_xl" and sub == "native"
+
+
+def test_gainmap_opcode_layout():
+    from stegodng.opcodes import (
+        GAIN_MAP_POINTS, GainMapConfig, build_opcode_list2,
+        parse_opcode_list2, validate_opcode_list2,
+    )
+    blob = build_opcode_list2(
+        4048, 3036, seed=7, config=GainMapConfig.synthetic())
+    assert len(blob) == 19572  # matches the real Pixel XL OpcodeList2
+    maps = validate_opcode_list2(blob, width=4048, height=3036)
+    assert len(maps) == 4
+    assert [(m.top, m.left) for m in maps] == [
+        (1, 1), (1, 0), (0, 1), (0, 0)]
+    for m in maps:
+        assert (m.bottom, m.right) == (3036, 4048)
+        assert (m.plane, m.planes) == (0, 1)
+        assert (m.row_pitch, m.col_pitch) == (2, 2)
+        assert (m.points_v, m.points_h) == GAIN_MAP_POINTS
+        assert abs(m.spacing_v - 1 / 29) < 1e-12
+        assert abs(m.spacing_h - 1 / 39) < 1e-12
+        assert m.map_planes == 1
+        assert m.gains.shape == (30, 40, 1)
+        assert 1.0 <= m.gains.min() <= m.gains.max() <= 4.2
+    parsed = parse_opcode_list2(blob)
+    assert [(m.top, m.left) for m in parsed] == [
+        (1, 1), (1, 0), (0, 1), (0, 0)]
+
+
+def test_gainmap_seed_variation():
+    from stegodng.opcodes import GainMapConfig, build_opcode_list2, parse_opcode_list2
+    cfg = GainMapConfig.synthetic()
+    a = build_opcode_list2(1024, 768, seed=3, config=cfg)
+    b = build_opcode_list2(1024, 768, seed=3, config=cfg)
+    c = build_opcode_list2(1024, 768, seed=4, config=cfg)
+    assert a == b
+    assert a != c
+    ga = parse_opcode_list2(a)[0].gains
+    gc = parse_opcode_list2(c)[0].gains
+    diff = float(np.abs(ga - gc).mean())
+    assert 0.005 < diff < 0.15
+
+
+def test_gainmap_custom_profile_config():
+    from stegodng.opcodes import build_opcode_list2, parse_opcode_list2, validate_opcode_list2
+    from stegodng.profiles import get_profile
+    p = get_profile("custom_pixel_xl")
+    assert p.gainmap is not None
+    assert p.gainmap.grid == (8, 10)
+    assert p.gainmap.planes.shape == (4, 8, 10)
+    blob = build_opcode_list2(4048, 3036, seed=11, config=p.gainmap)
+    maps = validate_opcode_list2(blob, width=4048, height=3036)
+    # The harvested base is bright at the corners and near 1.0 at center.
+    assert maps[0].gains[15, 20, 0] < 1.4
+    assert maps[0].gains[0, 0, 0] > 3.0
+    assert parse_opcode_list2(blob)[0].gains.shape == (30, 40, 1)
+
+
+def test_gainmap_written_in_cfa_dng(tmp_path):
+    import tifffile
+    from stegodng.opcodes import read_opcode_list2, validate_opcode_list2
+    from stegodng.profiles import get_profile
+
+    payload = b"gainmap payload" * 100
+    out = str(tmp_path / "gainmap.dng")
+    stego_dng.encode(
+        payload, out, width=256, height=192, seed=7, mode="cfa",
+        thumbnail="synthetic", profile=get_profile("custom_pixel_xl"),
+    )
+    assert stego_dng.decode(out) == payload
+    blob = read_opcode_list2(out)
+    assert blob is not None and len(blob) == 19572
+    maps = validate_opcode_list2(blob, width=256, height=192)
+    assert [m.left for m in maps] == [1, 0, 1, 0]
+    tags = set()
+    with tifffile.TiffFile(out) as tif:
+        pages = [page for series in tif.series for page in series.pages]
+        for page in pages:
+            tags.update(page.tags.keys())
+        cfa = next(page.tags[33422] for page in pages if 33422 in page.tags)
+    assert 51009 in tags
+    assert 51022 not in tags  # real Pixel XL files carry no OpcodeList3
+    assert cfa.dtype == 1  # BYTE, as in the real files
+    assert bytes(cfa.value) == b"\x02\x01\x01\x00"  # BGGR
+
+
+def test_default_encode_keeps_opcode_list3(tmp_path):
+    import tifffile
+    from stegodng.opcodes import read_opcode_list2
+
+    out = str(tmp_path / "gfx.dng")
+    stego_dng.encode(b"x" * 100, out, width=256, height=192, seed=9,
+                     mode="cfa", thumbnail="synthetic")
+    assert read_opcode_list2(out) is None
+    tags = set()
+    with tifffile.TiffFile(out) as tif:
+        for series in tif.series:
+            for page in series.pages:
+                tags.update(page.tags.keys())
+    assert 51022 in tags
+
+
+def test_fidelity_profile_config():
+    from stegodng.profiles import get_profile
+    p = get_profile("custom_pixel_xl")
+    f = p.fidelity
+    assert f is not None
+    assert f.preview_size == (676, 506)
+    assert f.orientations == (6, 3)
+    assert f.software_variants[-1].endswith("nd")
+    assert f.date_window_days == 365 and f.date_range is None
+    assert f.suggested_mode == "cfa"
+    assert f.asn_r == (4453, 6460) and f.asn_b == (3780, 6410)
+    assert f.baseline_exposure == (1300, 9400)
+    assert f.emit_xmp is False and f.emit_lens is False
+    assert f.emit_serials is False and f.emit_gps is True
+    assert f.tile == (256, 256)
+    assert f.black_levels == ((1020, 1), (1016, 1), (1016, 1), (1020, 1))
+    assert f.white_level == 16368 and f.max_planes == 16
+    assert f.level_policy == "capacity"
+    assert f.crop_margin == (8, 8) and f.bayer_green_split == 500
+    assert f.sensor_sizes == ((4048, 3036),) and f.prefer_native
+    assert f.noise_s == (3e-05, 0.0013)
+    assert f.noise_o == (6e-08, 4e-05)
+    assert f.adobe is not None
+    assert f.adobe.hue_sat_map_dims == (90, 30, 1)
+    assert len(f.adobe.hue_sat_map_data1 or b"") == 90 * 30 * 3 * 4
+    assert len(f.adobe.hue_sat_map_data2 or b"") == 90 * 30 * 3 * 4
+    assert f.adobe.look_table_dims == (36, 8, 16)
+    assert len(f.adobe.look_table_data or b"") == 36 * 8 * 16 * 3 * 4
+    assert p.subprofiles["native"] == (4048, 3036)
+    assert p.effective_white(16, "profile") == 65535
+    assert p.effective_max_planes(16, "profile") == 16
+    assert p.effective_white(16, "strict") == 16368
+    assert p.effective_max_planes(16, "strict") == 13
+    assert p.effective_white(16, "capacity") == 65535
+    assert p.effective_max_planes(16, "capacity") == 16
+    assert p.effective_black_levels("cfa", 16, "strict") == (
+        1020, 1016, 1016, 1020)
+    cap_black = p.effective_black_levels("cfa", 16, "profile")
+    assert all(4000 < v < 4200 for v in cap_black)
+
+
+def test_fidelity_schema_rejects_bad_values():
+    from stegodng.fidelity import FidelityConfig
+    with pytest.raises(ValueError, match="white_level"):
+        FidelityConfig.from_dict({"raw": {"white_level": 0}})
+    with pytest.raises(ValueError, match="level_policy"):
+        FidelityConfig.from_dict({"raw": {"level_policy": "bogus"}})
+    with pytest.raises(ValueError, match="preview.size"):
+        FidelityConfig.from_dict({"preview": {"size": [0, 10]}})
+    with pytest.raises(ValueError, match="orientation"):
+        FidelityConfig.from_dict({"orientation": [9]})
+    with pytest.raises(ValueError, match="date_range"):
+        FidelityConfig.from_dict({"date_range": ["2026-13-01", "2026-12-31"]})
+    with pytest.raises(ValueError, match="black_levels"):
+        FidelityConfig.from_dict(
+            {"raw": {"black_levels": [[1020, 1], [1016, 0]]}})
+
+
+def test_fidelity_metadata_randomizer():
+    import datetime as dt
+    from stegodng.metadata import MetadataRandomizer
+    from stegodng.profiles import get_profile
+    p = get_profile("custom_pixel_xl")
+    now = dt.datetime.now()
+    earliest = now - dt.timedelta(days=365)
+    for seed in range(20):
+        meta = MetadataRandomizer(seed, p).randomize()
+        assert meta["software"] in p.fidelity.software_variants
+        assert meta["orientation"] in p.fidelity.orientations
+        when = dt.datetime.strptime(meta["datetime"], "%Y:%m:%d %H:%M:%S")
+        assert earliest - dt.timedelta(seconds=1) <= when <= now
+        r = meta["as_shot_neutral"][0][0]
+        b = meta["as_shot_neutral"][2][0]
+        assert 4453 <= r <= 6460 and 3780 <= b <= 6410
+        assert 1300 <= meta["baseline_exposure"][0] <= 9400
+        assert meta["exposure_bias"] == (0, 100)
+        assert meta["flash"] == 16
+        n, d = meta["subject_distance"]
+        if n in (0, 0xFFFFFFFF):
+            assert meta["subject_distance_range"] == 3
+        else:
+            metres = n / d
+            expected = 1 if metres <= 1.0 else (2 if metres <= 2.0 else 3)
+            assert meta["subject_distance_range"] == expected
+        gps = meta["gps"]
+        assert gps is not None
+        assert gps["lat_ref"] in ("N", "S")
+        assert gps["lon_ref"] in ("E", "W")
+        gps_date = dt.datetime.strptime(gps["date"], "%Y:%m:%d")
+        assert earliest.date() - dt.timedelta(days=1) <= gps_date.date() <= now.date()
+        noise = meta["noise_profile"]
+        assert noise is not None and len(noise) == 6
+        assert p.fidelity.noise_s[0] <= noise[0] <= p.fidelity.noise_s[1]
+        assert p.fidelity.noise_o[0] <= noise[1] <= p.fidelity.noise_o[1]
+
+
+def test_fidelity_tag_emission_and_raw_layout(tmp_path):
+    import tifffile
+    from stegodng.container import read_exif_tags, read_gps
+    from stegodng.profiles import get_profile
+
+    p = get_profile("custom_pixel_xl")
+    out = str(tmp_path / "fidelity.dng")
+    payload = b"fidelity payload" * 50
+    info = stego_dng.encode(
+        payload, out, width=256, height=192, seed=7, mode="cfa",
+        lsb_planes=4, thumbnail="synthetic", profile=p,
+        level_policy="strict",
+    )
+    assert stego_dng.decode(out) == payload
+
+    with tifffile.TiffFile(out) as tif:
+        ifd0 = tif.pages[0]
+        tags = ifd0.tags
+        assert tags[274].value in (6, 3)
+        assert str(tags[305].value) in p.fidelity.software_variants
+        assert ifd0.shape == (506, 676, 3)
+        assert 700 not in tags          # XMP suppressed
+        assert 50735 not in tags        # camera serial suppressed
+        assert 50736 not in tags        # lens info suppressed
+        assert 50964 in tags and 50965 in tags
+        assert 50936 in tags and 50932 in tags
+        assert 50942 in tags and 50941 in tags
+        assert tags[50937].value == (90, 30, 1)
+        assert tags[50938].count == 8100 and tags[50939].count == 8100
+        assert tags[50981].value == (36, 8, 16)
+        assert tags[50982].count == 13824
+        assert 51041 in tags and tags[51041].count == 6
+        noise = tags[51041].value
+        assert all(p.fidelity.noise_s[0] <= v <= p.fidelity.noise_s[1]
+                   for v in noise[0::2])
+        assert all(p.fidelity.noise_o[0] <= v <= p.fidelity.noise_o[1]
+                   for v in noise[1::2])
+        assert 34853 in tags             # GPS pointer
+        raw_page = next(
+            page for series in tif.series for page in series.pages
+            if page.photometric == 32803 and page is not ifd0)
+        assert raw_page.tags[50714].count == 4
+        assert raw_page.tags[50714].value == (1020, 1, 1016, 1,
+                                              1016, 1, 1020, 1)
+        assert raw_page.tags[50713].value == (2, 2)
+        assert raw_page.tags[50717].value == 16368
+        assert raw_page.tags[50719].value == (8, 1, 8, 1)
+        assert raw_page.tags[50720].value == (240, 1, 176, 1)
+        assert raw_page.tags[50829].value == (0, 0, 192, 256)
+        assert raw_page.tags[50733].value == 500
+        assert raw_page.tags[33422].dtype == 1
+        assert bytes(raw_page.tags[33422].value) == b"\x02\x01\x01\x00"
+        assert raw_page.tags[322].value == 256
+        assert raw_page.tags[323].value == 256
+        assert 51009 in raw_page.tags and 51022 not in raw_page.tags
+        assert int(raw_page.asarray().max()) <= 16368
+
+    exif = read_exif_tags(out)
+    assert exif is not None
+    assert set(exif) == set(p.fidelity.exif_allow)
+    for omitted in (34850, 36880, 36881, 36882, 37383, 37384,
+                    42033, 42034, 42035, 42036, 42037):
+        assert omitted not in exif
+    assert struct.unpack("<H", exif[37385][2])[0] == 16
+    assert struct.unpack("<ii", exif[37380][2]) == (0, 100)
+
+    gps = read_gps(out)
+    assert gps is not None
+    assert gps["version"] == (2, 2, 0, 0)
+    assert gps["processing_method"] == "charset=Ascii fused"
+    with open(out, "rb") as f:
+        raw_file = f.read()
+    assert b"ASCII\x00\x00\x00fused" in raw_file
+    assert b"charset=Ascii fused" not in raw_file
+    assert gps["date"] == info["metadata"]["gps"]["date"]
+    assert gps["lat"] == tuple(
+        (v if isinstance(v, tuple) else (v, 1))
+        for v in info["metadata"]["gps"]["lat"])
+
+
+def test_fidelity_subject_distance_infinity(tmp_path):
+    import struct
+    from stegodng.container import read_exif_tags
+    from stegodng.metadata import MetadataRandomizer
+    from stegodng.profiles import get_profile
+
+    p = get_profile("custom_pixel_xl")
+    seed = next(seed for seed in range(200)
+                if MetadataRandomizer(seed, p).randomize()[
+                    "subject_distance"][0] == 0xFFFFFFFF)
+    out = str(tmp_path / "infinity.dng")
+    stego_dng.encode(
+        b"infinity", out, width=256, height=192, seed=seed, mode="cfa",
+        lsb_planes=4, thumbnail="synthetic", profile=p,
+        level_policy="strict",
+    )
+    exif = read_exif_tags(out)
+    assert struct.unpack("<II", exif[37382][2]) == (0xFFFFFFFF, 1)
+    assert struct.unpack("<H", exif[41996][2])[0] == 3
+
+
+def test_fidelity_capacity_policy(tmp_path):
+    import tifffile
+    from stegodng.profiles import get_profile
+    p = get_profile("custom_pixel_xl")
+    out = str(tmp_path / "capacity.dng")
+    stego_dng.encode(
+        b"capacity" * 100, out, width=256, height=192, seed=8, mode="cfa",
+        lsb_planes=16, thumbnail="synthetic", profile=p,
+        level_policy="capacity",
+    )
+    assert stego_dng.decode(out) == b"capacity" * 100
+    with tifffile.TiffFile(out) as tif:
+        raw_page = next(
+            page for series in tif.series for page in series.pages
+            if page.photometric == 32803)
+        assert raw_page.tags[50717].value == 65535
+        assert int(raw_page.asarray().max()) > 16368
+    with pytest.raises(ValueError, match="profile's maximum"):
+        stego_dng.encode(
+            b"x", str(tmp_path / "strict16.dng"), width=256, height=192,
+            mode="cfa", lsb_planes=16, thumbnail="synthetic", profile=p,
+            level_policy="strict",
+        )
+
+
+def test_fidelity_native_autosize():
+    from stegodng.profiles import get_profile
+    from stegodng.sizing import recommend
+    p = get_profile("custom_pixel_xl")
+    cfg = recommend(
+        8 * 1024 * 1024, mode="cfa", bit_depth=16, auto_size=True,
+        max_planes=p.effective_max_planes(16, "profile"),
+        sensor_sizes=p.fidelity.sensor_sizes, prefer_max_planes=True,
+    )
+    assert (cfg["width"], cfg["height"]) == (4048, 3036)
+    assert cfg["preset"] == "sensor"
+    assert cfg["lsb_planes"] == 16
+    assert cfg["capacity"] >= 8 * 1024 * 1024
+
+    # Above native capacity the frame must grow at max planes, not fall
+    # back to a one-plane giant frame.
+    for payload in (24 * 1024 * 1024, 50 * 1024 * 1024):
+        cfg = recommend(
+            payload, mode="cfa", bit_depth=16, auto_size=True,
+            max_planes=p.effective_max_planes(16, "profile"),
+            sensor_sizes=p.fidelity.sensor_sizes, prefer_max_planes=True,
+        )
+        assert cfg["lsb_planes"] == 16
+        assert cfg["capacity"] >= payload
+        assert cfg["width"] * cfg["height"] < 40_000_000
+
+
+def test_fidelity_pinned_native_prefers_max_planes():
+    from stegodng.profiles import get_profile
+    from stegodng.sizing import recommend
+    p = get_profile("custom_pixel_xl")
+    cfg = recommend(
+        8 * 1024 * 1024, width=4048, height=3036, mode="cfa",
+        bit_depth=16, max_planes=16, prefer_max_planes=True,
+    )
+    assert cfg["lsb_planes"] == 16
+
+
+def test_auto_size_overflow_reports_max_plane_capacity():
+    from stegodng.codec import capacity_bytes_total, format_kb_lo
+    from stegodng.profile import PIXELSHIFT_H, PIXELSHIFT_W
+    from stegodng.sizing import recommend
+    payload = 800 * 1024 * 1024
+    expected = format_kb_lo(capacity_bytes_total(
+        PIXELSHIFT_W * PIXELSHIFT_H, 16, 1))
+    with pytest.raises(ValueError) as exc:
+        recommend(
+            payload, mode="cfa", bit_depth=16, auto_size=True,
+            max_planes=16, sensor_sizes=((4048, 3036),),
+            prefer_max_planes=True,
+        )
+    assert expected in str(exc.value)
+
+    pinned = format_kb_lo(capacity_bytes_total(
+        PIXELSHIFT_W * PIXELSHIFT_H * 3, 2, 1))
+    top_linear = format_kb_lo(capacity_bytes_total(
+        PIXELSHIFT_W * PIXELSHIFT_H * 3, 16, 1))
+    assert pinned != top_linear
+    with pytest.raises(ValueError) as exc:
+        recommend(
+            500_000_000, mode="linear", bit_depth=16, lsb_planes=2,
+            auto_size=True,
+        )
+    message = str(exc.value)
+    assert pinned in message
+    assert top_linear in message
+
+
+def test_fidelity_linear_omits_photo_cfapattern(tmp_path):
+    from stegodng.container import read_exif_tags
+    from stegodng.profiles import get_profile
+    out = str(tmp_path / "linear.dng")
+    stego_dng.encode(
+        b"linear", out, width=256, height=192, seed=3, mode="linear",
+        lsb_planes=4, thumbnail="synthetic",
+        profile=get_profile("custom_pixel_xl"),
+    )
+    exif = read_exif_tags(out)
+    assert exif is not None and 41730 not in exif
+
+
+def test_fidelity_default_writer_unchanged(tmp_path):
+    import tifffile
+    from stegodng.container import read_exif_tags, read_gps
+    out = str(tmp_path / "default.dng")
+    stego_dng.encode(b"default" * 100, out, width=256, height=192, seed=9,
+                     mode="cfa", thumbnail="synthetic")
+    assert read_gps(out) is None
+    exif = read_exif_tags(out)
+    assert exif is not None
+    assert 36880 in exif  # OffsetTime still emitted for the legacy profile
+    with tifffile.TiffFile(out) as tif:
+        ifd0 = tif.pages[0]
+        assert ifd0.tags[274].value == 1
+        assert 700 in ifd0.tags and 50735 in ifd0.tags
+        raw_page = next(
+            page for series in tif.series for page in series.pages
+            if page.photometric == 32803)
+        assert raw_page.tags[50717].value == 65535
+        assert 50829 not in raw_page.tags
+
+
+def test_read_ifd_bigtiff(tmp_path):
+    import numpy as np
+    import tifffile
+    from stegodng.container import read_ifd
+    path = str(tmp_path / "big.tif")
+    tifffile.imwrite(path, np.zeros((8, 8), dtype=np.uint8), bigtiff=True)
+    tags = {tag for tag, _typ, _count, _raw in read_ifd(path)}
+    assert {256, 257} <= tags
+
+
+def test_custom_profile_assets_and_package_data():
+    from stegodng.profiles import get_profile
+    p = get_profile("custom_pixel_xl")
+    root = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "stegodng", "profiles", "custom",
+        "custom_pixel_xl")
+    assert p.fidelity is not None and p.fidelity.adobe is not None
+    for name in ("adobe_hue_sat_map1.bin", "adobe_hue_sat_map2.bin",
+                 "adobe_look_table.bin"):
+        assert os.path.isfile(os.path.join(root, name)), name
+    with open(os.path.join(os.path.dirname(root), "..", "..", "..",
+                           "pyproject.toml")) as f:
+        assert '"*/*/*.bin"' in f.read()
+
+
+def test_cli_level_policy_and_suggested_mode(tmp_path):
+    from stegodng.opcodes import read_opcode_list2
+    src = str(tmp_path / "payload.bin")
+    with open(src, "wb") as f:
+        f.write(b"cli fidelity" * 50)
+    strict = str(tmp_path / "strict.dng")
+    r = subprocess.run(
+        [sys.executable, STEGO_SCRIPT, "encode", "-i", src, "-o", strict,
+         "--camera-profile", "custom_pixel_xl", "--width", "256",
+         "--height", "192", "--lsb-planes", "16", "--level-policy",
+         "strict", "--thumbnail", "synthetic"],
+        capture_output=True, text=True)
+    assert r.returncode == 1
+    assert "profile maximum" in r.stderr
+
+    out = str(tmp_path / "suggested.dng")
+    r = subprocess.run(
+        [sys.executable, STEGO_SCRIPT, "encode", "-i", src, "-o", out,
+         "--camera-profile", "custom_pixel_xl", "--width", "256",
+         "--height", "192", "--lsb-planes", "4", "--thumbnail",
+         "synthetic", "--seed", "5"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert "cfa" in r.stdout
+    import tifffile
+    with tifffile.TiffFile(out) as tif:
+        raw_page = next(
+            page for series in tif.series for page in series.pages
+            if page.photometric == 32803)
+        assert 51009 in raw_page.tags
+    assert read_opcode_list2(out) is not None
 
 
 def test_camera_profile_from_dict_defaults():
@@ -1387,6 +1872,21 @@ def test_camera_profile_data_valid():
         sub = data["subprofiles"]
         for name, g in sub.items():
             assert g["width"] > 0 and g["height"] > 0, (slug, name)
+        if "gainmap" in data:
+            from stegodng.opcodes import GainMapConfig
+            cfg = GainMapConfig.from_dict(data["gainmap"])
+            assert cfg.planes.shape[0] == 4, slug
+            assert min(cfg.grid) >= 2 and cfg.jitter >= 0, slug
+        if "fidelity" in data:
+            from stegodng.fidelity import FidelityConfig
+            cfg = FidelityConfig.from_dict(
+                data["fidelity"], base_dir=dirpath)
+            if cfg.preview_size:
+                assert min(cfg.preview_size) > 0, slug
+            if cfg.tile:
+                assert min(cfg.tile) > 0, slug
+            if cfg.max_planes is not None:
+                assert 1 <= cfg.max_planes <= 16, slug
         seen.add(slug)
     # Every profile the registry exposes must have passed the checks above.
     assert set(list_profiles()) - {"gfx_100"} <= seen

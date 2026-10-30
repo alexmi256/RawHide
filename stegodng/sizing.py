@@ -67,13 +67,17 @@ class AutoSizer:
             lsb_planes: int | None = None,
             auto_size: bool = False,
             frames: int = 1,
+            max_planes: int | None = None,
+            sensor_sizes: tuple[tuple[int, int], ...] | None = None,
+            prefer_max_planes: bool = False,
         ) -> dict:
         """Choose the smallest configuration that fits ``payload_len`` bytes.
 
         Any argument left as ``None`` is auto-selected; explicitly passed
         values are always respected (and validated). With ``auto_size=True``
-        (no preset geometries) the smallest 4:3 width/height holding the
-        payload is computed instead, which also minimizes the output file.
+        a profile-supplied ``sensor_sizes`` entry is preferred when the
+        payload fits; otherwise the smallest 4:3 width/height holding the
+        payload is computed, which also minimizes the output file.
         ``frames`` scales capacity (payload is striped over that many raw
         SubIFDs); it is never auto-bumped, only validated. Returns a dict
         with ``width``, ``height``, ``mode``, ``bit_depth``, ``lsb_planes``,
@@ -102,12 +106,23 @@ class AutoSizer:
                 f"lsb_planes must be 1-{MAX_LSB_PLANES} (got {lsb_planes})")
         if not (1 <= frames <= MAX_FRAMES):
             raise ValueError(f"frames must be 1-{MAX_FRAMES} (got {frames})")
+        top = min(_top_planes(depth_eff),
+                  max_planes if max_planes is not None else MAX_LSB_PLANES)
+        if max_planes is not None and not (1 <= max_planes <= MAX_LSB_PLANES):
+            raise ValueError(
+                f"max_planes must be 1-{MAX_LSB_PLANES} (got {max_planes})")
         if lsb_planes is not None and lsb_planes > depth_eff:
             raise ValueError(
                 f"lsb_planes ({lsb_planes}) exceeds bit_depth ({depth_eff}); "
                 f"payload values would overflow the declared WhiteLevel. "
                 f"Use --bit-depth 16 (full-range uint16, up to 16 planes) or "
                 f"fewer planes.")
+        if (max_planes is not None and lsb_planes is not None
+                and lsb_planes > top):
+            raise ValueError(
+                f"lsb_planes ({lsb_planes}) exceeds the profile maximum "
+                f"of {top} at {depth_eff}-bit; use fewer planes or a "
+                f"capacity level policy.")
 
         factor = 3 if mode_eff == "linear" else 1
 
@@ -143,19 +158,21 @@ class AutoSizer:
                             "bit_depth": depth_eff, "lsb_planes": lsb_planes,
                             "frames": frames,
                             "capacity": c, "auto": auto, "preset": None}
-                c_max = cap(width, height, _top_planes(depth_eff))
-                gbl = cap(PIXELSHIFT_W, PIXELSHIFT_H, _top_planes(depth_eff))
+                c_max = cap(width, height, top)
+                gbl = cap(PIXELSHIFT_W, PIXELSHIFT_H, top)
                 raise ValueError(
                     f"payload {_kb_hi(payload_len)} exceeds capacity {_kb_lo(c)} "
                     f"for {width}x{height} {mode_eff} {depth_eff}-bit with "
                     f"{lsb_planes} LSB plane(s) "
-                    f"(max at this geometry with {_top_planes(depth_eff)} planes: "
+                    f"(max at this geometry with {top} planes: "
                     f"{_kb(c_max)}; largest supported configuration "
                     f"({_max_config_str(mode_eff, depth_eff, frames)}): {_kb(gbl)}). "
                     "Use a larger --width/--height, more --lsb-planes, more "
                     "--raw-frames, leave dimensions unset for auto-sizing, or "
                     "split the input across multiple DNGs.")
-            for p in range(1, min(MAX_LSB_PLANES, depth_eff) + 1):
+            plane_order = (range(top, 0, -1) if prefer_max_planes
+                           else range(1, top + 1))
+            for p in plane_order:
                 c = cap(width, height, p)
                 if payload_len <= c:
                     return {"width": width, "height": height, "mode": mode_eff,
@@ -163,7 +180,6 @@ class AutoSizer:
                             "frames": frames,
                             "capacity": c, "auto": auto + ["lsb_planes"],
                             "preset": None}
-            top = _top_planes(depth_eff)
             c_max = cap(width, height, top)
             gbl = cap(PIXELSHIFT_W, PIXELSHIFT_H, top)
             raise ValueError(
@@ -175,10 +191,29 @@ class AutoSizer:
                 "auto-sizing, more --raw-frames, or split the input across "
                 "multiple DNGs.")
 
-        top = _top_planes(depth_eff)
-        planes_list = ([lsb_planes] if lsb_planes is not None
-                       else list(range(1, top + 1)))
+        if lsb_planes is not None:
+            planes_list = [lsb_planes]
+        elif prefer_max_planes:
+            # Camera-profile path: fill the frame with payload bits before
+            # growing it, so a large input does not explode the geometry.
+            planes_list = list(range(top, 0, -1))
+        else:
+            planes_list = list(range(1, top + 1))
         if auto_size:
+            # Prefer the camera's real sensor geometry when it fits.
+            for (sw, sh) in (sensor_sizes or ()):
+                if sw > PIXELSHIFT_W or sh > PIXELSHIFT_H:
+                    continue
+                for p in planes_list:
+                    c = cap(sw, sh, p)
+                    if payload_len <= c:
+                        auto_fields = auto + ["width", "height"]
+                        if lsb_planes is None:
+                            auto_fields = auto_fields + ["lsb_planes"]
+                        return {"width": sw, "height": sh, "mode": mode_eff,
+                                "bit_depth": depth_eff, "lsb_planes": p,
+                                "frames": frames, "capacity": c,
+                                "auto": auto_fields, "preset": "sensor"}
             need_bits = (payload_len + HEADER_LEN) * 8
             for p in planes_list:
                 # Per-frame slot need: the bitstream is striped over frames.
@@ -223,7 +258,7 @@ class AutoSizer:
                                 "frames": frames,
                                 "capacity": c, "auto": auto_fields,
                                 "preset": label}
-        p_max = planes_list[-1]
+        p_max = lsb_planes if lsb_planes is not None else top
         gbl = cap(PIXELSHIFT_W, PIXELSHIFT_H, p_max)
         abs_max = cap(PIXELSHIFT_W, PIXELSHIFT_H, top)
         hint = ""
@@ -236,7 +271,8 @@ class AutoSizer:
             hint += (f" (linear mode max would be {_kb_lo(abs_lin)})")
         if auto_size:
             hint += (" (--auto-size already uses minimal dimensions; only "
-                     "more planes, linear mode, or splitting the input help)")
+                     "more planes, more --raw-frames, linear mode, or "
+                     "splitting the input help)")
         raise ValueError(
             f"payload {_kb_hi(payload_len)} exceeds maximum capacity {_kb_lo(gbl)} "
             f"under the given constraints "
@@ -264,12 +300,16 @@ def recommend(
     lsb_planes: int | None = None,
     auto_size: bool = False,
     frames: int = 1,
+    max_planes: int | None = None,
+    sensor_sizes: tuple[tuple[int, int], ...] | None = None,
+    prefer_max_planes: bool = False,
 ) -> dict:
     """Backwards-compatible wrapper (see :meth:`AutoSizer.recommend`)."""
     return AutoSizer().recommend(
         payload_len, width=width, height=height, mode=mode,
         bit_depth=bit_depth, lsb_planes=lsb_planes,
-        auto_size=auto_size, frames=frames,
+        auto_size=auto_size, frames=frames, max_planes=max_planes,
+        sensor_sizes=sensor_sizes, prefer_max_planes=prefer_max_planes,
     )
 
 

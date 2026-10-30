@@ -27,6 +27,7 @@ from .container import (
 from .cover import CoverGenerator
 from .framing import PayloadFrame
 from .metadata import MetadataRandomizer
+from .opcodes import build_opcode_list2
 from .thumbnails import ThumbnailProvider
 from .split import (
     chunk_path,
@@ -46,6 +47,16 @@ from .profile import (
 )
 
 
+# CFA pattern name -> (top-left, top-right, bottom-left, bottom-right)
+# colour codes (0=R, 1=G, 2=B).  Default stays RGGB for byte stability.
+_CFA_CODES = {
+    "RGGB": (0, 1, 1, 2),
+    "BGGR": (2, 1, 1, 0),
+    "GRBG": (1, 0, 2, 1),
+    "GBRG": (1, 2, 0, 1),
+}
+
+
 class _DecodeLimitError(ValueError):
     """Declared payload rejected by the cap or image capacity.
 
@@ -58,10 +69,15 @@ class _DecodeLimitError(ValueError):
 class DngStego:
     """Embed and recover payloads in DNG raw sensor data."""
 
-    def __init__(self, profile=DEFAULT_PROFILE) -> None:
+    def __init__(self, profile=DEFAULT_PROFILE,
+                 level_policy: str = "profile") -> None:
         # Explicit None means "default story" (module wrappers pass
         # through a missing profile this way).
         self.profile = profile if profile is not None else DEFAULT_PROFILE
+        if level_policy not in ("profile", "strict", "capacity"):
+            raise ValueError(
+                "level_policy must be profile, strict or capacity")
+        self.level_policy = level_policy
 
     @staticmethod
     def _rgb_to_ycbcr(thumb_rgb) -> "np.ndarray":
@@ -70,19 +86,29 @@ class DngStego:
         return np.ascontiguousarray(
             np.asarray(Image.fromarray(thumb_rgb).convert("YCbCr")))
 
+    def _thumbnail_size(self, width: int, height: int) -> tuple[int, int]:
+        fidelity = self.profile.fidelity
+        if fidelity and fidelity.preview_size:
+            return fidelity.preview_size
+        return min(4000, width), min(3000, height)
+
     def _levels(self, mode: str, bit_depth: int):
-        peak = (1 << bit_depth) - 1
-        # Scale the combiner reference BlackLevel (256 @ 16-bit).
-        black_val = max(1, round(self.profile.black_level_ref * peak / 65535))
+        white = self.profile.effective_white(bit_depth, self.level_policy)
+        black = self.profile.effective_black_levels(
+            mode, bit_depth, self.level_policy)
         n = 3 if mode == "linear" else 1
-        return (black_val,) * n, (peak,) * n
+        return black, (white,) * n
 
     def _ifd0_extras(self, meta: dict, n_dummies: int = 0) -> list:
+        fidelity = self.profile.fidelity
         extras = [
             (271, "s", 0, self.profile.make, True),
             (272, "s", 0, self.profile.model, True),
-            (274, 3, 1, (1,), True),
-            (700, "B", XMP_LEN, build_xmp(), True),
+            (274, 3, 1, (int(meta.get("orientation", 1)),), True),
+        ]
+        if fidelity is None or fidelity.emit_xmp:
+            extras.append((700, "B", XMP_LEN, build_xmp(), True))
+        extras += [
             (50706, "B", 4, self.profile.dng_version, True),
             (50707, "B", 4, self.profile.dng_backward, True),
             (50708, "s", 0, self.profile.unique_camera_model, True),
@@ -94,62 +120,147 @@ class DngStego:
             (50731, 5, 1, [self.profile.baseline_noise], True),
             (50732, 5, 1, [self.profile.baseline_sharpness], True),
             (50734, 5, 1, [self.profile.linear_response_limit], True),
-            (50735, "s", 0, meta["camera_serial"], True),
-            (50736, 5, 4, [
+        ]
+        if fidelity is None or fidelity.emit_serials:
+            extras.append((50735, "s", 0, meta["camera_serial"], True))
+        if fidelity is None or fidelity.emit_lens:
+            extras.append((50736, 5, 4, [
                 (meta["lens_spec"][0], meta["lens_spec"][1]),
                 (meta["lens_spec"][2], meta["lens_spec"][3]),
                 (meta["lens_spec"][4], meta["lens_spec"][5]),
                 (meta["lens_spec"][6], meta["lens_spec"][7]),
-            ], True),
+            ], True))
+        extras += [
             (50739, 5, 1, [self.profile.shadow_scale], True),
             (50778, 3, 1, (self.profile.calib_illuminant1,), True),
             (50779, 3, 1, (self.profile.calib_illuminant2,), True),
-            # Dummy private tag repurposed into ExifTag (34665) after
-            # writing: tifffile filters IFD-pointer tags from extratags,
-            # so the EXIF Sub-IFD offset is patched in post (same 12-byte
-            # entry, no shifting required).
-            (65000, 3, 1, (0,), True),
         ]
+        if fidelity is not None and fidelity.adobe is not None:
+            adobe = fidelity.adobe
+            if adobe.forward_matrix1:
+                extras.append((50964, 10, 9, adobe.forward_matrix1, True))
+            if adobe.forward_matrix2:
+                extras.append((50965, 10, 9, adobe.forward_matrix2, True))
+            if adobe.name:
+                extras.append((50936, "s", 0, adobe.name, True))
+            if adobe.calibration_signature:
+                extras.append((50932, "s", 0,
+                               adobe.calibration_signature, True))
+            if adobe.copyright:
+                extras.append((50942, "s", 0, adobe.copyright, True))
+            if adobe.embed_policy is not None:
+                extras.append((50941, 4, 1, (adobe.embed_policy,), True))
+            if adobe.hue_sat_map_dims is not None:
+                extras.append((50937, 4, 3, adobe.hue_sat_map_dims, True))
+                for tag, blob in (
+                        (50938, adobe.hue_sat_map_data1),
+                        (50939, adobe.hue_sat_map_data2)):
+                    if blob is None:
+                        continue
+                    values = np.frombuffer(blob, dtype="<f4").astype(float).tolist()
+                    extras.append((tag, 11, len(values), values, True))
+            if adobe.look_table_dims is not None:
+                extras.append((50981, 4, 3, adobe.look_table_dims, True))
+                if adobe.look_table_data is not None:
+                    values = np.frombuffer(
+                        adobe.look_table_data, dtype="<f4").astype(float).tolist()
+                    extras.append((50982, 11, len(values), values, True))
+        if meta.get("noise_profile") is not None:
+            extras.append((51041, 12, 6, list(meta["noise_profile"]), True))
+        if meta.get("gps") is not None:
+            # Repurposed into GPSTag (34853) after the GPS IFD is appended.
+            extras.append((65010, 3, 1, (0,), True))
+        # Dummy private tag repurposed into ExifTag (34665) after
+        # writing: tifffile filters IFD-pointer tags from extratags,
+        # so the EXIF Sub-IFD offset is patched in post (same 12-byte
+        # entry, no shifting required).
+        extras.append((65000, 3, 1, (0,), True))
         # Reserved dummies repurposed post-write into split seq/id tags.
         for i in range(n_dummies):
             extras.append((65001 + i, 4, 1, (0,), True))
         return extras
 
     def _sub_extras(self, meta: dict, mode: str, width: int, height: int,
-                    bit_depth: int) -> list:
+                    bit_depth: int, seed: int = 0) -> list:
         black, white_t = self._levels(mode, bit_depth)
+        fidelity = self.profile.fidelity
         opcode = self.profile.opcode_list3
         if mode == "linear":
-            return [
+            extras = [
                 (50714, 4, 3, black, True),
                 (50717, 4, 3, white_t, True),
                 (50718, 5, 2, [(1, 1), (1, 1)], True),
                 (50719, 5, 2, [(0, 1), (0, 1)], True),
                 (50720, 5, 2, [(width, 1), (height, 1)], True),
                 (50738, 5, 1, [(100, 100)], True),
-                (50780, 5, 1, [(100, 100)], True),
+                (50780, 5, 1, [(1, 1) if fidelity else (100, 100)], True),
                 (51022, 7, len(opcode), opcode, True),
             ]
-        return [
+            return extras
+        pattern = (self.profile.cfa_pattern or "RGGB").upper()
+        codes = _CFA_CODES.get(pattern, _CFA_CODES["RGGB"])
+        # Real DNGs store CFAPattern as BYTE; keep the legacy SHORT form for
+        # profiles that do not declare a pattern so the GFX output stays
+        # byte-identical.
+        cfa_tag = ((33422, 1, 4, bytes(codes), True)
+                   if self.profile.cfa_pattern
+                   else (33422, 3, 4, codes, True))
+        if fidelity and fidelity.black_levels:
+            black_tag = (50714, 5, len(black),
+                         [(v, 1) for v in black], True)
+            white_tag = (50717, 3, 1, (white_t[0],), True)
+        else:
+            black_tag = (50714, 4, 1, black, True)
+            white_tag = (50717, 4, 1, white_t, True)
+        crop_x, crop_y, crop_w, crop_h = 0, 0, width, height
+        active = None
+        if fidelity and fidelity.crop_margin:
+            mx, my = fidelity.crop_margin
+            if width <= 2 * mx or height <= 2 * my:
+                raise ValueError(
+                    f"crop_margin {fidelity.crop_margin} leaves no image in "
+                    f"{width}x{height}")
+            crop_x, crop_y = mx, my
+            crop_w, crop_h = width - 2 * mx, height - 2 * my
+            active = (0, 0, height, width)
+        extras = [
             (50710, 3, 3, (0, 1, 2), True),  # CFAPlaneColor R,G,B
             (50711, 3, 1, (1,), True),        # CFALayout rectangular
-            (50714, 4, 1, black, True),
-            (50717, 4, 1, white_t, True),
+            black_tag,
+            white_tag,
             (50718, 5, 2, [(1, 1), (1, 1)], True),
-            (50719, 5, 2, [(0, 1), (0, 1)], True),
-            (50720, 5, 2, [(width, 1), (height, 1)], True),
+            (50719, 5, 2, [(crop_x, 1), (crop_y, 1)], True),
+            (50720, 5, 2, [(crop_w, 1), (crop_h, 1)], True),
             (50738, 5, 1, [(100, 100)], True),
-            (50780, 5, 1, [(100, 100)], True),
+            (50780, 5, 1, [(1, 1) if fidelity else (100, 100)], True),
             (33421, 3, 2, (2, 2), True),
-            (33422, 3, 4, (0, 1, 1, 2), True),
-            (51022, 7, len(opcode), opcode, True),
+            cfa_tag,
         ]
+        if fidelity and fidelity.black_levels and len(black) == 4:
+            extras.append((50713, 3, 2, (2, 2), True))
+        if fidelity and fidelity.bayer_green_split is not None:
+            extras.append((50733, 4, 1,
+                           (fidelity.bayer_green_split,), True))
+        if active is not None:
+            extras.append((50829, 4, 4, active, True))
+            extras.append((51125, 5, 4, [
+                (0, 1), (0, 1), (1, 1), (1, 1)], True))
+        if self.profile.gainmap is not None:
+            # Pixel XL style: four per-phase GainMaps in OpcodeList2 and no
+            # OpcodeList3.  The maps are regenerated per file from the
+            # profile base grid so a batch never shares an identical blob.
+            opcode2 = build_opcode_list2(
+                width, height, seed=seed, config=self.profile.gainmap)
+            extras.append((51009, 7, len(opcode2), opcode2, True))
+        else:
+            extras.append((51022, 7, len(opcode), opcode, True))
+        return extras
 
     def _write_container(self, output_path: str, *, stegos: list,
                          thumb_rgb, meta: dict, width: int, height: int,
                          mode: str, bit_depth: int, compression: str,
                          frames: int, tw: int, th: int,
-                         ifd0_dummies: int = 0) -> bool:
+                         ifd0_dummies: int = 0, seed: int = 0) -> bool:
         """Write thumbnail + raw frames, patch photometrics, attach EXIF.
 
         ``ifd0_dummies`` reserves that many private LONG tags (65001+)
@@ -162,7 +273,9 @@ class DngStego:
             * bytes_per_sample * frames
         ) > 3_500_000_000
         photo_main = "rgb" if mode == "linear" else "cfa"  # patched to LinearRaw later
-        tile = (96, 128) if (width >= 128 and height >= 96) else None
+        fidelity = self.profile.fidelity
+        tile = (fidelity.tile if fidelity and fidelity.tile
+                else ((96, 128) if (width >= 128 and height >= 96) else None))
         # Uncompressed by default: LibRaw/rawpy (tested 0.27) decodes
         # uncompressed DNG but fails on Adobe-Deflate DNG ("unexpected EOF").
         # Deflate stays available as an opt-in for smaller files; it is still
@@ -176,13 +289,14 @@ class DngStego:
                 # Empty Software (profiles with no observed Software
                 # string) omits tag 305 explicitly instead of relying on
                 # tifffile skipping empty strings.
-                software=self.profile.software or False,
+                software=(meta.get("software") or self.profile.software
+                          or False),
                 datetime=meta["datetime"],
                 rowsperstrip=th,
                 subfiletype=1, subifds=frames, metadata=None, extratags=ifd0_extras,
             )
             sub_extras = self._sub_extras(meta, mode, width, height,
-                                                bit_depth)
+                                          bit_depth, seed=seed)
             for stego in stegos:
                 tif.write(
                     stego, photometric=photo_main,
@@ -195,7 +309,23 @@ class DngStego:
 
         if mode == "linear":
             DngContainer(output_path).patch_linear_raw()
-        DngContainer(output_path).append_exif(meta, tw, th)
+        if fidelity is not None:
+            meta.setdefault("fidelity_layout", False)
+            allow = fidelity.exif_allow
+            if mode != "cfa" and allow is not None:
+                allow = tuple(tag for tag in allow if tag != 41730)
+            meta.setdefault("exif_allow", allow)
+            meta.setdefault("emit_serials", fidelity.emit_serials)
+            meta.setdefault("emit_lens", fidelity.emit_lens)
+            if (mode == "cfa"
+                    and (self.profile.cfa_pattern or "").upper() == "BGGR"):
+                meta.setdefault(
+                    "photo_cfa_pattern",
+                    b"\x02\x00\x02\x00\x02\x01\x01\x00")
+        container = DngContainer(output_path)
+        container.append_exif(meta, tw, th)
+        if meta.get("gps") is not None:
+            container.append_gps(meta["gps"])
         return bigtiff
 
     def _file_info(self, output_path: str, *, width: int, height: int,
@@ -252,8 +382,15 @@ class DngStego:
         if seed is None:
             seed = 0
 
-        covers = [CoverGenerator(seed + i).cover(height, width, mode, bit_depth)
-                  for i in range(frames)]
+        white = (self.profile.effective_white(bit_depth, self.level_policy)
+                 if self.profile.fidelity is not None
+                 and self.profile.fidelity.white_level is not None else None)
+        headroom = ((1 << lsb_planes) - 1
+                    if white is not None
+                    and white < (1 << bit_depth) - 1 else 0)
+        covers = [CoverGenerator(seed + i).cover(
+            height, width, mode, bit_depth,
+            white_level=white, headroom=headroom) for i in range(frames)]
         n_samples = covers[0].size
         cap = LsbCodec.capacity_bytes_total(n_samples, lsb_planes, frames)
         if len(payload) > cap:
@@ -270,13 +407,14 @@ class DngStego:
         # buffers, so drop the extra references promptly.
         del covers
 
-        tw, th = min(4000, width), min(3000, height)
+        tw, th = self._thumbnail_size(width, height)
         thumb, thumb_label = ThumbnailProvider(seed=seed).get(
             tw, th, source=thumbnail)
         bigtiff = self._write_container(
             output_path, stegos=stegos, thumb_rgb=thumb, meta=meta,
             width=width, height=height, mode=mode, bit_depth=bit_depth,
             compression=compression, frames=frames, tw=tw, th=th,
+            seed=0 if seed is None else seed,
         )
         return self._file_info(
             output_path, width=width, height=height, mode=mode,
@@ -297,6 +435,18 @@ class DngStego:
                 f"payload values would overflow the declared WhiteLevel. "
                 f"Use --bit-depth 16 (full-range uint16, up to 16 planes) or "
                 f"fewer planes.")
+        if self.profile.fidelity is not None:
+            max_planes = self.profile.effective_max_planes(
+                bit_depth, self.level_policy)
+            if lsb_planes > max_planes:
+                policy = self.profile._policy(self.level_policy)
+                hint = (" Use --level-policy capacity for the full 16 planes."
+                        if policy == "strict" and max_planes < MAX_LSB_PLANES
+                        else "")
+                raise ValueError(
+                    f"lsb_planes ({lsb_planes}) exceeds this profile's "
+                    f"maximum of {max_planes} at {bit_depth}-bit under the "
+                    f"{policy!r} level policy.{hint}")
         if not (1 <= frames <= MAX_FRAMES):
             raise ValueError(f"frames must be 1-{MAX_FRAMES} (got {frames})")
         if mode not in ("linear", "cfa"):
@@ -404,9 +554,18 @@ class DngStego:
                     cs = random.randrange(1 << 30)
                 else:
                     cs = cseed
-                covers = [CoverGenerator(cs + f).cover(height, width, mode,
-                                                       bit_depth)
-                          for f in range(frames)]
+                white = (self.profile.effective_white(
+                    bit_depth, self.level_policy)
+                    if self.profile.fidelity is not None
+                    and self.profile.fidelity.white_level is not None
+                    else None)
+                headroom = ((1 << lsb_planes) - 1
+                            if white is not None
+                            and white < (1 << bit_depth) - 1 else 0)
+                covers = [CoverGenerator(cs + f).cover(
+                    height, width, mode, bit_depth,
+                    white_level=white, headroom=headroom)
+                    for f in range(frames)]
                 n_samples = covers[0].size
                 cap = LsbCodec.capacity_bytes_total(n_samples, lsb_planes, frames)
                 if chunk_len > cap:
@@ -427,14 +586,14 @@ class DngStego:
                 # stripe_frames embeds in place: stegos share the covers'
                 # buffers, so drop the extra references promptly.
                 del covers, frame
-                tw, th = min(4000, width), min(3000, height)
+                tw, th = self._thumbnail_size(width, height)
                 thumb, thumb_label = ThumbnailProvider(seed=cs).get(
                     tw, th, source=thumbnail)
                 bigtiff = self._write_container(
                     path, stegos=stegos, thumb_rgb=thumb, meta=meta,
                     width=width, height=height, mode=mode, bit_depth=bit_depth,
                     compression=compression, frames=frames, tw=tw, th=th,
-                    ifd0_dummies=ifd0_dummies,
+                    ifd0_dummies=ifd0_dummies, seed=cs,
                 )
                 self._write_split_tags(path, id_spec, seq_spec, split_id_field,
                                        split_seq_field, uid, seq, total)
@@ -816,9 +975,11 @@ def encode(
     thumbnail: str = "random",
     progress: bool | None = None,
     profile=None,
+    level_policy: str = "profile",
 ) -> dict:
     """Backwards-compatible wrapper (see :meth:`DngStego.encode`)."""
-    stego = _DEFAULT if profile is None else DngStego(profile)
+    stego = (_DEFAULT if profile is None
+             else DngStego(profile, level_policy=level_policy))
     return stego.encode(
         payload, output_path, width=width, height=height, seed=seed,
         key=key, lsb_planes=lsb_planes, bit_depth=bit_depth, mode=mode,
@@ -863,9 +1024,11 @@ def encode_split(
     split_seq_field: str = "ImageNumber",
     progress: bool | None = None,
     profile=None,
+    level_policy: str = "profile",
 ) -> list[dict]:
     """Backwards-compatible wrapper (see :meth:`DngStego.encode_split`)."""
-    stego = _DEFAULT if profile is None else DngStego(profile)
+    stego = (_DEFAULT if profile is None
+             else DngStego(profile, level_policy=level_policy))
     return stego.encode_split(
         payload, output_path, split_size, width=width, height=height,
         seed=seed, key=key, lsb_planes=lsb_planes, bit_depth=bit_depth,

@@ -103,6 +103,10 @@ class DngContainer:
         """Append the EXIF Sub-IFD at EOF and link it from IFD0."""
         _append_exif(self.path, meta, thumb_w, thumb_h)
 
+    def append_gps(self, gps: dict) -> None:
+        """Append a GPS IFD at EOF and link it from IFD0."""
+        _append_gps(self.path, gps)
+
 
 XMP_LEN = 12288
 
@@ -176,6 +180,15 @@ _EXIF_TAGS: list[tuple[int, str]] = [
 _DTYPE_NUM = {"BYTE": 1, "ASCII": 2, "SHORT": 3, "LONG": 4, "RATIONAL": 5,
               "UNDEFINED": 7, "SLONG": 9, "SRATIONAL": 10}
 
+# Tags the Pixel XL samples carry that the historical GFX EXIF block did
+# not.  They are only added when a profile supplies an EXIF allowlist.
+_EXIF_EXTRA_TAGS: list[tuple[int, str]] = [
+    (37382, "RATIONAL"),     # SubjectDistance
+    (41730, "UNDEFINED"),    # CFAPattern
+    (41988, "RATIONAL"),     # DigitalZoomRatio
+    (41996, "SHORT"),        # SubjectDistanceRange
+]
+
 
 def _exif_values(meta: dict, thumb_w: int, thumb_h: int) -> dict[int, object]:
     exp_n, exp_d = meta["exposure_time"]
@@ -205,7 +218,7 @@ def _exif_values(meta: dict, thumb_w: int, thumb_h: int) -> dict[int, object]:
         37381: [meta["max_aperture"]],
         37383: [meta["metering"]],
         37384: [0],
-        37385: [0],
+        37385: [meta.get("flash", 0)],
         37386: [meta["focal_rational"]],
         37520: meta["subsec"],
         37521: meta["subsec"],
@@ -232,6 +245,11 @@ def _exif_values(meta: dict, thumb_w: int, thumb_h: int) -> dict[int, object]:
         42035: meta.get("lens_make", "FUJIFILM"),
         42036: meta["lens"],
         42037: meta["lens_serial"],
+        37382: [meta.get("subject_distance", (0, 0))],
+        41730: meta.get("photo_cfa_pattern",
+                        b"\x02\x00\x02\x00\x02\x01\x01\x00"),
+        41988: [(0, 1)],
+        41996: [meta.get("subject_distance_range", 0)],
     }
     # Split markers (chunk-set UUID, sequence): written only on split
     # chunks. meta["split_exif"] maps tag -> value for EXIF-bound fields.
@@ -241,7 +259,11 @@ def _exif_values(meta: dict, thumb_w: int, thumb_h: int) -> dict[int, object]:
 
 
 def _pack_val(dtype: str, value: object) -> tuple[int, bytes]:
-    """Return (count, raw_bytes) for an EXIF value."""
+    """Return (count, raw_bytes) for an EXIF/GPS value."""
+    if dtype == "BYTE":
+        assert isinstance(value, (bytes, bytearray, list, tuple))
+        raw = bytes(value)
+        return len(raw), raw
     if dtype == "ASCII":
         assert isinstance(value, str)
         raw = value.encode("ascii") + b"\x00"
@@ -272,7 +294,9 @@ SPLIT_EXIF_DTYPES = {
 
 def _build_exif_block(meta: dict, thumb_w: int, thumb_h: int,
                      exif_offset: int, bigtiff: bool,
-                     extra_tags: list[tuple[int, str]] | None = None) -> bytes:
+                     extra_tags: list[tuple[int, str]] | None = None,
+                     allow: set[int] | None = None,
+                     legacy_layout: bool = True) -> bytes:
     """Build an EXIF Sub-IFD block with absolute offsets for `exif_offset`.
 
     Layout matches the container: classic TIFF uses 2-byte counts,
@@ -280,16 +304,32 @@ def _build_exif_block(meta: dict, thumb_w: int, thumb_h: int,
     8-byte counts, 20-byte entries and 8-byte offsets.
     """
     values = _exif_values(meta, thumb_w, thumb_h)
-    tags = _EXIF_TAGS + (extra_tags or [])
+    if allow is not None:
+        base = [item for item in _EXIF_TAGS if item[0] in allow]
+        base += [item for item in _EXIF_EXTRA_TAGS if item[0] in allow]
+        base.sort(key=lambda item: item[0])
+    else:
+        base = list(_EXIF_TAGS)
+    if meta.get("emit_serials") is False:
+        base = [item for item in base if item[0] not in (42033, 42037)]
+    if meta.get("emit_lens") is False:
+        base = [item for item in base
+                if item[0] not in (42034, 42035, 42036, 42037)]
+    tags = base + (extra_tags or [])
     n = len(tags)
     field_len = 8 if bigtiff else 4
     count_fmt = "<Q" if bigtiff else "<H"
     count_len = 8 if bigtiff else 2
+    # The legacy writer wrote a 2-byte "next IFD" field in classic TIFF;
+    # real TIFFs use 4 bytes.  Keep the old layout for byte stability on
+    # profiles without a fidelity block, use the correct width otherwise.
+    next_len = count_len if legacy_layout else (8 if bigtiff else 4)
+    next_fmt = count_fmt if legacy_layout else ("<Q" if bigtiff else "<I")
     entry_size = 20 if bigtiff else 12
     off_fmt = "<Q" if bigtiff else "<I"
     blobs: list[bytes] = []
     entries: list[bytes] = []
-    data_start = exif_offset + count_len + entry_size * n + count_len
+    data_start = exif_offset + count_len + entry_size * n + next_len
     cursor = data_start
     for tag, dtype in tags:
         count, raw = _pack_val(dtype, values[tag])
@@ -305,7 +345,7 @@ def _build_exif_block(meta: dict, thumb_w: int, thumb_h: int,
                         tag, _DTYPE_NUM[dtype], count, field)
         )
     return (struct.pack(count_fmt, n) + b"".join(entries)
-            + struct.pack(count_fmt, 0) + b"".join(blobs))
+            + struct.pack(next_fmt, 0) + b"".join(blobs))
 
 
 def build_exif_block(meta: dict, thumb_w: int, thumb_h: int,
@@ -352,7 +392,7 @@ def _entry_value_ptr(data: bytes | bytearray, entry: int):
 
 
 _TYPE_SIZE = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 7: 1, 9: 4, 10: 8,
-              13: 4, 16: 8, 17: 8, 18: 8}  # 13/18 need bigtiff fixup below
+              11: 4, 12: 8, 13: 4, 16: 8, 17: 8, 18: 8}
 
 
 def _subifd_offsets(data: bytes | bytearray, ifd0: int) -> list[int]:
@@ -474,8 +514,11 @@ def _append_exif(path: str, meta: dict, thumb_w: int, thumb_h: int) -> None:
         split_exif = meta.get("split_exif", {})
         extra = ([(tag, SPLIT_EXIF_DTYPES[tag]) for tag in split_exif]
                  if split_exif else None)
-        block = _build_exif_block(meta, thumb_w, thumb_h, exif_offset, big,
-                                  extra)
+        allow = meta.get("exif_allow")
+        block = _build_exif_block(
+            meta, thumb_w, thumb_h, exif_offset, big, extra,
+            allow=set(allow) if allow is not None else None,
+            legacy_layout=meta.get("fidelity_layout", True))
         # rewrite the dummy entry in place as ExifTag (34665, LONG, 1).
         # Same-sized entry, no byte shifting required.
         f.seek(e)
@@ -487,6 +530,184 @@ def _append_exif(path: str, meta: dict, thumb_w: int, thumb_h: int) -> None:
             f.write(struct.pack("<I", exif_offset))
         f.seek(exif_offset)
         f.write(block)
+
+
+_GPS_TAGS: list[tuple[int, str]] = [
+    (0, "BYTE"),          # GPSVersionID
+    (1, "ASCII"),         # GPSLatitudeRef
+    (2, "RATIONAL"),      # GPSLatitude
+    (3, "ASCII"),         # GPSLongitudeRef
+    (4, "RATIONAL"),      # GPSLongitude
+    (5, "BYTE"),          # GPSAltitudeRef
+    (6, "RATIONAL"),      # GPSAltitude
+    (7, "RATIONAL"),      # GPSTimeStamp
+    (11, "RATIONAL"),     # GPSDOP
+    (27, "UNDEFINED"),    # GPSProcessingMethod
+    (29, "ASCII"),        # GPSDateStamp
+]
+
+
+def _gps_values(gps: dict) -> dict[int, object]:
+    return {
+        0: (2, 2, 0, 0),
+        1: gps["lat_ref"],
+        2: [(gps["lat"][0], 1), (gps["lat"][1], 1), gps["lat"][2]],
+        3: gps["lon_ref"],
+        4: [(gps["lon"][0], 1), (gps["lon"][1], 1), gps["lon"][2]],
+        5: (0,),
+        6: [(int(gps["altitude_mm"]), 1000)],
+        7: [(int(gps["time"][0]), 1), (int(gps["time"][1]), 1),
+            (int(gps["time"][2]), 1)],
+        11: [(int(gps["dop"]), 1000)],
+        27: b"ASCII\x00\x00\x00fused",
+        29: gps["date"],
+    }
+
+
+def _build_gps_block(gps: dict, gps_offset: int, bigtiff: bool) -> bytes:
+    values = _gps_values(gps)
+    tags = _GPS_TAGS
+    field_len = 8 if bigtiff else 4
+    count_fmt = "<Q" if bigtiff else "<H"
+    count_len = 8 if bigtiff else 2
+    next_len = 8 if bigtiff else 4
+    next_fmt = "<Q" if bigtiff else "<I"
+    entry_size = 20 if bigtiff else 12
+    off_fmt = "<Q" if bigtiff else "<I"
+    blobs: list[bytes] = []
+    entries: list[bytes] = []
+    cursor = gps_offset + count_len + entry_size * len(tags) + next_len
+    for tag, dtype in tags:
+        count, raw = _pack_val(dtype, values[tag])
+        if len(raw) <= field_len:
+            field = raw + b"\x00" * (field_len - len(raw))
+        else:
+            field = struct.pack(off_fmt, cursor)
+            blobs.append(raw)
+            cursor += len(raw)
+        entries.append(struct.pack(
+            "<HH" + ("Q" if bigtiff else "I") + ("8s" if bigtiff else "4s"),
+            tag, _DTYPE_NUM[dtype], count, field))
+    return (struct.pack(count_fmt, len(tags)) + b"".join(entries)
+            + struct.pack(next_fmt, 0) + b"".join(blobs))
+
+
+def _append_gps(path: str, gps: dict) -> None:
+    """Append a GPS IFD and repurpose dummy tag 65010 into GPSTag (34853)."""
+    with open(path, "r+b") as f:
+        ifd0 = _seek_ifd0_offset(f)
+        found = _seek_ifd_entry(f, ifd0, 65010)
+        if found is None:  # pragma: no cover
+            raise ValueError("dummy tag 65010 not found in IFD0")
+        e, _, _, _, big = found
+        f.seek(0, 2)
+        gps_offset = f.tell()
+        while gps_offset % 8:
+            f.write(b"\x00")
+            gps_offset = f.tell()
+        f.seek(gps_offset)
+        f.write(_build_gps_block(gps, gps_offset, big))
+        f.seek(e)
+        if big:
+            f.write(struct.pack("<HHQ", 34853, 4, 1))
+            f.write(struct.pack("<Q", gps_offset))
+        else:
+            f.write(struct.pack("<HHI", 34853, 4, 1))
+            f.write(struct.pack("<I", gps_offset))
+
+
+_GPS_NAMES = {
+    0: "version", 1: "lat_ref", 2: "lat", 3: "lon_ref", 4: "lon",
+    5: "altitude_ref", 6: "altitude", 7: "time", 11: "dop",
+    27: "processing_method", 29: "date",
+}
+
+
+def read_ifd(path: str, offset: int | None = None
+             ) -> list[tuple[int, int, int, bytes]]:
+    """Read one little-endian IFD as (tag, type, count, raw value) tuples."""
+    with open(path, "rb") as f:
+        magic = f.read(4)
+        if magic[:2] != b"II" or magic[2:4] not in (b"*\x00", b"+\x00"):
+            raise ValueError("not a little-endian TIFF")
+        big = magic == b"II+\x00"
+        if offset is None:
+            if big:
+                f.read(4)  # bytesize (8) + reserved (0)
+                offset = struct.unpack("<Q", f.read(8))[0]
+            else:
+                offset = struct.unpack("<I", f.read(4))[0]
+        f.seek(offset)
+        n = struct.unpack("<Q" if big else "<H", f.read(8 if big else 2))[0]
+        head, size = (8, 20) if big else (2, 12)
+        field = 12 if big else 8
+        out = []
+        for i in range(n):
+            f.seek(offset + head + i * size)
+            entry = f.read(size)
+            tag = struct.unpack_from("<H", entry, 0)[0]
+            typ = struct.unpack_from("<H", entry, 2)[0]
+            count = struct.unpack_from("<Q" if big else "<I",
+                                       entry, 4)[0]
+            total = _TYPE_SIZE.get(typ, 1) * count
+            if big and tag in (34665, 34853):
+                # The writer stores IFD pointers as LONG with an 8-byte
+                # value field in BigTIFF; read the whole field.
+                total = 8
+            if total <= (8 if big else 4):
+                raw = entry[field:field + total]
+            else:
+                ptr = struct.unpack_from("<Q" if big else "<I",
+                                         entry, field)[0]
+                f.seek(ptr)
+                raw = f.read(total)
+            out.append((tag, typ, count, raw))
+        return out
+
+
+def _ifd_pointer(entries: list[tuple[int, int, int, bytes]],
+                 tag: int) -> int | None:
+    for t, typ, _count, raw in entries:
+        if t == tag and typ in (4, 13):
+            return struct.unpack_from("<Q" if len(raw) == 8 else "<I", raw)[0]
+    return None
+
+
+def read_exif_tags(path: str) -> dict[int, tuple[int, int, bytes]] | None:
+    """Read the appended EXIF IFD as tag -> (type, count, raw value)."""
+    off = _ifd_pointer(read_ifd(path), 34665)
+    if off is None:
+        return None
+    return {tag: (typ, count, raw)
+            for tag, typ, count, raw in read_ifd(path, off)}
+
+
+def read_gps(path: str) -> dict | None:
+    """Read the GPS IFD written by :func:`_append_gps`."""
+    off = _ifd_pointer(read_ifd(path), 34853)
+    if off is None:
+        return None
+    out: dict[str, object] = {}
+    for tag, typ, count, raw in read_ifd(path, off):
+        name = _GPS_NAMES.get(tag)
+        if name is None:
+            continue
+        if typ == 2:
+            out[name] = raw.rstrip(b"\x00").decode("ascii", "replace")
+        elif typ == 5:
+            nums = struct.unpack_from("<" + "I" * (count * 2), raw, 0)
+            out[name] = tuple(
+                (nums[i], nums[i + 1]) for i in range(0, len(nums), 2))
+        elif typ == 7:
+            text = raw.rstrip(b"\x00")
+            if text.startswith(b"ASCII\x00\x00\x00"):
+                out[name] = "charset=Ascii " + text[8:].decode(
+                    "ascii", "replace")
+            else:
+                out[name] = text.decode("ascii", "replace")
+        else:
+            out[name] = tuple(raw)
+    return out
 
 
 def set_ifd0_tag(path: str, dummy_code: int, tag: int, dtype_name: str,

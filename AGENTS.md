@@ -15,6 +15,8 @@ is the operator's guide for changing code.
 | `stegodng/metadata.py` | `MetadataRandomizer` (seeded per-file EXIF variety) |
 | `stegodng/cover.py` | `CoverGenerator` (synthetic raw covers + gradient thumbnails) |
 | `stegodng/codec.py` | `LsbCodec` (LSB embed/extract, capacity, KB formatters) |
+| `stegodng/opcodes.py` | `OpcodeList2` GainMap generation/parsing (per-profile base grid) |
+| `stegodng/fidelity.py` | optional `fidelity` profile block (metadata ranges, tags, levels, crop, GPS, Adobe) |
 | `stegodng/container.py` | `DngContainer` (XMP/EXIF builders, IFD patching incl. BigTIFF, raw reading) |
 | `stegodng/sizing.py` | `AutoSizer` (smallest-fit search, max-capacity errors, risk warnings) |
 | `stegodng/split.py` | split sizes/naming, chunk-field registries, seq parse/format |

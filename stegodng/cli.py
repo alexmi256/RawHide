@@ -44,13 +44,19 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("--key", default=None, help="passphrase for payload encryption")
     e.add_argument("--lsb-planes", type=int, default=None,
                    choices=tuple(range(1, MAX_LSB_PLANES + 1)),
-                   help="LSB planes used (default: fewest fitting the input; "
+                   help="LSB planes used (default: the profile maximum for "
+                   "prefer_native profiles, otherwise fewest fitting; "
                    "capacity scales linearly; 3+ degrade the cover, 9+ "
                    "destroy most of it, 16 = samples are pure payload)")
     e.add_argument("--bit-depth", type=int, default=None, choices=(8, 10, 12, 14, 16),
                    help="packed BitsPerSample of the raw SubIFD (default: 16)")
     e.add_argument("--mode", default=None, choices=("linear", "cfa"),
                    help="raw layout (default: linear)")
+    e.add_argument("--level-policy", default="profile",
+                   choices=("profile", "strict", "capacity"),
+                   help="raw level policy: profile (default), strict "
+                   "(effective WhiteLevel and plane cap), or capacity "
+                   "(full 16-bit range, up to 16 planes)")
     e.add_argument("--compression", default="none",
                    choices=("none", "adobe_deflate"),
                    help="raw SubIFD compression (none = widest viewer support; "
@@ -103,10 +109,11 @@ def main(argv: list[str] | None = None) -> int:
                    "with frames but so does file size, and multiple raw "
                    "frames are non-standard for still DNGs)")
     e.add_argument("--auto-size", action="store_true",
-                   help="compute the smallest 4:3 width/height fitting the "
-                   "input (smaller files, but non-standard dimensions may "
-                   "look unusual under inspection; cannot be combined with "
-                   "--width/--height/--camera-profile subprofiles)")
+                   help="prefer the profile's native sensor size when the "
+                   "input fits, otherwise compute the smallest 4:3 frame "
+                   "(unusual dimensions may look suspicious; cannot be "
+                   "combined with --width/--height/--camera-profile "
+                   "subprofiles)")
     e.add_argument("--progress", action="store_true",
                    help="force progress bars on (by default they show on "
                    "a TTY and stay quiet when output is piped)")
@@ -192,11 +199,20 @@ def main(argv: list[str] | None = None) -> int:
         album = None
         album_preexisted = False
         try:
+            fidelity = profile.fidelity
+            mode = (args.mode
+                    or (fidelity.suggested_mode if fidelity else None))
+            max_planes = profile.effective_max_planes(
+                args.bit_depth or 16, args.level_policy)
+            sensor_sizes = (fidelity.sensor_sizes
+                            if fidelity and fidelity.prefer_native else None)
             cfg = recommend(
                 split_size if split_size is not None else len(payload),
-                width=w, height=h, mode=args.mode,
+                width=w, height=h, mode=mode,
                 bit_depth=args.bit_depth, lsb_planes=args.lsb_planes,
                 auto_size=args.auto_size, frames=args.raw_frames,
+                max_planes=max_planes, sensor_sizes=sensor_sizes,
+                prefer_max_planes=bool(fidelity and fidelity.prefer_native),
             )
             scope = (f"per {format_kb(split_size)} chunk "
                      f"(from {format_kb(len(payload))} input)"
@@ -234,6 +250,7 @@ def main(argv: list[str] | None = None) -> int:
                 no_randomize=args.no_randomize, frames=cfg["frames"],
                 thumbnail=args.thumbnail,
                 progress=forced, profile=profile,
+                level_policy=args.level_policy,
             )
             if split_size is not None:
                 infos = encode_split(

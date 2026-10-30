@@ -87,10 +87,18 @@ python stego_dng.py decode -i out.dng -o recovered.bin --max-bytes 500m
 
 ### 2.2 Sizing
 
-With no sizing flags, `encode` picks the smallest preset — and within it
-the fewest LSB planes — that fits the input:
+For profiles without `prefer_native`, with no sizing flags, `encode` picks
+the smallest preset — and within it the fewest LSB planes — that fits the
+input:
 
 `2048x1536 -> 4000x3000 -> 11648x8736 (gfx_100-native) -> 23296x17472 (gfx_100-pixelshift)`
+
+For profiles that opt into `prefer_native` (currently `custom_pixel_xl`),
+the order is different: the profile's native `sensor_sizes` are tried
+first, the plane search runs from `max_planes` downward, and the frame is
+only grown after the maximum-plane native frame is exhausted. That keeps
+large inputs at the profile's 16 planes instead of expanding a low-plane
+frame. Profiles without `prefer_native` keep the fewest-planes behaviour.
 
 Defaults inside that search are `linear`, 16-bit, 1 frame.
 The chosen config is printed as an `auto-config ...` line.
@@ -223,8 +231,9 @@ silences them. The Python API takes the same tri-state:
 | `-o, --output` | `<input>.dng` | output DNG path; with `--split-file`, `0001`-style numbers go before the extension; with `--split-file-album` (on) chunks move into `<output-dir>/<input-stem>/` |
 | `--width, --height` | auto | raw frame size; one-sided values complete via 4:3; pinned geometry only bumps planes; cannot be combined with a `--camera-profile` subprofile |
 | `--camera-profile SLUG[-SUB]` | `gfx_100` | camera cover story: Make/Model/lenses/pools stamped into the file; base slug keeps auto-sizing, `-native` pins that camera's sensor geometry, `-pixelshift` (GFX 100 only) pins `23296x17472` (GB-size file, needs lots of RAM); unknown names list choices; see §3.5 |
-| `--auto-size` | off | compute the smallest even 4:3 frame that fits; smallest files, non-standard dims |
-| `--lsb-planes 1–16` | fewest fitting | payload bit planes per sample; capacity scales linearly; 3+ visibly degrade, 9+ destroy most cover, 16 = pure payload |
+| `--auto-size` | off | prefer the profile's native sensor size when it fits, else the smallest even 4:3 frame; smallest files use non-standard dims |
+| `--level-policy` | `profile` | `profile` follows the profile's raw policy; `strict` keeps its effective WhiteLevel/plane cap; `capacity` restores full 16-bit range and up to 16 planes |
+| `--lsb-planes 1–16` | profile max for `prefer_native`, else fewest fitting | payload bit planes per sample; capacity scales linearly; 3+ visibly degrade, 9+ destroy most cover, 16 = pure payload |
 | `--bit-depth 8/10/12/14/16` | 16 | packed `BitsPerSample`; controls plausibility and file size, not capacity per plane |
 | `--mode linear\|cfa` | linear | demosaiced RGB (3 samples/px) vs mosaic (1 sample/px, ÷3 capacity) |
 | `--raw-frames 1–8` | 1 | full-res raw SubIFDs in one file; capacity ×N, file size ~×N, non-standard for still DNGs |
@@ -302,6 +311,24 @@ python stego_dng.py encode -i big.bin -o ps.dng --camera-profile gfx_100-pixelsh
   `list_profiles()` lists slugs. Regenerate the whole tree from samples
   with `tools/` (see `tools/README.md`); the `-native` pin is the most
   common decoded geometry per model (hi-res composites excluded).
+- Optional `"gainmap"` block (currently the custom Pixel XL profile):
+  CFA encodes write four per-phase `GainMap` opcodes in `OpcodeList2`
+  from a compact base grid plus seeded per-file jitter, instead of an
+  empty `OpcodeList3`. Without the block, behaviour is unchanged. See
+  the profile README for the schema and `stegodng/opcodes.py` for the
+  generator/parser.
+- Optional `"fidelity"` block (currently the custom Pixel XL profile):
+  per-profile preview size, orientation/software/date pools, metadata
+  ranges, EXIF allowlist, tag suppression, GPS, raw tile/levels/crop,
+  the full Adobe profile block (including harvested HueSat/LookTable
+  blobs), per-file NoiseProfile, and a strict-or-capacity level policy.
+  `suggested_mode` lets the CLI default a profile to CFA (`custom_pixel_xl`
+  does); the Python API still requires `mode="cfa"` explicitly.
+  `--level-policy profile|strict|capacity` overrides the profile default
+  (strict caps planes and keeps the effective white; capacity restores
+  the full 16-bit range). `--auto-size` prefers the profile's
+  `sensor_sizes` when the payload fits, so Pixel XL outputs stay at
+  4048x3036 before growing. See `stegodng/fidelity.py`.
 - Fidelity is honest, not perfect: DNG-native cameras contribute real
   `ColorMatrix`/`BlackLevel`/`WhiteLevel`/opcode data; proprietary-RAW
   cameras (CR3, NEF, ARW, RAF, RW2, ORF, ...) fall back to the GFX
@@ -347,7 +374,8 @@ options:
   --seed SEED
   --key KEY             passphrase for payload encryption
   --lsb-planes {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16}
-                        LSB planes used (default: fewest fitting the input;
+                        LSB planes used (default: the profile maximum for
+                        prefer_native profiles, otherwise fewest fitting;
                         capacity scales linearly; 3+ degrade the cover, 9+
                         destroy most of it, 16 = samples are pure payload)
   --bit-depth {8,10,12,14,16}
@@ -397,10 +425,15 @@ options:
                         (burst/stack style, 1-8); capacity scales with frames
                         but so does file size, and multiple raw frames are
                         non-standard for still DNGs)
-  --auto-size           compute the smallest 4:3 width/height fitting the
-                        input (smaller files, but non-standard dimensions may
-                        look unusual under inspection; cannot be combined with
-                        --width/--height/--camera-profile subprofiles)
+  --auto-size           prefer the profile's native sensor size when the
+                        input fits, otherwise compute the smallest 4:3 frame
+                        (unusual dimensions may look suspicious; cannot be
+                        combined with --width/--height/--camera-profile
+                        subprofiles)
+  --level-policy {profile,strict,capacity}
+                        raw level policy: profile (default), strict
+                        (effective WhiteLevel and plane cap), or capacity
+                        (full 16-bit range, up to 16 planes)
   --progress            force progress bars on (by default they show on a TTY
                         and stay quiet when output is piped)
   --no-progress         disable progress bars
@@ -473,7 +506,10 @@ options:
   RGB directly swaps chroma.
 - **Sizing.** `AutoSizer.recommend()` walks presets smallest-first and
   picks the fewest planes that fit; `--auto-size` instead solves for the
-  smallest even 4:3 frame. `frames` is never auto-bumped, only validated.
+  smallest even 4:3 frame. Profiles with `prefer_native` search planes
+  from `max_planes` downward and try their `sensor_sizes` first, so the
+  profile's plane default is preserved before the frame grows.
+  `frames` is never auto-bumped, only validated.
   `--lsb-planes` may not exceed `--bit-depth` (values would overflow the
   declared `WhiteLevel`).
 - **Split sets.** One input → N independent framed chunks, 4-digit

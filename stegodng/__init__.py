@@ -25,9 +25,24 @@ from .codec import (
     format_kb_hi,
     format_kb_lo,
 )
-from .container import DngContainer, build_exif_block, build_xmp
+from .container import (
+    DngContainer,
+    build_exif_block,
+    build_xmp,
+    read_exif_tags,
+    read_gps,
+    read_ifd,
+)
 from .cover import CoverGenerator, make_cover, make_thumbnail
+from .fidelity import AdobeProfile, FidelityConfig
 from .framing import PayloadFrame
+from .opcodes import (
+    GainMap,
+    GainMapConfig,
+    build_opcode_list2,
+    parse_opcode_list2,
+    validate_opcode_list2,
+)
 from .metadata import MetadataRandomizer, randomize_metadata
 from .profile import (
     AUTO_MIN_H,
@@ -60,17 +75,27 @@ from .thumbnails import ThumbnailError, ThumbnailProvider, prepare
 __version__ = "1.0.0"
 
 __all__ = [
+    "AdobeProfile",
     "AutoSizer",
     "CameraProfile",
     "CoverGenerator",
     "DEFAULT_PROFILE",
     "DngContainer",
     "DngStego",
+    "FidelityConfig",
+    "GainMap",
+    "GainMapConfig",
     "LsbCodec",
     "PayloadFrame",
     "MetadataRandomizer",
     "build_exif_block",
+    "build_opcode_list2",
     "build_xmp",
+    "parse_opcode_list2",
+    "read_exif_tags",
+    "read_gps",
+    "read_ifd",
+    "validate_opcode_list2",
     "capacity_bytes",
     "capacity_bytes_total",
     "decode",

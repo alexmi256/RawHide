@@ -12,8 +12,12 @@ combiner profile and stays byte-stable.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any
+
+from .fidelity import FidelityConfig
+from .opcodes import GainMapConfig
 
 MAX_LSB_PLANES = 16
 # Frames (full-resolution raw SubIFDs sharing one file, burst/stack style).
@@ -92,6 +96,12 @@ class CameraProfile:
         "00000001000000383fad0f10239baaa43fb463dcfc19bda0bfd51fa03a2241f0"
         "3fdbc76f7c9e4ad0bfc809334b6932d03fe00000000000003fe0000000000000"
     )
+    # Optional OpcodeList2 GainMap setup; when set, CFA encodes write four
+    # per-phase GainMap opcodes instead of an empty OpcodeList3.
+    gainmap: GainMapConfig | None = None
+    # Optional metadata/raw fidelity overlay (all fields default to the
+    # historical writer behaviour when the block is absent).
+    fidelity: FidelityConfig | None = None
     # -- per-camera overlay (registry profiles) -------------------------
     # CLI slug, e.g. "sony_ilce_7rm5" (+ "-native"/"-pixelshift" suffix).
     slug: str = "gfx_100"
@@ -142,8 +152,56 @@ class CameraProfile:
         stay below 2**bit_depth)."""
         return min(MAX_LSB_PLANES, bit_depth)
 
+    # -- optional fidelity overlay --------------------------------------
+    def _policy(self, policy: str | None) -> str:
+        if policy in (None, "profile"):
+            return self.fidelity.level_policy if self.fidelity else "capacity"
+        return policy
+
+    def effective_white(self, bit_depth: int,
+                        policy: str | None = "profile") -> int:
+        """WhiteLevel for this file; ``capacity`` keeps the full container."""
+        peak = self.white_level(bit_depth)
+        if not self.fidelity or self.fidelity.white_level is None:
+            return peak
+        if self._policy(policy) == "capacity":
+            return peak
+        return min(peak, self.fidelity.white_level)
+
+    def effective_max_planes(self, bit_depth: int,
+                             policy: str | None = "profile") -> int:
+        top = min(MAX_LSB_PLANES, bit_depth)
+        if not self.fidelity:
+            return top
+        if self._policy(policy) != "strict":
+            return top
+        if self.fidelity.max_planes:
+            top = min(top, self.fidelity.max_planes)
+        # Under strict policy the cover must leave (2**planes - 1) codes
+        # of headroom below the effective white.
+        white = min(self.effective_white(bit_depth, "strict"),
+                    (1 << bit_depth) - 1)
+        safe = max(1, int(math.floor(math.log2(white + 1))))
+        return min(top, safe)
+
+    def effective_black_levels(self, mode: str, bit_depth: int,
+                               policy: str | None = "profile") -> tuple[int, ...]:
+        """Per-channel BlackLevel values, scaled to this file's WhiteLevel."""
+        if not self.fidelity or not self.fidelity.black_levels:
+            n = 3 if mode == "linear" else 1
+            return (self.black_level(bit_depth),) * n
+        white = self.effective_white(bit_depth, policy)
+        ref = self.fidelity.white_level or self.white_level(bit_depth)
+        values = tuple(
+            max(1, round((n / d) * white / ref))
+            for n, d in self.fidelity.black_levels)
+        if mode == "linear" and len(values) == 4:
+            return values[:3]
+        return values
+
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "CameraProfile":
+    def from_dict(cls, data: dict[str, Any],
+                  base_dir: str | None = None) -> "CameraProfile":
         """Build a profile from a registry ``profile.json`` dict.
 
         Missing calibration keys fall back to the GFX reference values
@@ -204,6 +262,10 @@ class CameraProfile:
             black_level_ref=_or("black_level_ref", ref.black_level_ref),
             opcode_list3=bytes.fromhex(opcode_hex)
             if opcode_hex else ref.opcode_list3,
+            gainmap=GainMapConfig.from_dict(data["gainmap"])
+            if data.get("gainmap") else None,
+            fidelity=FidelityConfig.from_dict(data["fidelity"], base_dir)
+            if data.get("fidelity") else None,
             slug=data.get("slug", ""),
             display_name=data.get("display_name", ""),
             native_width=data.get("native_width"),

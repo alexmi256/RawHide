@@ -59,7 +59,8 @@ def _load_all() -> dict[str, CameraProfile]:
         if slug == "gfx_100":
             continue  # built-in reference stays byte-stable
         try:
-            profiles[slug] = CameraProfile.from_dict(data)
+            profiles[slug] = CameraProfile.from_dict(
+                data, base_dir=str(data_file.parent))
         except Exception:
             continue  # one bad file must not break all profiles
     _CACHE = profiles
