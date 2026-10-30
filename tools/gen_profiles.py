@@ -10,8 +10,6 @@ import json
 import os
 import re
 import shutil
-import sys
-from collections import Counter
 
 INDEX = "/tmp/opencode/harvest_index.json"
 REPO = "/home/alex/.local/share/opencode/worktree/5241a7d1ac4ca366825a7eef5700531d38754095/camera-profiles"
@@ -521,10 +519,10 @@ def main():
 
         lenses_obs = entry.get("lenses", [])[:12]
         focals = parse_float_mm(entry.get("focal_observed", []))
-        lenses = [list(lens_spec(l.get("make", ""), l.get("model", ""),
+        lenses = [list(lens_spec(lens.get("make", ""), lens.get("model", ""),
                                  focals,
                                  entry.get("fnumber_observed", [])))
-                  for l in lenses_obs]
+                  for lens in lenses_obs]
         if not lenses and focals:
             # Fixed-lens camera (compact/drone/phone) with no LensModel
             # tag: synthesize one built-in zoom from the observed focal
@@ -687,8 +685,8 @@ def sync_staging(slugs: set) -> None:
 
 
 def render_readme(prof, entry):
-    l = []
-    A = l.append
+    lines = []
+    A = lines.append
     A(f"# {prof['display_name']}\n")
     A(f"Profile slug: `{prof['slug']}`  \n"
       f"EXIF Make/Model: `{prof['make']}` / `{prof['model']}`\n")
@@ -746,7 +744,7 @@ def render_readme(prof, entry):
       f"(scaled per bit depth); OpcodeList3: "
       f"{'harvested' if prof['opcode_list3_hex'] else 'GFX reference fallback'}\n")
     A("\n## Randomized per file (seeded)\n")
-    A(f"- DateTime*, OffsetTime*, SubSecTime* (2019-2024 window)\n")
+    A("- DateTime*, OffsetTime*, SubSecTime* (2019-2024 window)\n")
     A(f"- ExposureTime pool: "
       f"{prof['exposure_choices'] or 'reference defaults'}\n")
     A(f"- FNumber pool: {prof['fnumber_choices'] or 'reference defaults'}\n")
@@ -781,7 +779,7 @@ def render_readme(prof, entry):
           "which mismatches this mount (visible in LensModel).\n")
     A("- Native geometry includes masked margins; exact active-area "
       "dimensions may differ by a few dozen pixels.\n")
-    return "".join(l)
+    return "".join(lines)
 
 
 main()
