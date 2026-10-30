@@ -3,6 +3,8 @@
 Each ``<slug>/`` directory holds ``profile.json`` (machine-readable data
 harvested from ``dpreview-raw`` samples) plus ``README.md`` (camera name,
 sample metadata, static-vs-randomized fields, subprofile definitions).
+Hand-maintained profiles live one level deeper in ``custom/<slug>/``; the
+registry scans both layouts.
 :func:`get_profile` builds :class:`CameraProfile` instances on demand and
 caches them; the built-in ``gfx_100`` reference profile is always
 available even when no data directories are present.
@@ -19,28 +21,47 @@ _DATA_DIR = Path(__file__).resolve().parent
 _CACHE: dict[str, CameraProfile] | None = None
 
 
+def _profile_files() -> list[Path]:
+    """Every ``profile.json`` in the registry.
+
+    Flat harvested profiles live in ``profiles/<slug>/``; hand-maintained
+    ones live in ``profiles/custom/<slug>/``. Unknown top-level directories
+    without their own ``profile.json`` are treated as namespaces and
+    scanned exactly one level deep.
+    """
+    files: list[Path] = []
+    for child in sorted(_DATA_DIR.iterdir()):
+        if not child.is_dir():
+            continue
+        direct = child / "profile.json"
+        if direct.is_file():
+            files.append(direct)
+            continue
+        for nested in sorted(child.iterdir()):
+            if nested.is_dir() and (nested / "profile.json").is_file():
+                files.append(nested / "profile.json")
+    return files
+
+
 def _load_all() -> dict[str, CameraProfile]:
     global _CACHE
     if _CACHE is not None:
         return _CACHE
     profiles: dict[str, CameraProfile] = {"gfx_100": DEFAULT_PROFILE}
-    if _DATA_DIR.is_dir():
-        for child in sorted(_DATA_DIR.iterdir()):
-            data_file = child / "profile.json"
-            if child.is_dir() and data_file.is_file():
-                try:
-                    data = json.loads(data_file.read_text())
-                except (OSError, ValueError):
-                    continue  # corrupt entry: skip, never fail the import
-                if not isinstance(data, dict):
-                    continue
-                slug = data.get("slug", child.name)
-                if slug == "gfx_100":
-                    continue  # built-in reference stays byte-stable
-                try:
-                    profiles[slug] = CameraProfile.from_dict(data)
-                except Exception:
-                    continue  # one bad file must not break all profiles
+    for data_file in _profile_files():
+        try:
+            data = json.loads(data_file.read_text())
+        except (OSError, ValueError):
+            continue  # corrupt entry: skip, never fail the import
+        if not isinstance(data, dict):
+            continue
+        slug = data.get("slug", data_file.parent.name)
+        if slug == "gfx_100":
+            continue  # built-in reference stays byte-stable
+        try:
+            profiles[slug] = CameraProfile.from_dict(data)
+        except Exception:
+            continue  # one bad file must not break all profiles
     _CACHE = profiles
     return profiles
 

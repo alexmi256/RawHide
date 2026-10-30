@@ -14,8 +14,13 @@ python3 tools/gen_profiles.py
 
 `gen_profiles.py` stages into `stegodng/profiles.staging/` and syncs
 slug dirs + `PROFILES.md` over; it never touches
-`stegodng/profiles/__init__.py` (the registry loader), so regeneration
+`stegodng/profiles/__init__.py` (the registry loader) or the
+hand-maintained `stegodng/profiles/custom/` namespace, so regeneration
 cannot strand the package. Do **not** `rm -rf stegodng/profiles`.
+
+Custom profiles added under `stegodng/profiles/custom/<slug>/` are loaded
+by the registry alongside the harvested ones and are listed in the
+`Custom profiles` section of `PROFILES.md`.
 
 After regen: `python3 -m pytest tests/ -q` (includes
 `test_camera_profile_data_valid`, which validates every `profile.json`).

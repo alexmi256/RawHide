@@ -311,6 +311,14 @@
 | `xiaoyi_m1` | Xiaomi M1 | harvested-dng | 2 |
 | `zeiss_zx1` | Zeiss ZX1 | harvested-dng | 2 |
 
+## Custom profiles
+
+Hand-maintained profiles under `profiles/custom/`; not regenerated from `dpreview-raw`.
+
+| profile | camera | calibration | samples |
+|---|---|---|---|
+| `custom_pixel_xl` | Google Pixel XL (custom) | harvested-adobe-dng | 4 |
+
 ## Skipped (no usable RAW data)
 
 - 'Apple' 'iPhone 11 Pro Max': no true RAW file (heic/jpg only)

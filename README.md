@@ -293,8 +293,11 @@ python stego_dng.py encode -i big.bin -o ps.dng --camera-profile gfx_100-pixelsh
 - Profiles live in `stegodng/profiles/<slug>/` (`profile.json` +
   `README.md`): camera name, sample metadata extracted from
   `dpreview-raw` files, static vs randomized fields, subprofile
-  definitions, and calibration fidelity notes. `PROFILES.md` in the
-  same directory indexes all profiles and the skipped models.
+  definitions, and calibration fidelity notes. Hand-maintained profiles
+  live one level deeper in `stegodng/profiles/custom/<slug>/`; the
+  registry loads both layouts and `tools/gen_profiles.py` leaves
+  `custom/` untouched. `PROFILES.md` in the same directory indexes all
+  profiles and the skipped models.
   Python API: `DngStego(get_profile("sony_ilce_7rm5"))`;
   `list_profiles()` lists slugs. Regenerate the whole tree from samples
   with `tools/` (see `tools/README.md`); the `-native` pin is the most
@@ -302,10 +305,12 @@ python stego_dng.py encode -i big.bin -o ps.dng --camera-profile gfx_100-pixelsh
 - Fidelity is honest, not perfect: DNG-native cameras contribute real
   `ColorMatrix`/`BlackLevel`/`WhiteLevel`/opcode data; proprietary-RAW
   cameras (CR3, NEF, ARW, RAF, RW2, ORF, ...) fall back to the GFX
-  reference calibration with an `exif-plus-fallback` marker — an
-  inspector comparing against Adobe DNG Converter output for that body
-  would spot the mismatch. The per-profile README says exactly what an
-  inspector would observe.
+  reference calibration with an `exif-plus-fallback` marker — for those,
+  an inspector comparing against Adobe DNG Converter output for that body
+  would spot the mismatch. Custom profiles harvested from Adobe DNG
+  Converter output use the `harvested-adobe-dng` marker; their README
+  lists the Adobe-only tags the writer still does not reproduce. The
+  per-profile README says exactly what an inspector would observe.
 
 ### 3.5 Full `--help` output
 
