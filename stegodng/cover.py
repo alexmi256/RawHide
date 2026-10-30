@@ -16,7 +16,8 @@ class CoverGenerator:
         self._seed = 0 if seed is None else seed
 
     def cover(self, height: int, width: int, mode: str,
-              bit_depth: int) -> np.ndarray:
+              bit_depth: int, white_level: int | None = None,
+              headroom: int = 0) -> np.ndarray:
         """Photographic-like raw cover: uint8 for 8-bit, else uint16.
 
         10/12/14-bit values are quantized to ``2**(16 - bit_depth)`` steps
@@ -33,7 +34,16 @@ class CoverGenerator:
             raise ValueError(f"bit_depth must be one of {SUPPORTED_BIT_DEPTHS}")
         rng = np.random.default_rng(self._seed)
         peak = (1 << bit_depth) - 1
-        scale = peak / 65535.0
+        # `white_level` keeps the cover inside a camera's effective white
+        # (e.g. 14-bit data in a 16-bit container).  `headroom` reserves the
+        # low bits the payload will set, so the final samples stay below it.
+        limit = min(peak, white_level if white_level is not None else peak)
+        limit = max(1, limit - max(0, headroom))
+        # The synthetic base is ~7k..11.5k in 16-bit units.  Legacy callers
+        # scale it by the full container; fidelity callers stretch it to the
+        # profile's effective white so a 14-bit raw still uses its range.
+        scale = (limit / 12500.0 if white_level is not None
+                 else limit / 65535.0)
         sigma = 420 * scale
         if bit_depth <= 8:
             dtype = np.uint8
@@ -69,7 +79,7 @@ class CoverGenerator:
                     base = base16 * scale
                     noise = rng.normal(
                         0, sigma, size=(y1 - y0, width)).astype(np.float32)
-                    plane = np.clip(base * gains[c] + noise, 0, peak)
+                    plane = np.clip(base * gains[c] + noise, 0, limit)
                     if step > 1:
                         plane = np.floor(plane / step) * step
                     cover[y0:y1, :, c] = plane.astype(dtype)
@@ -87,7 +97,7 @@ class CoverGenerator:
                 base = base16 * scale
                 noise = rng.normal(
                     0, sigma, size=(y1 - y0, width)).astype(np.float32)
-                plane = np.clip(base + noise, 0, peak)
+                plane = np.clip(base + noise, 0, limit)
                 # RGGB Bayer gains per 2x2 cell, keyed to absolute frame
                 # coordinates (band-relative slicing would shift parity
                 # for odd y0, so offset the starts by y0 % 2).
@@ -97,7 +107,7 @@ class CoverGenerator:
                 plane[r_even::2, 1::2] *= 0.94
                 plane[r_odd::2, 0::2] *= 0.94
                 plane[r_odd::2, 1::2] *= 0.82
-                plane = np.clip(plane, 0, peak)
+                plane = np.clip(plane, 0, limit)
                 if step > 1:
                     plane = np.floor(plane / step) * step
                 cover[y0:y1, :] = plane.astype(dtype)
@@ -118,9 +128,12 @@ class CoverGenerator:
 
 
 def make_cover(height: int, width: int, seed: int | None, mode: str,
-               bit_depth: int) -> np.ndarray:
+               bit_depth: int, white_level: int | None = None,
+               headroom: int = 0) -> np.ndarray:
     """Backwards-compatible wrapper (see :meth:`CoverGenerator.cover`)."""
-    return CoverGenerator(seed).cover(height, width, mode, bit_depth)
+    return CoverGenerator(seed).cover(
+        height, width, mode, bit_depth,
+        white_level=white_level, headroom=headroom)
 
 
 def make_thumbnail(height: int, width: int, seed: int | None) -> np.ndarray:

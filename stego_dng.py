@@ -63,9 +63,20 @@ from stegodng.container import (
     build_exif_block,
     build_xmp,
     DngContainer,
+    read_exif_tags,
+    read_gps,
+    read_ifd,
     XMP_LEN,
 )
 from stegodng.cover import CoverGenerator, make_cover, make_thumbnail
+from stegodng.fidelity import AdobeProfile, FidelityConfig
+from stegodng.opcodes import (
+    GainMap,
+    GainMapConfig,
+    build_opcode_list2,
+    parse_opcode_list2,
+    validate_opcode_list2,
+)
 from stegodng.framing import PayloadFrame
 from stegodng.metadata import (
     EXPPROG_CHOICES,

@@ -8,6 +8,7 @@ See README for the static-vs-randomized table.
 from __future__ import annotations
 
 import datetime as _dt
+import math
 import random
 
 
@@ -65,6 +66,32 @@ class MetadataRandomizer:
                                  else ["92A", "94A", "93A", "95A"])
         self._crop = (profile.crop_factor if profile is not None
                       else 0.79)
+        fidelity = (profile.fidelity if profile is not None else None)
+        self._fidelity = fidelity
+        self._orientations = (list(fidelity.orientations)
+                              if fidelity and fidelity.orientations else [1])
+        self._software_variants = (
+            list(fidelity.software_variants)
+            if fidelity and fidelity.software_variants
+            else ([profile.software] if profile is not None
+                  and profile.software else []))
+        self._date_bounds = fidelity.date_bounds() if fidelity else None
+        self._asn_r = (fidelity.asn_r if fidelity else None) or (5000, 7600)
+        self._asn_b = (fidelity.asn_b if fidelity else None) or (4000, 5600)
+        self._baseline = ((fidelity.baseline_exposure if fidelity else None)
+                          or (-60, 60))
+        self._subject_distance = (fidelity.subject_distance
+                                  if fidelity else ())
+        self._subject_range = (fidelity.subject_distance_range
+                               if fidelity else ())
+        self._gps = bool(fidelity and fidelity.emit_gps)
+        self._exposure_bias = (fidelity.exposure_bias
+                               if fidelity and fidelity.exposure_bias
+                               else (0, 0, 0, -33, 33, -67, 67))
+        self._flash = (fidelity.flash
+                       if fidelity and fidelity.flash is not None else 0)
+        self._noise_s = fidelity.noise_s if fidelity else None
+        self._noise_o = fidelity.noise_o if fidelity else None
         self._lens_make_default = (profile.make if profile is not None
                                    else "FUJIFILM")
         # Serial pools: the reference profile keeps its legacy hardcoded
@@ -92,10 +119,64 @@ class MetadataRandomizer:
         exp_n, exp_d = rng.choice(self._exposures)
         fnum = rng.choice(self._fnumbers)
         fnum_pair = tuple(fnum) if isinstance(fnum, (list, tuple)) else (fnum, 100)
-        base = _dt.datetime(2019, 1, 1) + _dt.timedelta(
-            seconds=rng.randint(0, 5 * 365 * 24 * 3600)
-        )
+        if self._date_bounds:
+            start, end = self._date_bounds
+            span = max(1, int((end - start).total_seconds()))
+            base = start + _dt.timedelta(seconds=rng.randint(0, span))
+        else:
+            base = _dt.datetime(2019, 1, 1) + _dt.timedelta(
+                seconds=rng.randint(0, 5 * 365 * 24 * 3600)
+            )
         dt = base.strftime("%Y:%m:%d %H:%M:%S")
+        # Keep the historical RNG draw order for profiles without a
+        # fidelity block: only draw these fields when the profile opts in.
+        if self._fidelity is not None and self._software_variants:
+            software = rng.choice(self._software_variants)
+        else:
+            software = self._software_variants[0] if self._software_variants else ""
+        if self._fidelity is not None and self._orientations:
+            orientation = rng.choice(self._orientations)
+        else:
+            orientation = 1
+        if self._fidelity is not None and self._subject_distance:
+            subject_distance = rng.choice(self._subject_distance)
+            n, d = subject_distance
+            if n in (0, 0xFFFFFFFF):
+                subject_range = 3          # infinity / distant view
+            else:
+                metres = n / d if d else 0.0
+                subject_range = 1 if metres <= 1.0 else (
+                    2 if metres <= 2.0 else 3)
+        else:
+            subject_distance = (0, 0)
+            subject_range = 0
+        gps = None
+        if self._gps:
+            def _deg(max_deg: int) -> tuple[int, int, tuple[int, int]]:
+                deg = rng.randint(0, max_deg)
+                minute = rng.randint(0, 59)
+                sec = rng.randint(0, 59 * 32768 + 32767)
+                return deg, minute, (sec, 32768)
+            lat = _deg(89)
+            lon = _deg(179)
+            gps = {
+                "lat_ref": rng.choice(("N", "S")),
+                "lat": (lat[0], lat[1], lat[2]),
+                "lon_ref": rng.choice(("E", "W")),
+                "lon": (lon[0], lon[1], lon[2]),
+                "altitude_mm": rng.randint(0, 500_000),
+                "time": (rng.randint(0, 23), rng.randint(0, 59),
+                         rng.randint(0, 59)),
+                "dop": rng.randint(5_000, 20_000),
+                "date": base.strftime("%Y:%m:%d"),
+            }
+        noise_profile = None
+        if self._noise_s and self._noise_o:
+            s = math.exp(rng.uniform(math.log(self._noise_s[0]),
+                                     math.log(self._noise_s[1])))
+            o = math.exp(rng.uniform(math.log(self._noise_o[0]),
+                                     math.log(self._noise_o[1])))
+            noise_profile = (s, o, s, o, s, o)
         serial = self._rand_serial(rng, rng.choice(self._serial_prefixes))
         if self._legacy_serials:
             body_serial = rng.choice(["33000087", "94000525", serial])
@@ -107,11 +188,17 @@ class MetadataRandomizer:
             lens_serial = self._rand_serial(
                 rng, rng.choice(self._serial_prefixes))
         r35 = int(round(focal * self._crop))  # sensor crop factor
-        asn_r = rng.randint(5000, 7600)   # AsShotNeutral varies with WB
-        asn_b = rng.randint(4000, 5600)
-        bexp = rng.randint(-60, 60)       # +/- 0.006 EV baseline tweaks
+        asn_r = rng.randint(*self._asn_r)  # AsShotNeutral varies with WB
+        asn_b = rng.randint(*self._asn_b)
+        bexp = rng.randint(*self._baseline)
         return {
             "datetime": dt,
+            "software": software,
+            "orientation": orientation,
+            "subject_distance": subject_distance,
+            "subject_distance_range": subject_range,
+            "gps": gps,
+            "noise_profile": noise_profile,
             "exposure_time": (exp_n, exp_d),
             "fnumber": fnum_pair,
             "exposure_program": rng.choice(self._expprog),
@@ -135,7 +222,8 @@ class MetadataRandomizer:
             "as_shot_neutral": [(asn_r, 10000), (10000, 10000), (asn_b, 10000)],
             "baseline_exposure": (bexp, 10000),
             "brightness": (rng.randint(100, 600), 100),
-            "exposure_bias": (rng.choice([0, 0, 0, -33, 33, -67, 67]), 100),
+            "exposure_bias": (rng.choice(self._exposure_bias), 100),
+            "flash": self._flash,
             "subsec": f"{rng.randint(0, 99):02d}",
             "offset": rng.choice(["+08:00", "+09:00", "+01:00", "+02:00", "-05:00"]),
         }

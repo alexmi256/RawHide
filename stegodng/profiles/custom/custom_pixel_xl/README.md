@@ -8,12 +8,14 @@ CFA: BGGR (`CFAPattern` bytes `02 01 01 00`)
 Crop factor: 5.53  
 Calibration source: `harvested-adobe-dng`
 
-Derived from four DNGs taken 2026-10-29 on the author's Pixel XL:
+Derived from six DNGs taken 2026-10-29/30 on the author's Pixel XL:
 
 - `images/pixel_xl/IMG_20261029_174518.dng`
 - `images/pixel_xl/IMG_20261029_183843.dng`
 - `images/pixel_xl/IMG_20261029_183853.dng`
 - `images/pixel_xl/IMG_20261029_183905.dng`
+- `images/pixel_xl/IMG_20261030_094221.dng`
+- `images/pixel_xl/IMG_20261030_094256.dng`
 
 These carry Adobe's DNG converter signature (`ProfileName: Adobe Standard`,
 `ProfileCalibrationSignature: com.adobe`, DNG 1.3 headers), not the native
@@ -22,8 +24,12 @@ the two profiles carry different color matrices and DNG versions.
 
 ## Sample metadata
 
-- Software variants: `HDR+ 1.0.281780091zd` (3 files),
-  `HDR+ 1.0.281780091nl` (1 file)
+The 2026-10-30 additions contribute ISO 50, Software `nd`, GPS, and
+BlackLevel `1020/1016/1016/1020`; they are currently used for the GainMap
+base, while the rest of this section is the original four-file harvest.
+
+- Software variants: `HDR+ 1.0.281780091zd` (4 files),
+  `HDR+ 1.0.281780091nl` (1 file), `HDR+ 1.0.281780091nd` (1 file)
 - Lenses observed: none. The writer synthesizes the fixed
   `Pixel XL built-in lens` (4.7 mm, f/2.0)
 - ISO observed: 1225, 2035, 1250, 2900
@@ -73,7 +79,7 @@ Raw SubIFD:
 - CFAPattern: `02 01 01 00` (BGGR)
 - CFAPlaneColor: `00 01 02`
 - BlackLevelRepeatDim: 2 x 2
-- BlackLevel: 1009.49-1017.86 per file (four rational values)
+- BlackLevel: four rationals, 1009.49-1020 per channel per file
 - WhiteLevel: 16368
 - DefaultCropOrigin: 8, 8
 - DefaultCropSize: 4032, 3020
@@ -87,61 +93,105 @@ Raw SubIFD:
 
 ## Static fields (stamped by the current writer)
 
-- Make `Google`, Model `Pixel XL`, UniqueCameraModel `Google Pixel XL`,
-  Software `HDR+ 1.0.281780091zd`
+- Make `Google`, Model `Pixel XL`, UniqueCameraModel `Google Pixel XL`;
+  Software is one of the observed variants
 - DNGVersion [1, 3, 0, 0], DNGBackwardVersion [1, 3, 0, 0]
 - ColorMatrix1/2 and CalibrationIlluminants 17/21 from the harvest
+- ForwardMatrix1/2, `Adobe Standard`, `com.adobe`, the Adobe
+  copyright/embed-policy tags, `ProfileHueSatMapData1/2` (90x30x1) and
+  `ProfileLookTableData` (36x8x16) from the harvest, plus a per-file
+  `NoiseProfile`
 - BaselineNoise/BaselineSharpness/LinearResponseLimit/ShadowScale 1.0
-- BlackLevel ref 4075 (16-bit equivalent; observed per-channel range
-  ~4042-4075, ref is file 1's first channel); OpcodeList3 empty
-  (`00000000`)
+- BlackLevel per channel `1020/1016/1016/1020` with
+  `BlackLevelRepeatDim 2x2` (scaled to the 16-bit range under the default
+  capacity policy)
+- Default capacity policy: WhiteLevel 65535 and up to 16 planes.
+  `--level-policy strict` switches to WhiteLevel 16368 and a safe
+  13-plane cap so no sample exceeds it (other profiles keep their own
+  policy, or 16 planes when they have no fidelity block)
+- `--auto-size` tries native 4048x3036 with 16 planes first and only
+  grows the frame after that configuration is exhausted; the same
+  descending plane search applies when the native subprofile pins the
+  geometry
+- OpcodeList2 is generated per file (four GainMaps, see below), so no
+  OpcodeList3 is written
+- Preview 676x506, `CFAPattern` BYTE BGGR, `BayerGreenSplit` 500,
+  `ActiveArea` and an 8 px crop margin around `4032x3020`, 256x256 tiles
+
+## GainMap / OpcodeList2
+
+`profile.json` carries a compact `"gainmap"` block: a 4 x 8 x 10 base
+grid (one grid per CFA phase, averaged from the six samples' 30 x 40
+maps), plus `jitter` and `clip`. CFA encodes interpolate the base to
+30 x 40, add a seeded low-frequency jitter, and write four `GainMap`
+opcodes (ID 9) in `OpcodeList2` (tag 51009) with phases
+`1,1 / 1,0 / 0,1 / 0,0`, 2x2 pitch, and one map plane. The blob is
+19,572 bytes, matching the samples; no `OpcodeList3` is written.
+
+Edit `jitter` to change file-to-file variation, or remove the block
+(`"gainmap": null`) to fall back to the GFX-style empty `OpcodeList3`.
+The generator is `stegodng.opcodes.build_opcode_list2`; the parser and
+validator are `parse_opcode_list2` / `validate_opcode_list2`.
 
 ## Randomized per file (seeded)
 
-- DateTime*, OffsetTime*, SubSecTime* (2019-2024 window)
-- ExposureTime pool: the harvest's odd 1/24, 1/15, 1/13.33 values plus the
-  standard reference pool
+- DateTime* and SubSecTime* inside the last 365 days; Orientation 6 or 3
+- Software `…zd`, `…nl` or `…nd`
+- ExposureTime: the five observed exact rationals (≈1/160–1/13.3 s)
 - FNumber: always F2 (single-entry pool)
-- ISO pool: observed 1225/2035/1250/2900 plus the standard reference pool
-- Lens: fixed Pixel XL built-in lens (4.7 mm, f/2.0)
-- FocalLength 4.7 mm, 35 mm equivalent 26 mm (crop factor 5.53)
-- Camera/body/lens serials (generic prefixes, since the samples carry none)
-- AsShotNeutral (writer R 0.50-0.76 / B 0.40-0.56), BaselineExposure
-  (writer ±0.006 EV), Brightness, ExposureBias
-- Metering [2, 3, 5] and ExposureProgram [1, 2, 3, 4]: not observed in the
-  samples, but the writer always emits these tags
+- ISO: 50–2900, including the observed 1225/1250/2035/2900 values
+- Lens: fixed Pixel XL built-in lens (4.7 mm, f/2.0); focal length 4.7 mm,
+  35 mm equivalent 26 mm (crop factor 5.53)
+- AsShotNeutral R 0.4453–0.6460 / B 0.3780–0.6410; BaselineExposure
+  +0.13…+0.94 EV; ExposureBias 0; Flash “No, compulsory”
+- SubjectDistance/SubjectDistanceRange chosen as a consistent pair
+- GPS: seeded plausible coordinates, altitude, DOP, timestamp and date
+- No OffsetTime*, no MeteringMode/ExposureProgram, no camera/body/lens
+  serials, no lens tags, no XMP packet
+- The CLI defaults this profile to `--mode cfa` via
+  `fidelity.suggested_mode`; pass `--mode linear` to override. The Python
+  API still defaults to `linear` unless the caller passes `mode="cfa"`.
 
 ## Sub-profiles
 
-- `custom_pixel_xl-native`: pins 4032x3020 (the observed `DefaultCropSize`)
+- `custom_pixel_xl-native`: pins raw storage 4048x3036; the writer trims
+  8 px per side to the observed `DefaultCropSize` 4032x3020
 
-## Fidelity: present in the samples, not reproduced yet
+## Fidelity status
 
-The profile records the full harvest, but the current writer does not emit
-all of it. An inspector comparing a generated file against these samples
-would still see:
+Reproduced by the current writer:
 
-- No Adobe profile block (`ForwardMatrix1/2`, `ProfileHueSatMap`,
-  `ProfileLookTable`, `ProfileName`, `ProfileCopyright`, `NoiseProfile`)
-- No `OpcodeList2`; the writer emits an empty `OpcodeList3` instead
-- Uncompressed raw with 128x96 tiles instead of lossless-JPEG 256x256 tiles
-- Raw frame 4032x3020 with crop origin 0,0 instead of storage 4048x3036
-  with crop origin 8,8 and `ActiveArea`
-- `WhiteLevel 65535` instead of 16368 in a 16-bit container
-- RGGB instead of BGGR, no `BlackLevelRepeatDim`, no `BayerGreenSplit`
-- A preview up to 4000x3000 instead of 676x506
-- An XMP packet (the samples have none)
-- Lens model/make/spec, camera/body/lens serials, `OffsetTime*`,
-  `ExposureProgram`, `MeteringMode` (the samples omit all of these)
-- Orientation 1 instead of 6/3
-- No `SubjectDistance`/`SubjectDistanceRange`, no GPS
-- `BaselineExposure` is re-rolled within ±0.006 EV, while these samples are
-  +0.13 to +0.94 EV
-- `AsShotNeutral` is re-rolled as R 0.50-0.76 / B 0.40-0.56, wider than the
-  observed R 0.582-0.646 / B 0.378-0.433
+- Make/Model/UniqueCameraModel, DNG 1.3 headers, ColorMatrix1/2,
+  CalibrationIlluminants, and the full Adobe profile block
+  (`ForwardMatrix1/2`, `ProfileName`, signature, copyright, embed policy,
+  `ProfileHueSatMapData1/2`, `ProfileLookTableData`, `NoiseProfile`)
+- 4048x3036 raw storage, 8 px crop margin to 4032x3020, `ActiveArea`,
+  `DefaultUserCrop`, 256x256 tiles, BGGR `CFAPattern` (BYTE),
+  `BayerGreenSplit`, per-channel BlackLevel; default capacity WhiteLevel
+  65535 / 16 planes, strict WhiteLevel 16368 / 13 planes
+- 676x506 preview, Orientation 6/3, software variant, last-365-days dates,
+  AsShotNeutral/BaselineExposure ranges, SubjectDistance/Range, GPS
+- No XMP, lens tags, serials, `OffsetTime*`, `ExposureProgram`, or
+  `MeteringMode`, matching the samples
+- Generated `OpcodeList2` (four GainMaps) from the compact base grid
 
-`OpcodeList2`, the Google MakerNote and the per-file raw digests cannot be a
-single static profile blob: they differ in every sample.
+Still different:
+
+- Raw compression is uncompressed, not lossless-JPEG (Compression 7)
+- The Google MakerNote and the raw digests are not emitted
+- The preview is a thumbnail source, not a development of the raw scene
+- The raw pixels are a synthetic cover, not a real Pixel XL scene
+- `OpcodeList2` is generated, not copied byte-for-byte; its structure and
+  gain range match, but the four 30 x 40 tables differ from any sample
+- `NewRawImageDigest`/`RawDataUniqueID` are absent
+- The default capacity policy claims WhiteLevel 65535 / 16-bit data,
+  unlike the real 14-bit files; use `--level-policy strict` for 16368
+  and at most 13 planes
+
+The Google MakerNote and the per-file raw digests cannot be a single
+static profile blob because they differ in every sample. `OpcodeList2` is
+the exception: its header is static and only the gain tables vary, so a
+base grid plus per-file jitter reproduces it.
 
 ## Plausible-deniability notes
 

@@ -222,3 +222,4 @@ __marimo__/
 *.dng
 images/
 input.*
+output/

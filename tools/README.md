@@ -24,3 +24,17 @@ by the registry alongside the harvested ones and are listed in the
 
 After regen: `python3 -m pytest tests/ -q` (includes
 `test_camera_profile_data_valid`, which validates every `profile.json`).
+
+## GainMap / OpcodeList2
+
+`gainmap.py` inspects the `OpcodeList2` of a DNG or generates one from a
+profile's `"gainmap"` base grid:
+
+```bash
+python3 tools/gainmap.py inspect images/pixel_xl/IMG_20261030_094221.dng
+python3 tools/gainmap.py generate --profile custom_pixel_xl --seed 7 \
+    --width 4048 --height 3036 -o /tmp/opcode_list2.bin
+```
+
+The generator lives in `stegodng/opcodes.py`; the profile format is
+documented in `stegodng/profiles/custom/custom_pixel_xl/README.md`.
