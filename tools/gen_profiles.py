@@ -625,6 +625,32 @@ def main():
         f.write("|---|---|---|---|\n")
         for slug, disp, src, n in sorted(made):
             f.write(f"| `{slug}` | {disp} | {src} | {n} |\n")
+        custom_rows = []
+        custom_root = os.path.join(OUT, "custom")
+        if os.path.isdir(custom_root):
+            for child in sorted(os.listdir(custom_root)):
+                path = os.path.join(custom_root, child, "profile.json")
+                if not os.path.isfile(path):
+                    continue
+                try:
+                    with open(path) as cf:
+                        cdata = json.load(cf)
+                except (OSError, ValueError):
+                    continue
+                custom_rows.append((
+                    cdata.get("slug", child),
+                    cdata.get("display_name", child),
+                    cdata.get("calibration_source", ""),
+                    len(cdata.get("sample_files") or []),
+                ))
+        if custom_rows:
+            f.write("\n## Custom profiles\n\n")
+            f.write("Hand-maintained profiles under `profiles/custom/`; "
+                    "not regenerated from `dpreview-raw`.\n\n")
+            f.write("| profile | camera | calibration | samples |\n")
+            f.write("|---|---|---|---|\n")
+            for slug, disp, src, n in sorted(custom_rows):
+                f.write(f"| `{slug}` | {disp} | {src} | {n} |\n")
         f.write("\n## Skipped (no usable RAW data)\n\n")
         for s in skipped:
             f.write(f"- {s['make']!r} {s['model']!r}: {s['reason']}\n")
@@ -639,9 +665,10 @@ def main():
 def sync_staging(slugs: set) -> None:
     """Sync staged profiles into stegodng/profiles/.
 
-    Copies each staged slug dir + PROFILES.md over; removes profile dirs
-    that no longer exist upstream. Never touches __init__.py (file, not
-    dir) or __pycache__.
+    Copies each staged slug dir + PROFILES.md over; removes stale harvested
+    profile dirs (those containing a ``profile.json``). Never touches
+    __init__.py (file, not dir) or namespace dirs such as ``custom/``,
+    which have no direct ``profile.json``.
     """
     os.makedirs(OUT, exist_ok=True)
     for slug in sorted(slugs):
@@ -651,8 +678,8 @@ def sync_staging(slugs: set) -> None:
                  os.path.join(OUT, "PROFILES.md"))
     for child in sorted(os.listdir(OUT)):
         full = os.path.join(OUT, child)
-        if os.path.isdir(full) and child not in slugs \
-                and child != "__pycache__":
+        if (os.path.isdir(full) and child not in slugs
+                and os.path.isfile(os.path.join(full, "profile.json"))):
             shutil.rmtree(full)
             print(f"removed stale profile dir: {child}")
     shutil.rmtree(STAGE, ignore_errors=True)

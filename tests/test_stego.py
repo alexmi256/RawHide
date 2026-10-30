@@ -1326,6 +1326,19 @@ def test_camera_profile_registry():
         resolve("gfx_100-nosuchsub")
 
 
+def test_custom_profile_namespace():
+    from stegodng.profiles import get_profile, resolve
+    p = get_profile("custom_pixel_xl")
+    assert p.make == "Google" and p.model == "Pixel XL"
+    assert p.unique_camera_model == "Google Pixel XL"
+    assert p.cfa_pattern == "BGGR"
+    assert p.subprofiles["native"] == (4032, 3020)
+    # The harvested 16-bit-equivalent BlackLevel must stay below white.
+    assert 0 < p.black_level(16) < p.white_level(16)
+    prof, sub = resolve("custom_pixel_xl-native")
+    assert prof.slug == "custom_pixel_xl" and sub == "native"
+
+
 def test_camera_profile_from_dict_defaults():
     from stegodng.profile import DEFAULT_PROFILE, CameraProfile
     p = CameraProfile.from_dict({"slug": "x", "make": "ACME",
@@ -1361,18 +1374,22 @@ def test_camera_profile_data_valid():
         "stegodng", "profiles")
     required = {"schema", "slug", "display_name", "make", "model",
                 "software", "calibration_source", "subprofiles"}
-    for slug in list_profiles():
-        if slug == "gfx_100":
-            continue  # built-in reference, no data dir
-        d = os.path.join(base, slug)
-        with open(os.path.join(d, "profile.json")) as f:
+    seen = set()
+    for dirpath, _dirnames, filenames in os.walk(base):
+        if "profile.json" not in filenames:
+            continue
+        with open(os.path.join(dirpath, "profile.json")) as f:
             data = json.load(f)
+        slug = data["slug"]
         assert required <= set(data), slug
-        assert data["slug"] == slug
-        assert os.path.isfile(os.path.join(d, "README.md")), slug
+        assert slug == os.path.basename(dirpath), (slug, dirpath)
+        assert os.path.isfile(os.path.join(dirpath, "README.md")), slug
         sub = data["subprofiles"]
         for name, g in sub.items():
             assert g["width"] > 0 and g["height"] > 0, (slug, name)
+        seen.add(slug)
+    # Every profile the registry exposes must have passed the checks above.
+    assert set(list_profiles()) - {"gfx_100"} <= seen
 
 
 def test_camera_profile_encode_roundtrip(tmp_path):
