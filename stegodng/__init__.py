@@ -34,8 +34,14 @@ from .container import (
     read_ifd,
 )
 from .cover import CoverGenerator, make_cover, make_thumbnail
+from .digests import (
+    new_raw_image_digest,
+    opcode_list_fingerprint,
+    raw_data_unique_id,
+)
 from .fidelity import AdobeProfile, FidelityConfig
 from .framing import PayloadFrame
+from .makernote import MakernoteConfig
 from .opcodes import (
     GainMap,
     GainMapConfig,
@@ -86,12 +92,16 @@ __all__ = [
     "GainMap",
     "GainMapConfig",
     "LsbCodec",
+    "MakernoteConfig",
     "PayloadFrame",
     "MetadataRandomizer",
     "build_exif_block",
     "build_opcode_list2",
     "build_xmp",
+    "new_raw_image_digest",
+    "opcode_list_fingerprint",
     "parse_opcode_list2",
+    "raw_data_unique_id",
     "read_exif_tags",
     "read_gps",
     "read_ifd",

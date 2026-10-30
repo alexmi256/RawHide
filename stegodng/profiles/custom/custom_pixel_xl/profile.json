@@ -73,6 +73,13 @@
     ],
     "date_window_days": 365,
     "suggested_mode": "cfa",
+    "tag_conventions": "adobe",
+    "raw_digests": true,
+    "makernote": {
+      "magic": "HDRP",
+      "prefix_hex": "02ef64356d5e701e2ceae3",
+      "length": [2640, 2757]
+    },
     "as_shot_neutral": {
       "r": [
         4453,
@@ -133,6 +140,7 @@
         37382,
         37385,
         37386,
+        37500,
         37520,
         37521,
         37522,

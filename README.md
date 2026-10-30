@@ -198,6 +198,10 @@ Module layout:
 | `cover.py` | `CoverGenerator` | synthetic raw covers + JPEG thumbnails |
 | `codec.py` | `LsbCodec` | LSB embed/extract, capacity, KB formatting |
 | `container.py` | `DngContainer` | XMP/EXIF builders, BigTIFF-aware IFD patching, raw reading |
+| `digests.py` | — | `NewRawImageDigest` / `RawDataUniqueID` (DNG SDK rules) |
+| `fidelity.py` | `FidelityConfig` | optional per-profile metadata/tag fidelity block |
+| `makernote.py` | `MakernoteConfig` | opaque `HDRP`-style MakerNote envelopes |
+| `opcodes.py` | `GainMapConfig` | `OpcodeList2` GainMap generation/parsing |
 | `sizing.py` | `AutoSizer` | smallest-fit search, max-capacity errors, risk warnings |
 | `split.py` | — | chunk sizing/naming, split-field registries, seq parse/format |
 | `stego.py` | `DngStego` | `encode` / `decode` / `generate_tiff` orchestration |
@@ -329,6 +333,30 @@ python stego_dng.py encode -i big.bin -o ps.dng --camera-profile gfx_100-pixelsh
   the full 16-bit range). `--auto-size` prefers the profile's
   `sensor_sizes` when the payload fits, so Pixel XL outputs stay at
   4048x3036 before growing. See `stegodng/fidelity.py`.
+- Optional fidelity sub-blocks for writers whose files carry extra
+  identity tags:
+  - `"tag_conventions": "adobe"` reproduces Adobe's tag inventory: no
+    `XResolution`/`YResolution`/`ResolutionUnit`, `YCbCrCoefficients`
+    (529) + `YCbCrPositioning` (531) on the preview, `PlanarConfiguration`
+    on the raw SubIFD, `CFAPlaneColor` as BYTE, and `SubIFDs` typed LONG.
+    It also writes a full six-digit `SubSecTime` (override with
+    `subsec_digits`).
+  - `"raw_digests": true` emits `NewRawImageDigest` (51111) and
+    `RawDataUniqueID` (50781) with the DNG SDK rules — per-256×256-tile
+    MD5s chained, then MD5 over the digest, `UniqueCameraModel`, the
+    crop rectangles and the opcode-list fingerprint streams. Both
+    reproduce the reference Pixel XL tags byte-for-byte. Multi-frame
+    files omit them (one digest describes one raw image).
+  - `"makernote": {"magic": "HDRP", "prefix_hex": "...", "length": [lo, hi]}`
+    writes an opaque `Exif.Photo.MakerNote` plus DNG `MakerNoteSafety`
+    (50741). The tag itself is only written when the profile's
+    `exif_allow` list contains 37500 (the Pixel XL list does). The
+    reference `HDRP` blob is 2.6 KB of high-entropy data with a constant
+    15-byte prefix; the writer reproduces the envelope (prefix + seeded
+    pseudo-random tail at a realistic length) because the real payload is
+    per-file Google HDR+ metadata that no public parser decodes.
+  `tools/digests.py verify FILE` recomputes both digests from a DNG and
+  `tools/digests.py makernote FILE` prints a MakerNote envelope.
 - Fidelity is honest, not perfect: DNG-native cameras contribute real
   `ColorMatrix`/`BlackLevel`/`WhiteLevel`/opcode data; proprietary-RAW
   cameras (CR3, NEF, ARW, RAF, RW2, ORF, ...) fall back to the GFX

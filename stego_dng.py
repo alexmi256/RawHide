@@ -69,7 +69,13 @@ from stegodng.container import (
     XMP_LEN,
 )
 from stegodng.cover import CoverGenerator, make_cover, make_thumbnail
+from stegodng.digests import (
+    new_raw_image_digest,
+    opcode_list_fingerprint,
+    raw_data_unique_id,
+)
 from stegodng.fidelity import AdobeProfile, FidelityConfig
+from stegodng.makernote import MakernoteConfig
 from stegodng.opcodes import (
     GainMap,
     GainMapConfig,

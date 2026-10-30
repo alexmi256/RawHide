@@ -107,6 +107,115 @@ class DngContainer:
         """Append a GPS IFD at EOF and link it from IFD0."""
         _append_gps(self.path, gps)
 
+    def ifd0_offset(self) -> int:
+        """File offset of IFD0."""
+        with open(self.path, "rb") as f:
+            return _ifd0_offset(f.read(16))
+
+    def subifd_offsets(self) -> list[int]:
+        """Offsets of the raw SubIFD directories linked from IFD0."""
+        with open(self.path, "rb") as f:
+            return _seek_subifd_offsets(f, self.ifd0_offset())
+
+    def set_entry_type(self, ifd_offset: int, tag: int, dtype: int) -> None:
+        """Rewrite one IFD entry's datatype in place (same-size tags only)."""
+        with open(self.path, "r+b") as f:
+            found = _seek_ifd_entry(f, ifd_offset, tag)
+            if found is None:
+                return
+            f.seek(found[0] + 2)
+            f.write(struct.pack("<H", int(dtype)))
+
+    def entry_uint(self, ifd_offset: int, tag: int) -> int | None:
+        """Inline SHORT/LONG value of one entry (None when absent)."""
+        with open(self.path, "rb") as f:
+            found = _seek_ifd_entry(f, ifd_offset, tag)
+            if found is None:
+                return None
+            _entry, typ, count, value_ptr, big = found
+            fmt = ("<H" if typ == 3 else "<I" if typ == 4 else None)
+            if fmt is None or count != 1:
+                return None
+            f.seek(value_ptr)
+            raw = f.read(8 if big else 4)
+            return struct.unpack(fmt, raw[:struct.calcsize(fmt)])[0]
+
+    def set_entry_uint(self, ifd_offset: int, tag: int, value: int) -> None:
+        """Overwrite an inline SHORT/LONG value in place."""
+        with open(self.path, "r+b") as f:
+            found = _seek_ifd_entry(f, ifd_offset, tag)
+            if found is None:
+                return
+            _entry, typ, count, value_ptr, _big = found
+            fmt = ("<H" if typ == 3 else "<I" if typ == 4 else None)
+            if fmt is None or count != 1:
+                raise ValueError(f"tag {tag} is not an inline SHORT/LONG")
+            f.seek(value_ptr)
+            f.write(struct.pack(fmt, int(value)))
+
+    def drop_ifd_tags(self, ifd_offset: int, tags: set[int] | tuple) -> None:
+        """Remove tags from an IFD by compacting its entry block.
+
+        Entries are packed at the front of the directory so the remaining
+        tags stay in ascending order; the out-of-line values they point
+        at keep their absolute offsets, so nothing else in the file has to
+        move and the freed bytes are left as padding.  Used to undo the
+        X/YResolution and ResolutionUnit tags the TIFF writer always emits
+        but the reference files do not carry.  Seek-based: only the
+        directory itself is read, never the pixel data.
+        """
+        self.rewrite_ifd_entries(ifd_offset, drop=tags)
+
+    def rewrite_ifd_entries(self, ifd_offset: int, drop: set[int] | tuple = (),
+                            add: tuple | list = ()) -> None:
+        """Drop/add inline-value entries in one pass, keeping ascending order.
+
+        ``add`` items are ``(tag, dtype, count, raw_value)``; the value
+        must fit the entry's inline field (4 bytes classic, 8 BigTIFF).
+        The directory block never grows (that would overwrite the
+        out-of-line values), so ``add`` may only replace entries removed
+        by ``drop``.
+        """
+        drop = {int(tag) for tag in drop}
+        with open(self.path, "r+b") as f:
+            f.seek(0)
+            big = f.read(4) == b"II+\x00"
+            head, entry_size = (8, 20) if big else (2, 12)
+            next_len = 8 if big else 4
+            field_len = 8 if big else 4
+            f.seek(ifd_offset)
+            count = struct.unpack("<Q" if big else "<H", f.read(head))[0]
+            entries = []
+            removed = 0
+            for index in range(count):
+                raw = f.read(entry_size)
+                if struct.unpack_from("<H", raw, 0)[0] in drop:
+                    removed += 1
+                else:
+                    entries.append(raw)
+            for tag, dtype, n, value in add:
+                raw = bytes(value)
+                if len(raw) > field_len:
+                    raise ValueError(
+                        f"tag {tag} value does not fit the entry field")
+                entries.append(struct.pack(
+                    "<HH" + ("Q" if big else "I") + f"{field_len}s",
+                    int(tag), int(dtype), int(n),
+                    raw + b"\x00" * (field_len - len(raw))))
+            if len(entries) > count:
+                raise ValueError(
+                    "rewrite_ifd_entries cannot grow the directory block")
+            if not removed and not add:
+                return
+            entries.sort(key=lambda item: struct.unpack_from("<H", item, 0)[0])
+            nxt = f.read(next_len)
+            packed = b"".join(entries)
+            blob = (struct.pack("<Q" if big else "<H", len(entries))
+                    + packed + nxt)
+            f.seek(ifd_offset)
+            f.write(blob)
+            f.write(b"\x00" * (count * entry_size - len(packed)))
+
 
 XMP_LEN = 12288
 
@@ -184,6 +293,7 @@ _DTYPE_NUM = {"BYTE": 1, "ASCII": 2, "SHORT": 3, "LONG": 4, "RATIONAL": 5,
 # not.  They are only added when a profile supplies an EXIF allowlist.
 _EXIF_EXTRA_TAGS: list[tuple[int, str]] = [
     (37382, "RATIONAL"),     # SubjectDistance
+    (37500, "UNDEFINED"),    # MakerNote (fidelity.makernote)
     (41730, "UNDEFINED"),    # CFAPattern
     (41988, "RATIONAL"),     # DigitalZoomRatio
     (41996, "SHORT"),        # SubjectDistanceRange
@@ -251,6 +361,9 @@ def _exif_values(meta: dict, thumb_w: int, thumb_h: int) -> dict[int, object]:
         41988: [(0, 1)],
         41996: [meta.get("subject_distance_range", 0)],
     }
+    makernote = meta.get("makernote")
+    if makernote:
+        values[37500] = bytes(makernote)
     # Split markers (chunk-set UUID, sequence): written only on split
     # chunks. meta["split_exif"] maps tag -> value for EXIF-bound fields.
     for tag, value in meta.get("split_exif", {}).items():
@@ -316,6 +429,7 @@ def _build_exif_block(meta: dict, thumb_w: int, thumb_h: int,
         base = [item for item in base
                 if item[0] not in (42034, 42035, 42036, 42037)]
     tags = base + (extra_tags or [])
+    tags = [item for item in tags if item[0] in values]
     n = len(tags)
     field_len = 8 if bigtiff else 4
     count_fmt = "<Q" if bigtiff else "<H"

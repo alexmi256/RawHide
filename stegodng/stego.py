@@ -25,6 +25,7 @@ from .container import (
     set_ifd0_tag,
 )
 from .cover import CoverGenerator
+from .digests import new_raw_image_digest, raw_data_unique_id
 from .framing import PayloadFrame
 from .metadata import MetadataRandomizer
 from .opcodes import build_opcode_list2
@@ -99,8 +100,22 @@ class DngStego:
         n = 3 if mode == "linear" else 1
         return black, (white,) * n
 
-    def _ifd0_extras(self, meta: dict, n_dummies: int = 0) -> list:
+    def _ifd0_extras(self, meta: dict, n_dummies: int = 0,
+                     digest_tags: tuple | list = ()) -> list:
         fidelity = self.profile.fidelity
+        adobe = fidelity is not None and fidelity.tag_conventions == "adobe"
+        if adobe:
+            # Adobe writes these rationals at fixed denominators; keeping
+            # them (1e6 scaling, hundredth EV) avoids a batch-wide pattern.
+            analog = [(1000000, 1000000)] * 3
+            neutral = [(n * 100, 1000000) for n, _d in meta["as_shot_neutral"]]
+            baseline = [(int(round(meta["baseline_exposure"][0] / 100)), 100)]
+            shadow = [(1, 1)]
+        else:
+            analog = [(10000, 10000)] * 3
+            neutral = meta["as_shot_neutral"]
+            baseline = [meta["baseline_exposure"]]
+            shadow = [self.profile.shadow_scale]
         extras = [
             (271, "s", 0, self.profile.make, True),
             (272, "s", 0, self.profile.model, True),
@@ -114,13 +129,20 @@ class DngStego:
             (50708, "s", 0, self.profile.unique_camera_model, True),
             (50721, 10, 9, self.profile.color_matrix1, True),
             (50722, 10, 9, self.profile.color_matrix2, True),
-            (50727, 5, 3, [(10000, 10000)] * 3, True),
-            (50728, 5, 3, meta["as_shot_neutral"], True),
-            (50730, 10, 1, [meta["baseline_exposure"]], True),
+            (50727, 5, 3, analog, True),
+            (50728, 5, 3, neutral, True),
+            (50730, 10, 1, baseline, True),
             (50731, 5, 1, [self.profile.baseline_noise], True),
             (50732, 5, 1, [self.profile.baseline_sharpness], True),
             (50734, 5, 1, [self.profile.linear_response_limit], True),
         ]
+        if adobe:
+            # Adobe re-wraps the preview JPEG with its own YCbCr
+            # coefficients/positioning; without them the preview tags are
+            # only half of what the reference files carry.
+            extras.append((529, 5, 3, [
+                (299, 1000), (587, 1000), (114, 1000)], True))
+            extras.append((531, 3, 1, (1,), True))
         if fidelity is None or fidelity.emit_serials:
             extras.append((50735, "s", 0, meta["camera_serial"], True))
         if fidelity is None or fidelity.emit_lens:
@@ -131,7 +153,7 @@ class DngStego:
                 (meta["lens_spec"][6], meta["lens_spec"][7]),
             ], True))
         extras += [
-            (50739, 5, 1, [self.profile.shadow_scale], True),
+            (50739, 5, 1, shadow, True),
             (50778, 3, 1, (self.profile.calib_illuminant1,), True),
             (50779, 3, 1, (self.profile.calib_illuminant2,), True),
         ]
@@ -167,6 +189,10 @@ class DngStego:
                     extras.append((50982, 11, len(values), values, True))
         if meta.get("noise_profile") is not None:
             extras.append((51041, 12, 6, list(meta["noise_profile"]), True))
+        if meta.get("makernote"):
+            # DNG 1.3: tells editors the MakerNote is safe to copy.
+            extras.append((50741, 3, 1, (1,), True))
+        extras.extend(digest_tags)
         if meta.get("gps") is not None:
             # Repurposed into GPSTag (34853) after the GPS IFD is appended.
             extras.append((65010, 3, 1, (0,), True))
@@ -180,10 +206,24 @@ class DngStego:
             extras.append((65001 + i, 4, 1, (0,), True))
         return extras
 
+    def _crop_rect(self, width: int, height: int) -> tuple[int, int, int, int]:
+        """DefaultCropOrigin/Size as (x, y, w, h) for the current profile."""
+        fidelity = self.profile.fidelity
+        if fidelity and fidelity.crop_margin:
+            mx, my = fidelity.crop_margin
+            if width <= 2 * mx or height <= 2 * my:
+                raise ValueError(
+                    f"crop_margin {fidelity.crop_margin} leaves no image in "
+                    f"{width}x{height}")
+            return (mx, my, width - 2 * mx, height - 2 * my)
+        return (0, 0, width, height)
+
     def _sub_extras(self, meta: dict, mode: str, width: int, height: int,
-                    bit_depth: int, seed: int = 0) -> list:
+                    bit_depth: int, seed: int = 0,
+                    opcode2: bytes | None = None) -> list:
         black, white_t = self._levels(mode, bit_depth)
         fidelity = self.profile.fidelity
+        adobe = fidelity is not None and fidelity.tag_conventions == "adobe"
         opcode = self.profile.opcode_list3
         if mode == "linear":
             extras = [
@@ -212,19 +252,12 @@ class DngStego:
         else:
             black_tag = (50714, 4, 1, black, True)
             white_tag = (50717, 4, 1, white_t, True)
-        crop_x, crop_y, crop_w, crop_h = 0, 0, width, height
-        active = None
-        if fidelity and fidelity.crop_margin:
-            mx, my = fidelity.crop_margin
-            if width <= 2 * mx or height <= 2 * my:
-                raise ValueError(
-                    f"crop_margin {fidelity.crop_margin} leaves no image in "
-                    f"{width}x{height}")
-            crop_x, crop_y = mx, my
-            crop_w, crop_h = width - 2 * mx, height - 2 * my
-            active = (0, 0, height, width)
+        crop_x, crop_y, crop_w, crop_h = self._crop_rect(width, height)
+        active = (0, 0, height, width) if crop_w != width else None
+        plane_color = ((50710, 1, 3, bytes((0, 1, 2)), True) if adobe
+                       else (50710, 3, 3, (0, 1, 2), True))
         extras = [
-            (50710, 3, 3, (0, 1, 2), True),  # CFAPlaneColor R,G,B
+            plane_color,                      # CFAPlaneColor R,G,B
             (50711, 3, 1, (1,), True),        # CFALayout rectangular
             black_tag,
             white_tag,
@@ -249,8 +282,9 @@ class DngStego:
             # Pixel XL style: four per-phase GainMaps in OpcodeList2 and no
             # OpcodeList3.  The maps are regenerated per file from the
             # profile base grid so a batch never shares an identical blob.
-            opcode2 = build_opcode_list2(
-                width, height, seed=seed, config=self.profile.gainmap)
+            if opcode2 is None:
+                opcode2 = build_opcode_list2(
+                    width, height, seed=seed, config=self.profile.gainmap)
             extras.append((51009, 7, len(opcode2), opcode2, True))
         else:
             extras.append((51022, 7, len(opcode), opcode, True))
@@ -265,7 +299,13 @@ class DngStego:
 
         ``ifd0_dummies`` reserves that many private LONG tags (65001+)
         for post-write split seq/id fields. Returns the bigtiff flag.
+
+        The profile's MakerNote is attached here (not in ``encode``) so
+        the split path, which builds its own metadata per chunk, gets it
+        too; ``seed`` is the same value both callers already pass for the
+        cover/gain-map/metadata stream.
         """
+        self._attach_makernote(meta, seed)
         thumb_ycbcr = self._rgb_to_ycbcr(thumb_rgb)
         bytes_per_sample = 1 if bit_depth <= 8 else 2
         bigtiff = (
@@ -282,8 +322,21 @@ class DngStego:
         # lossless so the LSB payload survives either way.
         use_deflate = compression == "adobe_deflate"
 
+        # OpcodeList2 is generated once so the RawDataUniqueID can be
+        # derived from the exact blob that lands in the file.
+        opcode2 = None
+        if self.profile.gainmap is not None:
+            opcode2 = build_opcode_list2(
+                width, height, seed=seed, config=self.profile.gainmap)
+
+        container = DngContainer(output_path)
+        digest_tags: list[tuple] = []
+        if fidelity is not None and fidelity.raw_digests and frames == 1:
+            digest_tags = self._digest_tags(stegos[0], mode, opcode2)
+
         with tifffile.TiffWriter(output_path, bigtiff=bigtiff) as tif:
-            ifd0_extras = self._ifd0_extras(meta, n_dummies=ifd0_dummies)
+            ifd0_extras = self._ifd0_extras(
+                meta, n_dummies=ifd0_dummies, digest_tags=digest_tags)
             tif.write(
                 thumb_ycbcr, photometric="ycbcr", compression="jpeg",
                 # Empty Software (profiles with no observed Software
@@ -296,7 +349,8 @@ class DngStego:
                 subfiletype=1, subifds=frames, metadata=None, extratags=ifd0_extras,
             )
             sub_extras = self._sub_extras(meta, mode, width, height,
-                                          bit_depth, seed=seed)
+                                          bit_depth, seed=seed,
+                                          opcode2=opcode2)
             for stego in stegos:
                 tif.write(
                     stego, photometric=photo_main,
@@ -308,7 +362,7 @@ class DngStego:
                 )
 
         if mode == "linear":
-            DngContainer(output_path).patch_linear_raw()
+            container.patch_linear_raw()
         if fidelity is not None:
             meta.setdefault("fidelity_layout", False)
             allow = fidelity.exif_allow
@@ -322,11 +376,74 @@ class DngStego:
                 meta.setdefault(
                     "photo_cfa_pattern",
                     b"\x02\x00\x02\x00\x02\x01\x01\x00")
-        container = DngContainer(output_path)
         container.append_exif(meta, tw, th)
         if meta.get("gps") is not None:
             container.append_gps(meta["gps"])
+        if fidelity is not None and fidelity.tag_conventions == "adobe":
+            self._apply_adobe_tag_conventions(container)
         return bigtiff
+
+    def _digest_tags(self, raw, mode: str,
+                     opcode2: bytes | None) -> list[tuple]:
+        """NewRawImageDigest + RawDataUniqueID entries for the IFD0.
+
+        Only valid for a single raw frame: the digest describes one raw
+        image, so multi-frame files go without (see README).  The crop
+        rectangle and opcode lists must be the ones actually written:
+        linear raws use the full frame and only carry OpcodeList3.
+        """
+        height, width = raw.shape[:2]
+        if mode == "cfa":
+            crop_x, crop_y, crop_w, crop_h = self._crop_rect(width, height)
+            lists = (None, opcode2,
+                     None if self.profile.gainmap is not None
+                     else self.profile.opcode_list3)
+        else:
+            crop_x, crop_y, crop_w, crop_h = 0, 0, width, height
+            lists = (None, None, self.profile.opcode_list3)
+        digest = new_raw_image_digest(raw)
+        uid = raw_data_unique_id(
+            digest, self.profile.unique_camera_model,
+            crop_size=((crop_w, 1), (crop_h, 1)),
+            crop_origin=((crop_x, 1), (crop_y, 1)),
+            opcode_lists=lists,
+        )
+        return [
+            (51111, "B", 16, digest, True),
+            (50781, "B", 16, uid, True),
+        ]
+
+    @staticmethod
+    def _apply_adobe_tag_conventions(container: DngContainer) -> None:
+        """Match the tag inventory of Adobe re-wrapped DNGs.
+
+        The TIFF writer always emits X/YResolution and ResolutionUnit and
+        stores SubIFDs as type IFD; Adobe (and the reference files) carry
+        neither, and it only writes PlanarConfiguration for multi-sample
+        pages, so the raw SubIFD gets tag 284 patched in while the freed
+        entry slots are still available.
+        """
+        ifd0 = container.ifd0_offset()
+        container.drop_ifd_tags(ifd0, (282, 283, 296))
+        for offset in container.subifd_offsets():
+            # tifffile writes PlanarConfiguration itself for multi-sample
+            # pages (linear raws); only CFA SubIFDs need it patched in,
+            # and a second 284 entry would be invalid.
+            missing = container.entry_uint(offset, 284) is None
+            container.rewrite_ifd_entries(
+                offset, drop=(282, 283, 296),
+                add=[(284, 3, 1, b"\x01\x00")] if missing else [])
+        if not container.is_bigtiff:
+            # BigTIFF stores SubIFD offsets as IFD8 (type 18); retyping
+            # those to LONG (4) makes readers take 8-byte offsets as
+            # 4-byte values and corrupts the directory.
+            container.set_entry_type(ifd0, 330, 4)
+        # tifffile rounds a JPEG preview's RowsPerStrip up to an MCU
+        # multiple (512 for a 506-row preview); the reference files store
+        # the full preview height, which is still a single strip.
+        height = container.entry_uint(ifd0, 257)
+        if height is not None:
+            container.set_entry_uint(ifd0, 278, height)
 
     def _file_info(self, output_path: str, *, width: int, height: int,
                    mode: str, bit_depth: int, container: str,
@@ -347,7 +464,9 @@ class DngStego:
             "capacity": cap,
             "payload_len": payload_len,
             "size": os.path.getsize(output_path),
-            "metadata": meta,
+            # The MakerNote blob is per-file binary noise, not metadata a
+            # caller wants to inspect; keep it out of the info dict.
+            "metadata": {k: v for k, v in meta.items() if k != "makernote"},
         }
 
 
@@ -422,6 +541,12 @@ class DngStego:
             lsb_planes=lsb_planes, frames=frames, thumb_label=thumb_label,
             bigtiff=bigtiff, cap=cap, payload_len=len(payload), meta=meta,
         )
+
+    def _attach_makernote(self, meta: dict, seed: int) -> None:
+        """Add the profile's opaque MakerNote blob to ``meta`` (if any)."""
+        fidelity = self.profile.fidelity
+        if fidelity is not None and fidelity.makernote is not None:
+            meta["makernote"] = fidelity.makernote.generate(seed)
 
     def _validate_options(self, bit_depth: int, lsb_planes: int,
                           frames: int, mode: str, compression: str) -> None:

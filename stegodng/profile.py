@@ -273,7 +273,7 @@ class CameraProfile:
             suggested_bit_depth=_or("suggested_bit_depth", 16),
             cfa_pattern=data.get("cfa_pattern"),
             crop_factor=_or("crop_factor", ref.crop_factor),
-            lenses=tuple(tuple(l) for l in data["lenses"])
+            lenses=tuple(tuple(lens) for lens in data["lenses"])
             if data.get("lenses") else None,
             iso_choices=tuple(data["iso_choices"])
             if data.get("iso_choices") else None,

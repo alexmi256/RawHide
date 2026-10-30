@@ -16,6 +16,8 @@ is the operator's guide for changing code.
 | `stegodng/cover.py` | `CoverGenerator` (synthetic raw covers + gradient thumbnails) |
 | `stegodng/codec.py` | `LsbCodec` (LSB embed/extract, capacity, KB formatters) |
 | `stegodng/opcodes.py` | `OpcodeList2` GainMap generation/parsing (per-profile base grid) |
+| `stegodng/digests.py` | `NewRawImageDigest` / `RawDataUniqueID` (DNG SDK tile-hash rules) |
+| `stegodng/makernote.py` | opaque `HDRP`-style MakerNote envelopes (prefix + seeded tail) |
 | `stegodng/fidelity.py` | optional `fidelity` profile block (metadata ranges, tags, levels, crop, GPS, Adobe) |
 | `stegodng/container.py` | `DngContainer` (XMP/EXIF builders, IFD patching incl. BigTIFF, raw reading) |
 | `stegodng/sizing.py` | `AutoSizer` (smallest-fit search, max-capacity errors, risk warnings) |
@@ -84,6 +86,12 @@ is the operator's guide for changing code.
 - tifffile limitations to route around, not fight: no IFD-pointer tags
   via `extratags` (we rewrite a same-size dummy tag post-write), no
   packed-BPS + compression combo, no `bitspersample` with compression.
+- tifffile always writes X/YResolution/ResolutionUnit, refuses 284
+  (`PlanarConfiguration`) as an extratag, and rounds a JPEG preview's
+  RowsPerStrip up to an MCU multiple.  The `"adobe"` tag conventions fix
+  that by compacting IFD entries in place (`rewrite_ifd_entries`): only
+  the entry block shrinks, out-of-line values keep their absolute
+  offsets, so no pixel data moves.
 - LibRaw (rawpy) rejects Deflate DNGs and >16-bit integer DNGs in this
   environment — raw output defaults to uncompressed for that reason.
 - Classic TIFF helpers in `container.py` must stay BigTIFF-aware

@@ -38,3 +38,20 @@ python3 tools/gainmap.py generate --profile custom_pixel_xl --seed 7 \
 
 The generator lives in `stegodng/opcodes.py`; the profile format is
 documented in `stegodng/profiles/custom/custom_pixel_xl/README.md`.
+
+## Raw digests / MakerNote
+
+`digests.py` verifies the two raw identity tags and summarizes the
+opaque MakerNote of a DNG:
+
+```bash
+python3 tools/digests.py verify images/pixel_xl/IMG_20261030_094221.dng
+python3 tools/digests.py makernote images/pixel_xl/IMG_20261030_094221.dng
+```
+
+`verify` decodes the raw image (tifffile, falling back to `rawpy` for
+lossless-JPEG tiles) and recomputes `NewRawImageDigest` (tag 51111) and
+`RawDataUniqueID` (tag 50781) with the DNG SDK rules; it exits 1 on a
+mismatch. Both values are reproducible for the Pixel XL samples and for
+files written by this package. `makernote` prints the length, head bytes
+and byte entropy that the profile's `fidelity.makernote` block models.
