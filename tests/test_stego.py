@@ -459,7 +459,9 @@ def test_shim_delegates_to_package():
         "get_profile", "list_profiles", "AdobeProfile", "FidelityConfig",
         "GainMap", "GainMapConfig", "build_opcode_list2",
         "parse_opcode_list2", "validate_opcode_list2", "read_exif_tags",
-        "read_gps", "read_ifd",
+        "read_gps", "read_ifd", "MakernoteConfig",
+        "new_raw_image_digest", "raw_data_unique_id",
+        "opcode_list_fingerprint",
     ):
         assert hasattr(stego_dng, name), name
 
@@ -1774,6 +1776,330 @@ def test_read_ifd_bigtiff(tmp_path):
     tifffile.imwrite(path, np.zeros((8, 8), dtype=np.uint8), bigtiff=True)
     tags = {tag for tag, _typ, _count, _raw in read_ifd(path)}
     assert {256, 257} <= tags
+
+
+def _sdk_digest_manual(raw, tile=256):
+    """Reference implementation: per-tile MD5, then MD5 of the digests."""
+    import hashlib
+    arr = np.asarray(raw)
+    height, width = arr.shape[:2]
+    tiles = []
+    for top in range(0, height, tile):
+        for left in range(0, width, tile):
+            block = arr[top:top + tile, left:left + tile]
+            if block.ndim == 3:
+                block = np.transpose(block, (2, 0, 1))
+            tiles.append(hashlib.md5(
+                np.ascontiguousarray(block).astype("<u2").tobytes()).digest())
+    return hashlib.md5(b"".join(tiles)).digest()
+
+
+def test_new_raw_image_digest_uses_sdk_tiles():
+    from stegodng.digests import new_raw_image_digest
+
+    rng = np.random.default_rng(4)
+    # Not a multiple of the tile size: edge tiles must be truncated, and
+    # the tag is not a plain MD5 of the raster.
+    raw = rng.integers(0, 65535, size=(300, 260), dtype=np.uint16)
+    digest = new_raw_image_digest(raw)
+    assert digest == _sdk_digest_manual(raw)
+    import hashlib
+    assert digest != hashlib.md5(raw.astype("<u2").tobytes()).digest()
+
+    # One changed pixel changes the digest; the same pixels reproduce it.
+    other = raw.copy()
+    other[299, 259] ^= 1
+    assert new_raw_image_digest(other) != digest
+    assert new_raw_image_digest(raw.copy()) == digest
+
+    # Multi-plane raws are hashed plane by plane inside each tile.
+    planes = rng.integers(0, 65535, size=(256, 300, 3), dtype=np.uint16)
+    assert new_raw_image_digest(planes) == _sdk_digest_manual(planes)
+    assert new_raw_image_digest(planes) != new_raw_image_digest(planes[..., 0])
+
+    with pytest.raises(ValueError):
+        new_raw_image_digest(np.zeros((0, 4), dtype=np.uint16))
+    with pytest.raises(ValueError):
+        new_raw_image_digest(np.zeros((2, 2, 2, 2), dtype=np.uint16))
+
+
+def test_opcode_list_fingerprint_stream():
+    from stegodng.digests import opcode_list_fingerprint
+    from stegodng.opcodes import build_opcode_list2, parse_opcode_list2
+
+    gains = np.linspace(1.0, 2.0, 4 * 30 * 40).reshape(4, 30, 40)
+    blob = build_opcode_list2(300, 200, gains=gains)
+    stream = opcode_list_fingerprint(blob)
+    maps = parse_opcode_list2(blob)
+    expected = bytearray(struct.pack("<I", 4))
+    for gain_map in maps:
+        params = struct.pack(
+            "<10I4dI", gain_map.top, gain_map.left,
+            gain_map.bottom, gain_map.right, gain_map.plane,
+            gain_map.planes, gain_map.row_pitch, gain_map.col_pitch,
+            gain_map.points_v, gain_map.points_h, gain_map.spacing_v,
+            gain_map.spacing_h, gain_map.origin_v, gain_map.origin_h,
+            gain_map.map_planes) + gain_map.gains.astype("<f4").tobytes()
+        expected += struct.pack("<III", 9, 0x01030000, 0)
+        expected += struct.pack("<I", len(params)) + params
+    assert stream == bytes(expected)
+    # An empty opcode list contributes nothing to the unique ID.
+    assert opcode_list_fingerprint(b"\x00\x00\x00\x00") == b""
+    with pytest.raises(ValueError):
+        opcode_list_fingerprint(b"\x00\x00")
+    # Non-GainMap opcodes have no fingerprint rule; the UID cannot be
+    # derived for them, so the encode must fail loudly instead of
+    # writing a tag that no SDK would reproduce.
+    with pytest.raises(ValueError, match="no fingerprint rule"):
+        opcode_list_fingerprint(struct.pack(">IIIII", 1, 7, 0x01040000, 0, 0))
+
+
+def test_raw_data_unique_id_composition():
+    import hashlib
+    from stegodng.digests import (
+        opcode_list_fingerprint,
+        raw_data_unique_id,
+    )
+    from stegodng.opcodes import build_opcode_list2
+
+    digest = bytes(range(16))
+    crop_size = ((4032, 1), (3020, 1))
+    crop_origin = ((8, 1), (8, 1))
+    user_crop = ((0, 1), (0, 1), (1, 1), (1, 1))
+    opcode2 = build_opcode_list2(64, 48, seed=1)
+    uid = raw_data_unique_id(digest, "Google Pixel XL", crop_size,
+                             crop_origin, user_crop, (None, opcode2, None))
+    expected = hashlib.md5()
+    expected.update(digest)
+    expected.update(b"Google Pixel XL")
+    for pair in crop_size + crop_origin + user_crop:
+        expected.update(struct.pack("<II", *pair))
+    expected.update(opcode_list_fingerprint(opcode2))
+    assert uid == expected.digest()
+    assert len(uid) == 16
+
+    # Model, crop and opcode metadata are all part of the identity.
+    assert raw_data_unique_id(
+        digest, "Pixel XL", crop_size, crop_origin) != uid
+    assert raw_data_unique_id(
+        digest, "Google Pixel XL", ((4032, 1), (3020, 1)), ((0, 1), (0, 1))
+    ) != uid
+    assert raw_data_unique_id(
+        digest, "Google Pixel XL", crop_size, crop_origin,
+        opcode_lists=(None, build_opcode_list2(64, 48, seed=2), None),
+    ) != uid
+
+    with pytest.raises(ValueError):
+        raw_data_unique_id(b"short", "Google Pixel XL", crop_size,
+                           crop_origin)
+
+
+def test_makernote_config_and_generation():
+    from stegodng.makernote import MakernoteConfig
+
+    config = MakernoteConfig.from_dict({
+        "magic": "HDRP",
+        "prefix_hex": "02ef64356d5e701e2ceae3",
+        "length": [2640, 2757],
+    })
+    assert config.to_dict()["length"] == [2640, 2757]
+    first = config.generate(5)
+    assert first == config.generate(5)
+    assert first != config.generate(6)
+    assert first.startswith(b"HDRP\x02\xef\x64\x35\x6d\x5e\x70\x1e\x2c\xea\xe3")
+    low, high = config.length
+    assert all(low <= len(config.generate(seed)) <= high
+               for seed in range(12))
+    # Different seeds produce different tails, not just different lengths.
+    assert config.generate(1)[20:] != config.generate(2)[20:]
+
+    with pytest.raises(ValueError):
+        MakernoteConfig(length=(10, 5))
+    with pytest.raises(ValueError):
+        MakernoteConfig(prefix=b"x" * 40, length=(8, 16))
+    with pytest.raises(ValueError):
+        MakernoteConfig(prefix="not-hex")
+    with pytest.raises(ValueError):
+        MakernoteConfig.from_dict({"length": 5})
+
+
+def test_fidelity_makernote_digests_and_tag_conventions(tmp_path):
+    import hashlib
+    import tifffile
+    from stegodng.container import read_exif_tags
+    from stegodng.digests import (
+        new_raw_image_digest,
+        raw_data_unique_id,
+    )
+    from stegodng.profiles import get_profile
+
+    p = get_profile("custom_pixel_xl")
+    fidelity = p.fidelity
+    assert fidelity.tag_conventions == "adobe"
+    assert fidelity.raw_digests and fidelity.makernote is not None
+    out = str(tmp_path / "adobe.dng")
+    payload = b"digest payload" * 20
+    stego_dng.encode(
+        payload, out, width=256, height=192, seed=5, mode="cfa",
+        lsb_planes=4, thumbnail="synthetic", profile=p,
+        level_policy="strict",
+    )
+    assert stego_dng.decode(out) == payload
+
+    with tifffile.TiffFile(out) as tif:
+        ifd0 = tif.pages[0]
+        tags = ifd0.tags
+        # Tag inventory of an Adobe re-wrap, not of the TIFF writer.
+        for dropped in (282, 283, 296):
+            assert dropped not in tags
+        assert tags[529].value == (299, 1000, 587, 1000, 114, 1000)
+        assert tags[531].value == (1,)
+        assert tags[50741].value == 1
+        assert tags[330].dtype == 4  # LONG, not IFD
+        assert tags[278].value == tags[257].value  # full-height preview strip
+        stored_digest = bytes(tags[51111].value)
+        stored_uid = bytes(tags[50781].value)
+        raw_page = next(
+            page for series in tif.series for page in series.pages
+            if page.photometric == 32803)
+        for dropped in (282, 283, 296):
+            assert dropped not in raw_page.tags
+        assert raw_page.tags[284].value == 1
+        assert raw_page.tags[50710].dtype == 1  # BYTE CFAPlaneColor
+        raw = raw_page.asarray()
+        crop_size = tuple(raw_page.tags[50720].value)
+        crop_origin = tuple(raw_page.tags[50719].value)
+        user_crop = tuple(raw_page.tags[51125].value)
+        opcode2 = bytes(raw_page.tags[51009].value)
+
+    digest = new_raw_image_digest(raw)
+    assert stored_digest == digest
+    uid = raw_data_unique_id(
+        digest, "Google Pixel XL",
+        crop_size=(crop_size[:2], crop_size[2:]),
+        crop_origin=(crop_origin[:2], crop_origin[2:]),
+        user_crop=tuple(user_crop[i:i + 2] for i in range(0, 8, 2)),
+        opcode_lists=(None, opcode2, None),
+    )
+    assert stored_uid == uid
+
+    exif = read_exif_tags(out)
+    makernote = exif[37500][2]
+    assert makernote.startswith(b"HDRP")
+    low, high = fidelity.makernote.length
+    assert low <= len(makernote) <= high
+    assert makernote == fidelity.makernote.generate(5)
+    # Full EXIF sub-second fraction, like the reference files.
+    subsec = exif[37520][2].rstrip(b"\x00").decode("ascii")
+    assert len(subsec) == 6 and subsec.isdigit()
+    assert hashlib.md5(raw.tobytes()).digest() != digest
+
+
+def test_fidelity_multi_frame_omits_digests(tmp_path):
+    import tifffile
+    from stegodng.profiles import get_profile
+
+    p = get_profile("custom_pixel_xl")
+    out = str(tmp_path / "frames.dng")
+    stego_dng.encode(
+        b"two frames", out, width=256, height=192, seed=6, mode="cfa",
+        lsb_planes=2, thumbnail="synthetic", profile=p, frames=2,
+        level_policy="strict",
+    )
+    with tifffile.TiffFile(out) as tif:
+        tags = tif.pages[0].tags
+        assert 51111 not in tags and 50781 not in tags
+
+
+def test_fidelity_split_chunks_keep_makernote_and_digests(tmp_path):
+    import glob
+    import tifffile
+    from stegodng import DngStego
+    from stegodng.container import read_exif_tags
+    from stegodng.profiles import get_profile
+
+    p = get_profile("custom_pixel_xl")
+    payload = os.urandom(9000)
+    infos = DngStego(p, level_policy="strict").encode_split(
+        payload, str(tmp_path / "chunks.dng"), 4000, width=256, height=192,
+        seed=3, mode="cfa", lsb_planes=4, thumbnail="synthetic",
+    )
+    assert len(infos) == 3
+    files = sorted(glob.glob(str(tmp_path / "chunks0*.dng")))
+    assert len(files) == 3
+    for path in files:
+        exif = read_exif_tags(path)
+        assert exif is not None and 37500 in exif
+        assert exif[37500][2].startswith(b"HDRP")
+        with tifffile.TiffFile(path) as tif:
+            tags = tif.pages[0].tags
+            assert 50741 in tags
+            assert 51111 in tags and 50781 in tags
+    assert DngStego().decode(files) == payload
+
+
+def test_adobe_conventions_keep_bigtiff_subifds(tmp_path):
+    import numpy as np
+    import tifffile
+    from stegodng.container import DngContainer
+    from stegodng.stego import DngStego
+
+    path = str(tmp_path / "big.dng")
+    plane = np.zeros((32, 32), dtype=np.uint16)
+    with tifffile.TiffWriter(path, bigtiff=True) as tif:
+        tif.write(plane, photometric="cfa", subifds=2, metadata=None)
+        tif.write(plane + 1, photometric="cfa", subfiletype=0, metadata=None)
+        tif.write(plane + 2, photometric="cfa", subfiletype=0, metadata=None)
+    container = DngContainer(path)
+    offsets = container.subifd_offsets()
+    assert len(offsets) == 2
+    DngStego._apply_adobe_tag_conventions(container)
+    # IFD8 stays IFD8: retyping 64-bit offsets to LONG would corrupt them.
+    assert container.subifd_offsets() == offsets
+    with tifffile.TiffFile(path) as tif:
+        assert tif.is_bigtiff
+        assert tif.pages[0].tags[330].dtype == 18
+        assert tif.series[0].shape[:1] == (3,)  # both SubIFDs still linked
+
+
+def test_fidelity_linear_digests_cover_all_planes(tmp_path):
+    import tifffile
+    from stegodng.container import DngContainer, read_ifd
+    from stegodng.digests import new_raw_image_digest, raw_data_unique_id
+    from stegodng.profiles import get_profile
+
+    p = get_profile("custom_pixel_xl")
+    out = str(tmp_path / "linear.dng")
+    stego_dng.encode(
+        b"three planes", out, width=256, height=192, seed=2, mode="linear",
+        lsb_planes=2, thumbnail="synthetic", profile=p,
+    )
+    with tifffile.TiffFile(out) as tif:
+        raw_page = next(
+            page for series in tif.series for page in series.pages
+            if page.photometric == 34892)
+        raw = raw_page.asarray()
+        digest = new_raw_image_digest(raw)
+        assert bytes(tif.pages[0].tags[51111].value) == digest
+        stored_uid = bytes(tif.pages[0].tags[50781].value)
+        # Linear raws declare the full frame, not the Pixel crop margin.
+        assert raw_page.tags[50720].value == (256, 1, 192, 1)
+        assert raw_page.tags[50719].value == (0, 1, 0, 1)
+        assert 51125 not in raw_page.tags
+        opcode3 = bytes(raw_page.tags[51022].value)
+    # tifffile already writes PlanarConfiguration for 3-sample pages; the
+    # Adobe patch must not add a second 284 (or any duplicate tag).
+    codes = [tag for tag, _t, _c, _v in
+             read_ifd(out, DngContainer(out).subifd_offsets()[0])]
+    assert codes.count(284) == 1
+    assert len(codes) == len(set(codes))
+    uid = raw_data_unique_id(
+        digest, "Google Pixel XL",
+        crop_size=((256, 1), (192, 1)),
+        crop_origin=((0, 1), (0, 1)),
+        opcode_lists=(None, None, opcode3),
+    )
+    assert stored_uid == uid
 
 
 def test_custom_profile_assets_and_package_data():

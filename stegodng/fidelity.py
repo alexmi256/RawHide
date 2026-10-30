@@ -12,6 +12,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .makernote import MakernoteConfig
+
+# Tag-set conventions seen in files re-wrapped by Adobe software.  They
+# are opt-in because they change the tag inventory of the written file.
+TAG_CONVENTIONS = ("adobe",)
+
 
 def _pair(value: Any, name: str, *, positive: bool = False) -> tuple[int, int]:
     if (not isinstance(value, (list, tuple)) or len(value) != 2):
@@ -28,10 +34,22 @@ def _ranges(value: Any, name: str, *, count: int = 2) -> tuple[int, ...]:
     return tuple(int(v) for v in value)
 
 
+def _int_pair(value: Any, name: str) -> tuple[int, int]:
+    """Two-item integer list/tuple (typed as a pair for the dataclass)."""
+    low, high = _ranges(value, name)
+    return (low, high)
+
+
 def _floats(value: Any, name: str, *, count: int = 2) -> tuple[float, ...]:
     if not isinstance(value, (list, tuple)) or len(value) != count:
         raise ValueError(f"{name} must have {count} values")
     return tuple(float(v) for v in value)
+
+
+def _float_pair(value: Any, name: str) -> tuple[float, float]:
+    """Two-item float list/tuple (typed as a pair for the dataclass)."""
+    low, high = _floats(value, name)
+    return (low, high)
 
 
 def _rationals(value: Any, name: str) -> tuple[tuple[int, int], ...]:
@@ -105,6 +123,10 @@ class FidelityConfig:
     emit_serials: bool = True
     emit_gps: bool = False
     exif_allow: tuple[int, ...] | None = None
+    tag_conventions: str | None = None   # "adobe" -> Adobe writer tag set
+    raw_digests: bool = False            # NewRawImageDigest + RawDataUniqueID
+    makernote: MakernoteConfig | None = None
+    subsec_digits: int = 2               # EXIF SubSecTime fractional digits
 
     # Raw IFD
     tile: tuple[int, int] | None = None
@@ -156,14 +178,16 @@ class FidelityConfig:
         if suggested_mode is not None and suggested_mode not in ("linear", "cfa"):
             raise ValueError("suggested_mode must be linear or cfa")
         asn = data.get("as_shot_neutral") or {}
-        asn_r = _ranges(asn.get("r"), "as_shot_neutral.r") if asn.get("r") else None
-        asn_b = _ranges(asn.get("b"), "as_shot_neutral.b") if asn.get("b") else None
+        asn_r = (_int_pair(asn["r"], "as_shot_neutral.r")
+                 if asn.get("r") else None)
+        asn_b = (_int_pair(asn["b"], "as_shot_neutral.b")
+                 if asn.get("b") else None)
         for name, pair in (("as_shot_neutral.r", asn_r),
                            ("as_shot_neutral.b", asn_b)):
             if pair and not (0 < pair[0] <= pair[1] <= 10000):
                 raise ValueError(f"{name} must be 0 < low <= high <= 10000")
         baseline = data.get("baseline_exposure")
-        baseline_pair = (_ranges(baseline, "baseline_exposure")
+        baseline_pair = (_int_pair(baseline, "baseline_exposure")
                          if baseline is not None else None)
         if baseline_pair and not (-10000 <= baseline_pair[0]
                                   <= baseline_pair[1] <= 10000):
@@ -188,6 +212,23 @@ class FidelityConfig:
                       if allow is not None else None)
         exposure_bias = tuple(int(v) for v in tags.get("exposure_bias", ()))
         flash = int(tags["flash"]) if tags.get("flash") is not None else None
+
+        conventions = data.get("tag_conventions")
+        if conventions is not None and conventions not in TAG_CONVENTIONS:
+            raise ValueError(
+                f"tag_conventions must be one of {TAG_CONVENTIONS}")
+        raw_digests = bool(data.get("raw_digests", False))
+        makernote_data = data.get("makernote")
+        makernote = (MakernoteConfig.from_dict(makernote_data)
+                     if makernote_data else None)
+        subsec_digits = data.get("subsec_digits")
+        if subsec_digits is None:
+            # Adobe/re-wrapped files keep the full EXIF sub-second
+            # fraction (6 digits); the legacy writer used 2.
+            subsec_digits = 6 if conventions == "adobe" else 2
+        subsec_digits = int(subsec_digits)
+        if not (1 <= subsec_digits <= 9):
+            raise ValueError("subsec_digits must be 1..9")
 
         raw = data.get("raw") or {}
         tile = _pair(raw.get("tile"), "raw.tile", positive=True) \
@@ -220,9 +261,9 @@ class FidelityConfig:
         prefer = bool(geom.get("prefer_native", False))
 
         noise = data.get("noise") or {}
-        noise_s = (_floats(noise.get("s"), "noise.s")
+        noise_s = (_float_pair(noise["s"], "noise.s")
                    if noise.get("s") else None)
-        noise_o = (_floats(noise.get("o"), "noise.o")
+        noise_o = (_float_pair(noise["o"], "noise.o")
                    if noise.get("o") else None)
         for name, pair in (("noise.s", noise_s), ("noise.o", noise_o)):
             if pair and not (0 < pair[0] <= pair[1]):
@@ -283,7 +324,8 @@ class FidelityConfig:
             preview_size=preview_size,
             orientations=orientations,
             software_variants=variants,
-            date_range=tuple(str(v) for v in date_range) if date_range else None,
+            date_range=((str(date_range[0]), str(date_range[1]))
+                        if date_range else None),
             date_window_days=window,
             suggested_mode=suggested_mode,
             asn_r=asn_r, asn_b=asn_b,
@@ -293,6 +335,10 @@ class FidelityConfig:
             exposure_bias=exposure_bias,
             flash=flash,
             exif_allow=exif_allow,
+            tag_conventions=conventions,
+            raw_digests=raw_digests,
+            makernote=makernote,
+            subsec_digits=subsec_digits,
             tile=tile, black_levels=black, white_level=white,
             max_planes=max_planes, level_policy=policy,
             crop_margin=margin, bayer_green_split=green,

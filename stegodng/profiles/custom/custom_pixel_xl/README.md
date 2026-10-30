@@ -115,8 +115,83 @@ Raw SubIFD:
   geometry
 - OpcodeList2 is generated per file (four GainMaps, see below), so no
   OpcodeList3 is written
+- `NewRawImageDigest` + `RawDataUniqueID`, the `HDRP` MakerNote with
+  `MakerNoteSafety 1`, and the Adobe tag set (see below)
 - Preview 676x506, `CFAPattern` BYTE BGGR, `BayerGreenSplit` 500,
   `ActiveArea` and an 8 px crop margin around `4032x3020`, 256x256 tiles
+
+The IFD0 inventory is now exactly the sample set: `254 256 257 258 259
+262 271 272 273 274 277 278 279 284 305 306 330 529 530 531 532 34665
+34853 50706 50707 50708 50721 50722 50727 50728 50730 50731 50732 50734
+50739 50741 50778 50779 50781 50932 50936 50937 50938 50939 50941 50942
+50964 50965 50981 50982 51041 51111`, and the raw SubIFD matches too.
+
+## Adobe tag conventions (`fidelity.tag_conventions: "adobe"`)
+
+The TIFF writer used below tifffile's defaults, which differ from what
+Adobe software emits.  The profile now switches them off or on:
+
+- `XResolution` (282), `YResolution` (283) and `ResolutionUnit` (296) are
+  removed from IFD0 and the raw SubIFD after writing (the reference
+  files carry none of them)
+- `YCbCrCoefficients` (529, 299/1000 587/1000 114/1000) and
+  `YCbCrPositioning` (531, centered) are added to the preview IFD
+- the raw SubIFD gains `PlanarConfiguration` (284, chunky), which
+  tifffile only writes for multi-sample pages
+- `CFAPlaneColor` (50710) is written as BYTE, like the samples
+- `SubIFDs` (330) is retyped from TIFF IFD (13) to LONG (4)
+- `RowsPerStrip` (278) is the full preview height (`506`), not the TIFF
+  writer's MCU-rounded 512
+- `SubSecTime*` carry the full six-digit EXIF fraction (`153489`), not
+  the two-digit legacy value
+- `AnalogBalance` (1000000/1000000), `AsShotNeutral` (/1000000),
+  `BaselineExposure` (hundredths of a stop) and `ShadowScale` (1/1) use
+  Adobe's denominators instead of the writer's 1e4/100 defaults
+
+The entry block is compacted in place (`DngContainer.drop_ifd_tags` /
+`rewrite_ifd_entries`), so no offsets move and the raw tiles are
+untouched.
+
+## Raw image digests (`fidelity.raw_digests: true`)
+
+Both tags reproduce the sample values byte-for-byte (verified with
+`tools/digests.py verify` against all six files):
+
+- `NewRawImageDigest` (51111) is the DNG SDK "fast" digest: MD5 over the
+  concatenated MD5s of 256x256 tiles (row-major, edge tiles truncated,
+  little-endian 16-bit samples).  It is *not* MD5 of the whole raster.
+- `RawDataUniqueID` (50781) follows `dng_negative::FindRawDataUniqueID`:
+  MD5 over the new digest, `UniqueCameraModel` (`Google Pixel XL`, not
+  the IFD0 Model), `DefaultCropSize`/`DefaultCropOrigin`/`DefaultUserCrop`
+  rationals, and `FingerprintToStream` of OpcodeList2 (header fields plus
+  the gain table, host/little-endian).  The gain-map fingerprint is what
+  the SDK re-serializes, not the raw tag bytes.
+
+Both values are computed from the finished raw frame, so they stay valid
+after LSB embedding.  Multi-frame encodes (`--raw-frames 2+`) omit them:
+one digest describes one raw image.
+
+## MakerNote (`fidelity.makernote`)
+
+Every sample carries `Exif.Photo.MakerNote` (2640-2757 bytes) starting
+with `HDRP` + `02 ef` + nine constant bytes.  The tail is per-file
+high-entropy data (7.94 bits/byte, all 256 byte values, no strings, and
+two files XOR to noise), i.e. Google's HDR+ processing metadata; it is
+not derivable from anything else in the file and no public parser decodes
+it.
+
+The writer therefore reproduces the envelope only: the constant 15-byte
+prefix (`48 44 52 50 02 ef 64 35 6d 5e 70 1e 2c ea e3`) followed by
+seeded pseudo-random bytes, at a length drawn from 2640-2757 bytes.  The
+same seed reproduces the same blob; different seeds differ in length and
+content.  `MakerNoteSafety` (50741, "Safe") marks it copyable, as in the
+samples.  The profile must also list `37500` in
+`fidelity.tags.exif_allow`, otherwise the EXIF builder filters it out.
+
+What an inspector would see: a correctly sized, correctly prefixed
+MakerNote on every file.  What they would not see: a decodable HDR+
+payload.  An ExifTool dump only shows the opaque blob, but a byte-level
+comparison with a genuine Pixel file would expose the difference.
 
 ## GainMap / OpcodeList2
 
@@ -146,6 +221,7 @@ validator are `parse_opcode_list2` / `validate_opcode_list2`.
   +0.13…+0.94 EV; ExposureBias 0; Flash “No, compulsory”
 - SubjectDistance/SubjectDistanceRange chosen as a consistent pair
 - GPS: seeded plausible coordinates, altitude, DOP, timestamp and date
+- MakerNote length (2640-2757) and payload bytes
 - No OffsetTime*, no MeteringMode/ExposureProgram, no camera/body/lens
   serials, no lens tags, no XMP packet
 - The CLI defaults this profile to `--mode cfa` via
@@ -165,6 +241,13 @@ Reproduced by the current writer:
   CalibrationIlluminants, and the full Adobe profile block
   (`ForwardMatrix1/2`, `ProfileName`, signature, copyright, embed policy,
   `ProfileHueSatMapData1/2`, `ProfileLookTableData`, `NoiseProfile`)
+- The complete IFD0/SubIFD tag inventory of the samples (no
+  X/YResolution, no ResolutionUnit, Adobe's YCbCr pair, SubIFD
+  `PlanarConfiguration`, BYTE `CFAPlaneColor`, LONG `SubIFDs`)
+- `NewRawImageDigest` and `RawDataUniqueID` identical to the values a
+  DNG SDK-based writer produces for the same pixels and metadata
+- `HDRP` MakerNote at a realistic length plus `MakerNoteSafety`, and
+  six-digit `SubSecTime*`
 - 4048x3036 raw storage, 8 px crop margin to 4032x3020, `ActiveArea`,
   `DefaultUserCrop`, 256x256 tiles, BGGR `CFAPattern` (BYTE),
   `BayerGreenSplit`, per-channel BlackLevel; default capacity WhiteLevel
@@ -178,20 +261,20 @@ Reproduced by the current writer:
 Still different:
 
 - Raw compression is uncompressed, not lossless-JPEG (Compression 7)
-- The Google MakerNote and the raw digests are not emitted
+- The MakerNote payload is an opaque pseudo-random blob, not a real
+  HDR+ record (prefix, length and entropy match; content does not)
 - The preview is a thumbnail source, not a development of the raw scene
 - The raw pixels are a synthetic cover, not a real Pixel XL scene
 - `OpcodeList2` is generated, not copied byte-for-byte; its structure and
   gain range match, but the four 30 x 40 tables differ from any sample
-- `NewRawImageDigest`/`RawDataUniqueID` are absent
 - The default capacity policy claims WhiteLevel 65535 / 16-bit data,
   unlike the real 14-bit files; use `--level-policy strict` for 16368
   and at most 13 planes
 
-The Google MakerNote and the per-file raw digests cannot be a single
-static profile blob because they differ in every sample. `OpcodeList2` is
-the exception: its header is static and only the gain tables vary, so a
-base grid plus per-file jitter reproduces it.
+The MakerNote cannot be a static profile blob because it differs in
+every sample; the writer reproduces its envelope instead (see above).
+`OpcodeList2` is the exception: its header is static and only the gain
+tables vary, so a base grid plus per-file jitter reproduces it.
 
 ## Plausible-deniability notes
 

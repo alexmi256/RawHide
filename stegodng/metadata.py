@@ -92,6 +92,7 @@ class MetadataRandomizer:
                        if fidelity and fidelity.flash is not None else 0)
         self._noise_s = fidelity.noise_s if fidelity else None
         self._noise_o = fidelity.noise_o if fidelity else None
+        self._subsec_digits = fidelity.subsec_digits if fidelity else 2
         self._lens_make_default = (profile.make if profile is not None
                                    else "FUJIFILM")
         # Serial pools: the reference profile keeps its legacy hardcoded
@@ -224,7 +225,8 @@ class MetadataRandomizer:
             "brightness": (rng.randint(100, 600), 100),
             "exposure_bias": (rng.choice(self._exposure_bias), 100),
             "flash": self._flash,
-            "subsec": f"{rng.randint(0, 99):02d}",
+            "subsec": str(rng.randint(
+                0, 10 ** self._subsec_digits - 1)).zfill(self._subsec_digits),
             "offset": rng.choice(["+08:00", "+09:00", "+01:00", "+02:00", "-05:00"]),
         }
 
