@@ -5,6 +5,7 @@ wrappers preserve the original single-file API.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import itertools
 import os
 import random
@@ -474,7 +475,8 @@ class DngStego:
                        seed: int | None, key: bytes | None,
                        lsb_planes: int, bit_depth: int, mode: str,
                        compression: str, no_randomize: bool, frames: int,
-                       thumbnail: str) -> dict:
+                       thumbnail: str,
+                       image_time: _dt.datetime | None = None) -> dict:
         """The resolved encode knobs recorded in the debug sidecar."""
         return {
             "width": width,
@@ -488,6 +490,8 @@ class DngStego:
             "no_randomize": no_randomize,
             "frames": frames,
             "thumbnail": thumbnail,
+            "image_time": (image_time.isoformat(timespec="seconds")
+                           if image_time is not None else None),
             "camera_profile": self.profile.slug,
             "camera_profile_name": (self.profile.display_name
                                     or self.profile.model),
@@ -535,6 +539,7 @@ class DngStego:
         progress: bool | None = None,
         debug_metadata: bool = False,
         debug_context: dict | None = None,
+        image_time: _dt.datetime | None = None,
     ) -> dict:
         """Embed `payload` into a new DNG file. Returns info dict.
 
@@ -548,6 +553,10 @@ class DngStego:
         the returned dict). ``debug_context`` is optional provenance
         (e.g. the CLI input path) merged into that document; never put
         secrets such as the passphrase in it.
+
+        ``image_time`` pins the EXIF capture time (local wall clock) and
+        the matching UTC offset instead of randomizing it; ``None`` keeps
+        the default seeded random timestamp.
         """
         self._validate_options(bit_depth, lsb_planes, frames, mode,
                                compression)
@@ -557,7 +566,8 @@ class DngStego:
             # Unseeded run: draw a concrete seed so the debug sidecar can
             # record (and reproduce) the metadata randomization.
             metadata_seed = random.randrange(1 << 30)
-        meta = MetadataRandomizer(metadata_seed, self.profile).randomize()
+        meta = MetadataRandomizer(metadata_seed, self.profile).randomize(
+            image_time=image_time)
         if seed is None:
             seed = 0
 
@@ -609,7 +619,8 @@ class DngStego:
                     width=width, height=height, seed=requested_seed, key=key,
                     lsb_planes=lsb_planes, bit_depth=bit_depth, mode=mode,
                     compression=compression, no_randomize=no_randomize,
-                    frames=frames, thumbnail=thumbnail),
+                    frames=frames, thumbnail=thumbnail,
+                    image_time=image_time),
                 meta=meta, thumbnail_requested=thumbnail,
                 thumbnail_label=thumb_label, thumbnail_rgb=thumb,
                 stegos=stegos, cover_seed=seed,
@@ -685,6 +696,7 @@ class DngStego:
         progress: bool | None = None,
         debug_metadata: bool = False,
         debug_context: dict | None = None,
+        image_time: _dt.datetime | None = None,
     ) -> list[dict]:
         """Split `payload` into ≤`split_size`-byte chunks across DNG files.
 
@@ -699,6 +711,9 @@ class DngStego:
         ``debug_metadata`` writes one JSON sidecar per chunk (see
         :meth:`encode`); each document records its own chunk number,
         chunk-set UUID and per-chunk metadata.
+
+        ``image_time`` applies the same pinned capture time to every
+        chunk, so a split set shares one timestamp.
         """
         if isinstance(split_size, bool) or not isinstance(split_size, int) \
                 or split_size <= 0:
@@ -730,7 +745,7 @@ class DngStego:
                 no_randomize=no_randomize, frames=frames,
                 thumbnail=thumbnail, progress=progress,
                 debug_metadata=debug_metadata,
-                debug_context=debug_context,
+                debug_context=debug_context, image_time=image_time,
             )]
         ifd0_dummies = ((id_spec is not None and id_spec["ifd"] == "ifd0")
                         + (seq_spec is not None and seq_spec["ifd"] == "ifd0"))
@@ -752,7 +767,8 @@ class DngStego:
                     cseed = random.randrange(1 << 30)
                 else:
                     cseed = (0 if seed is None else seed) + seq - 1
-                meta = MetadataRandomizer(cseed, self.profile).randomize()
+                meta = MetadataRandomizer(cseed, self.profile).randomize(
+                    image_time=image_time)
                 split_exif: dict[int, Any] = {}
                 if id_spec is not None and id_spec["ifd"] == "exif":
                     split_exif[id_spec["tag"]] = uid
@@ -825,7 +841,7 @@ class DngStego:
                             lsb_planes=lsb_planes, bit_depth=bit_depth,
                             mode=mode, compression=compression,
                             no_randomize=no_randomize, frames=frames,
-                            thumbnail=thumbnail),
+                            thumbnail=thumbnail, image_time=image_time),
                         meta=meta, thumbnail_requested=thumbnail,
                         thumbnail_label=thumb_label, thumbnail_rgb=thumb,
                         stegos=stegos, cover_seed=cs,
@@ -1209,6 +1225,7 @@ def encode(
     level_policy: str = "profile",
     debug_metadata: bool = False,
     debug_context: dict | None = None,
+    image_time: _dt.datetime | None = None,
 ) -> dict:
     """Backwards-compatible wrapper (see :meth:`DngStego.encode`)."""
     stego = (_DEFAULT if profile is None
@@ -1219,6 +1236,7 @@ def encode(
         compression=compression, no_randomize=no_randomize, frames=frames,
         thumbnail=thumbnail, progress=progress,
         debug_metadata=debug_metadata, debug_context=debug_context,
+        image_time=image_time,
     )
 
 
@@ -1261,6 +1279,7 @@ def encode_split(
     level_policy: str = "profile",
     debug_metadata: bool = False,
     debug_context: dict | None = None,
+    image_time: _dt.datetime | None = None,
 ) -> list[dict]:
     """Backwards-compatible wrapper (see :meth:`DngStego.encode_split`)."""
     stego = (_DEFAULT if profile is None
@@ -1272,7 +1291,7 @@ def encode_split(
         frames=frames, thumbnail=thumbnail, split_id=split_id,
         split_id_field=split_id_field, split_seq_field=split_seq_field,
         progress=progress, debug_metadata=debug_metadata,
-        debug_context=debug_context)
+        debug_context=debug_context, image_time=image_time)
 
 
 def generate_tiff(

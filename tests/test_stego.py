@@ -114,6 +114,180 @@ def test_metadata_differs_per_seed(tmp_path):
     assert ia["metadata"]["camera_serial"] != ib["metadata"]["camera_serial"]
 
 
+def test_image_time_pins_capture_metadata(tmp_path):
+    import datetime as dt
+    from stegodng.filetime import normalize_image_time
+    from stegodng.metadata import MetadataRandomizer
+    from stegodng.profiles import get_profile
+
+    when = dt.datetime(2024, 5, 6, 7, 8, 9)
+    local, offset = normalize_image_time(when)
+    out = str(tmp_path / "pinned.dng")
+    info = stego_dng.encode(
+        b"pinned time", out, width=256, height=192, seed=3,
+        thumbnail="synthetic", image_time=when)
+    assert info["metadata"]["datetime"] == local.strftime("%Y:%m:%d %H:%M:%S")
+    assert info["metadata"]["offset"] == offset
+    tags = stego_dng.read_exif_tags(out)
+    for tag in (36867, 36868):  # DateTimeOriginal / DateTimeDigitized
+        assert tags[tag][2].rstrip(b"\x00").decode() == (
+            local.strftime("%Y:%m:%d %H:%M:%S"))
+    for tag in (36880, 36881, 36882):  # OffsetTime*
+        assert tags[tag][2].rstrip(b"\x00").decode() == offset
+
+    # An explicit time wins over a fidelity date window, and GPS carries
+    # the same moment in UTC instead of a second random one.
+    meta = MetadataRandomizer(4, get_profile("custom_pixel_xl")).randomize(
+        image_time=when)
+    assert meta["datetime"] == local.strftime("%Y:%m:%d %H:%M:%S")
+    gps_utc = when.astimezone(dt.timezone.utc)
+    assert meta["gps"]["date"] == gps_utc.strftime("%Y:%m:%d")
+    assert meta["gps"]["time"] == (
+        gps_utc.hour, gps_utc.minute, gps_utc.second)
+
+
+def test_default_metadata_stream_matches_reference():
+    from stegodng.metadata import MetadataRandomizer
+    from stegodng.profiles import get_profile
+
+    meta = MetadataRandomizer(12345).randomize()
+    assert (
+        meta["exposure_program"], meta["metering"], meta["image_number"],
+        meta["sequence"], meta["brightness"], meta["exposure_bias"],
+        meta["subsec"], meta["offset"],
+    ) == (1, 2, 45769, 5, (112, 100), (-33, 100), "43", "+08:00")
+    gps = MetadataRandomizer(456, get_profile("custom_pixel_xl")).randomize()[
+        "gps"]
+    assert (
+        gps["lat_ref"], gps["lat"], gps["lon_ref"], gps["lon"],
+        gps["altitude_mm"], gps["dop"],
+    ) == ("S", (62, 48, (241008, 32768)), "E",
+          (21, 30, (1459141, 32768)), 137950, 8032)
+
+
+def test_image_time_keeps_seeded_non_time_fields():
+    import datetime as dt
+    from stegodng.metadata import MetadataRandomizer
+
+    when = dt.datetime(2024, 5, 6, 7, 8, 9)
+    free = MetadataRandomizer(12345).randomize()
+    pinned = MetadataRandomizer(12345).randomize(image_time=when)
+    for key in free:
+        if key in ("datetime", "offset", "gps"):
+            continue
+        assert pinned[key] == free[key], key
+    assert pinned["datetime"] == "2024:05:06 07:08:09"
+
+
+def test_image_time_applies_to_split_chunks(tmp_path):
+    import datetime as dt
+
+    when = dt.datetime(2023, 12, 31, 23, 59, 58)
+    expected = when.strftime("%Y:%m:%d %H:%M:%S")
+    infos = stego_dng.encode_split(
+        os.urandom(50000), str(tmp_path / "split.dng"), 20000,
+        width=512, height=384, seed=5, thumbnail="synthetic",
+        image_time=when)
+    assert len(infos) == 3
+    assert all(info["metadata"]["datetime"] == expected for info in infos)
+
+
+def test_filetime_resolution_sources(tmp_path):
+    import datetime as dt
+    from stegodng import filetime
+
+    src = tmp_path / "in.bin"
+    src.write_bytes(b"time")
+    known = 1_700_000_000
+    os.utime(src, (known, known))
+    assert filetime.resolve_image_time("random", str(src)) is None
+    assert filetime.file_modified_timestamp(str(src)) == pytest.approx(known)
+    assert filetime.resolve_image_time(
+        "input-modified", str(src)) == dt.datetime.fromtimestamp(known)
+    assert filetime.file_created_timestamp(str(src)) > 0
+    before = dt.datetime.now() - dt.timedelta(seconds=1)
+    now = filetime.resolve_image_time("now", str(src))
+    after = dt.datetime.now() + dt.timedelta(seconds=1)
+    assert before <= now <= after
+
+
+def test_file_created_falls_back_to_ctime(tmp_path, monkeypatch):
+    from stegodng import filetime
+
+    if not sys.platform.startswith("linux"):
+        pytest.skip("Linux statx/ctime fallback")
+    src = tmp_path / "in.bin"
+    src.write_bytes(b"time")
+    st = os.stat(src)
+    monkeypatch.setattr(filetime, "_linux_birth_timestamp",
+                        lambda path: None)
+    assert filetime.file_created_timestamp(str(src)) == pytest.approx(
+        st.st_ctime)
+
+
+def test_cli_image_time_now_and_created(tmp_path, monkeypatch):
+    import datetime as dt
+    import json
+    from stegodng import cli, filetime
+
+    src = tmp_path / "in.bin"
+    src.write_bytes(b"cli time")
+    before = dt.datetime.now().replace(microsecond=0)
+    assert cli.main([
+        "encode", "-i", str(src), "-o", str(tmp_path / "now.dng"),
+        "--width", "256", "--height", "192", "--seed", "6",
+        "--thumbnail", "synthetic", "--image-time", "now",
+        "--debug-metadata-output"]) == 0
+    after = dt.datetime.now().replace(microsecond=0)
+    doc = json.loads((tmp_path / "now.json").read_text(encoding="utf-8"))
+    when = dt.datetime.strptime(doc["metadata"]["datetime"],
+                                "%Y:%m:%d %H:%M:%S")
+    assert before <= when <= after
+    assert doc["invocation"]["image_time_source"] == "now"
+
+    known = 1_650_000_000
+    monkeypatch.setattr(filetime, "file_created_timestamp",
+                        lambda path: known)
+    assert cli.main([
+        "encode", "-i", str(src), "-o", str(tmp_path / "created.dng"),
+        "--width", "256", "--height", "192", "--seed", "6",
+        "--thumbnail", "synthetic", "--image-time", "input-created",
+        "--debug-metadata-output"]) == 0
+    doc = json.loads((tmp_path / "created.json").read_text(encoding="utf-8"))
+    expected = dt.datetime.fromtimestamp(known)
+    assert doc["metadata"]["datetime"] == expected.strftime(
+        "%Y:%m:%d %H:%M:%S")
+    assert doc["invocation"]["image_time_source"] == "input-created"
+
+
+def test_cli_image_time_modified_split(tmp_path):
+    import datetime as dt
+    import json
+
+    src = tmp_path / "in.bin"
+    src.write_bytes(os.urandom(50000))
+    known = 1_680_000_000
+    os.utime(src, (known, known))
+    r = subprocess.run(
+        [sys.executable, STEGO_SCRIPT, "encode", "-i", str(src),
+         "-o", str(tmp_path / "out.dng"), "--seed", "5",
+         "--width", "512", "--height", "384", "--thumbnail", "synthetic",
+         "--split-file", "20k", "--image-time", "input-modified",
+         "--debug-metadata-output"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    expected = dt.datetime.fromtimestamp(known).strftime("%Y:%m:%d %H:%M:%S")
+    sidecars = sorted(glob.glob(str(tmp_path / "in" / "out0*.json")))
+    assert len(sidecars) == 3
+    for path in sidecars:
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+        assert doc["metadata"]["datetime"] == expected
+        assert doc["invocation"]["image_time_source"] == "input-modified"
+        assert doc["encode"]["options"]["image_time"] == (
+            dt.datetime.fromtimestamp(known).isoformat(timespec="seconds"))
+
+
 def test_capacity():
     n = 1024 * 768 * 3
     assert stego_dng.capacity_bytes(n, 1) == n // 8 - stego_dng.HEADER_LEN

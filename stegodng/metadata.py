@@ -11,6 +11,8 @@ import datetime as _dt
 import math
 import random
 
+from .filetime import normalize_image_time, utc_image_time
+
 
 class MetadataRandomizer:
     # Plausible GF lenses: (model, min_focal_mm, max_focal_mm, max_aperture)
@@ -107,8 +109,15 @@ class MetadataRandomizer:
         body = "".join(rng.choice(alphabet) for _ in range(8 - len(prefix)))
         return prefix + body
 
-    def randomize(self) -> dict:
-        """Fresh metadata dict with identifiable fields randomized."""
+    def randomize(self, image_time: _dt.datetime | None = None) -> dict:
+        """Fresh metadata dict with identifiable fields randomized.
+
+        ``image_time`` pins the capture timestamp (DateTimeOriginal,
+        DateTimeDigitized, OffsetTime* and GPS date/time) instead of
+        drawing a random one; the remaining fields still come from the
+        seeded stream.  The RNG draw order is unchanged so a given seed
+        produces the same non-time metadata either way.
+        """
         rng = self._rng
         lens = rng.choice(self._lenses)
         # Profile lenses carry (model, min, max, aperture[, make]);
@@ -123,11 +132,18 @@ class MetadataRandomizer:
         if self._date_bounds:
             start, end = self._date_bounds
             span = max(1, int((end - start).total_seconds()))
-            base = start + _dt.timedelta(seconds=rng.randint(0, span))
+            random_base = start + _dt.timedelta(seconds=rng.randint(0, span))
         else:
-            base = _dt.datetime(2019, 1, 1) + _dt.timedelta(
+            random_base = _dt.datetime(2019, 1, 1) + _dt.timedelta(
                 seconds=rng.randint(0, 5 * 365 * 24 * 3600)
             )
+        if image_time is not None:
+            base, offset = normalize_image_time(image_time)
+            gps_base = utc_image_time(image_time)
+        else:
+            base = random_base
+            offset = None
+            gps_base = base
         dt = base.strftime("%Y:%m:%d %H:%M:%S")
         # Keep the historical RNG draw order for profiles without a
         # fidelity block: only draw these fields when the profile opts in.
@@ -160,16 +176,26 @@ class MetadataRandomizer:
                 return deg, minute, (sec, 32768)
             lat = _deg(89)
             lon = _deg(179)
+            lat_ref = rng.choice(("N", "S"))
+            lon_ref = rng.choice(("E", "W"))
+            altitude_mm = rng.randint(0, 500_000)
+            gps_hour = rng.randint(0, 23)
+            gps_minute = rng.randint(0, 59)
+            gps_second = rng.randint(0, 59)
+            dop = rng.randint(5_000, 20_000)
             gps = {
-                "lat_ref": rng.choice(("N", "S")),
+                "lat_ref": lat_ref,
                 "lat": (lat[0], lat[1], lat[2]),
-                "lon_ref": rng.choice(("E", "W")),
+                "lon_ref": lon_ref,
                 "lon": (lon[0], lon[1], lon[2]),
-                "altitude_mm": rng.randint(0, 500_000),
-                "time": (rng.randint(0, 23), rng.randint(0, 59),
-                         rng.randint(0, 59)),
-                "dop": rng.randint(5_000, 20_000),
-                "date": base.strftime("%Y:%m:%d"),
+                "altitude_mm": altitude_mm,
+                # GPSDateStamp/GPSTimeStamp are UTC; derive them from the
+                # pinned local capture time so the two IFDs agree.
+                "time": ((gps_base.hour, gps_base.minute, gps_base.second)
+                         if image_time is not None
+                         else (gps_hour, gps_minute, gps_second)),
+                "dop": dop,
+                "date": gps_base.strftime("%Y:%m:%d"),
             }
         noise_profile = None
         if self._noise_s and self._noise_o:
@@ -227,14 +253,17 @@ class MetadataRandomizer:
             "flash": self._flash,
             "subsec": str(rng.randint(
                 0, 10 ** self._subsec_digits - 1)).zfill(self._subsec_digits),
-            "offset": rng.choice(["+08:00", "+09:00", "+01:00", "+02:00", "-05:00"]),
+            "offset": (offset if image_time is not None
+                       else rng.choice(["+08:00", "+09:00", "+01:00",
+                                        "+02:00", "-05:00"])),
         }
 
 
 def randomize_metadata(seed: int | None = None,
-                       profile=None) -> dict:
+                       profile=None,
+                       image_time: _dt.datetime | None = None) -> dict:
     """Backwards-compatible wrapper: fresh randomized metadata dict."""
-    return MetadataRandomizer(seed, profile).randomize()
+    return MetadataRandomizer(seed, profile).randomize(image_time=image_time)
 
 
 # Module-level aliases for the choice pools (also re-exported by the
