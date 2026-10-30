@@ -5,7 +5,6 @@ Covers codec/container/cover/framing/profile/sizing/split/stego/
 thumbnails/shim edges plus in-process CLI (main) paths.
 """
 
-import io
 import os
 import struct
 import sys
@@ -264,7 +263,6 @@ def test_unpack_errors():
     with pytest.raises(ValueError, match="too short"):
         PayloadFrame.unpack(b"short", None)
     # Bad version: craft header with version 99, unkeyed.
-    import struct
     import zlib
     payload = b"abc"
     bad_ver = PayloadFrame.MAGIC + bytes((99, 0)) + struct.pack(">Q", 3) + struct.pack(">I", zlib.crc32(payload) & 0xFFFFFFFF) + payload
@@ -457,7 +455,6 @@ def test_write_split_tags_int_wrap(tmp_path):
 def test_decode_with_planes_capacity_error():
     from stegodng import DngStego
     # Header declaring a 1 GB payload on a tiny cover -> capacity error.
-    import struct
     import zlib
     pay_len = 1024 ** 3
     hdr = (PayloadFrame.MAGIC + bytes((1, 0)) + struct.pack(">Q", pay_len)
@@ -520,7 +517,6 @@ def test_decode_many_markers_error_wrapped(tmp_path, monkeypatch):
         payload, str(tmp_path / "m.dng"), 3000, width=256, height=192,
         seed=1, thumbnail="synthetic")
     files = [i["path"] for i in infos]
-    orig = C.DngContainer.split_markers
     def boom(self, id_field="ImageUniqueID", seq_field="ImageNumber"):
         raise ValueError("marker boom")
     monkeypatch.setattr(C.DngContainer, "split_markers", boom)
@@ -574,7 +570,6 @@ def test_order_by_markers_errors():
 
 
 def test_order_by_names_errors(tmp_path):
-    import glob
     from stegodng import DngStego
     from stegodng.stego import DngStego as DS
     # Mixed stems via none/none split then rename to different stems.
@@ -610,7 +605,7 @@ def test_order_by_names_errors(tmp_path):
 def test_module_wrappers(tmp_path):
     import stegodng.stego as sm
     out = str(tmp_path / "w.dng")
-    info = sm.encode(b"wrap", out, width=64, height=48, seed=1, thumbnail="synthetic")
+    sm.encode(b"wrap", out, width=64, height=48, seed=1, thumbnail="synthetic")
     assert sm.decode(out) == b"wrap"
     infos = sm.encode_split(b"z" * 4000, str(tmp_path / "ws.dng"), 1500,
                             width=256, height=192, seed=1, thumbnail="synthetic")
@@ -635,7 +630,6 @@ def test_thumbnail_unexpected_redirect():
 
 def test_thumbnail_empty_download():
     from stegodng.thumbnails import ThumbnailProvider
-    photo = b"tiny"
     def opener(url, timeout):
         if url == ThumbnailProvider.RANDOM_URL:
             return ("https://commons.wikimedia.org/wiki/File:Meadow.png", b"page")

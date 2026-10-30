@@ -296,7 +296,6 @@ def test_frames_striped_roundtrip(tmp_path):
 
 
 def test_frames_multiplier_in_recommend():
-    a = stego_dng.recommend_config(1000)
     b = stego_dng.recommend_config(1000, frames=3)
     assert b["capacity"] == stego_dng.capacity_bytes_total(
         2048 * 1536 * 3, 1, 3) and b["frames"] == 3
@@ -328,7 +327,6 @@ def test_bigtiff_patch_and_append(tmp_path):
     stego_dng._append_exif(p, stego_dng.randomize_metadata(1), 64, 48)
     with tifffile.TiffFile(p) as tif:
         assert tif.is_bigtiff
-        ifd0 = stego_dng._ifd0_offset(bytearray(tif.filehandle.read()))
     data = bytearray(open(p, "rb").read())
     subs = stego_dng._subifd_offsets(data, stego_dng._ifd0_offset(data))
     assert len(subs) == 2
@@ -395,8 +393,6 @@ def test_package_class_apis():
         AutoSizer,
         CameraProfile,
         CoverGenerator,
-        DngContainer,
-        DngStego,
         LsbCodec,
         MetadataRandomizer,
         PayloadFrame,
@@ -1924,9 +1920,7 @@ def test_fidelity_native_autosize():
 
 
 def test_fidelity_pinned_native_prefers_max_planes():
-    from stegodng.profiles import get_profile
     from stegodng.sizing import recommend
-    p = get_profile("custom_pixel_xl")
     cfg = recommend(
         8 * 1024 * 1024, width=4048, height=3036, mode="cfa",
         bit_depth=16, max_planes=16, prefer_max_planes=True,
@@ -2479,7 +2473,7 @@ def test_camera_profile_empty_lens_make_falls_back(tmp_path):
     from stegodng.profiles import get_profile
     profile = get_profile("canon_eos_5d_mark_iv")
     assert profile.lenses, "expected harvested lenses"
-    assert all(l[4] == "" for l in profile.lenses)
+    assert all(lens[4] == "" for lens in profile.lenses)
     for seed in (0, 1, 2):
         meta = MetadataRandomizer(seed, profile).randomize()
         assert meta["lens_make"] == profile.make == "Canon"
@@ -2501,7 +2495,7 @@ def test_camera_profile_lens_ranges_match_names():
     with open(os.path.join(base, "canon_eos_5d_mark_iv",
                             "profile.json")) as f:
         lenses = json.load(f)["lenses"]
-    by_name = {l[0]: l for l in lenses}
+    by_name = {lens[0]: lens for lens in lenses}
     assert by_name["EF16-35mm f/2.8L III USM"][1:4] == [16.0, 35.0, 2.8]
     assert by_name["EF28mm f/2.8 IS USM"][1:4] == [28.0, 28.0, 2.8]
     assert by_name["TAMRON SP 150-600mm F/5-6.3 Di VC USD G2 A022"][1:4] == \
@@ -2571,7 +2565,6 @@ def test_dngstego_none_profile_is_default(tmp_path):
 
 
 def test_cli_camera_profile_roundtrip(tmp_path):
-    import tifffile
     from stegodng.profiles import list_profiles
     others = [s for s in list_profiles() if s != "gfx_100"]
     if not others:

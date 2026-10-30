@@ -96,7 +96,6 @@ def test_iter_chunk_bounds():
 
 
 def test_iter_chunk_bounds_rejects_bad_split_size():
-    import pytest
     for bad in (0, -1, -20000, True, False, 2.5, "20k"):
         with pytest.raises(ValueError, match="positive byte count"):
             list(iter_chunk_bounds(60000, bad))
