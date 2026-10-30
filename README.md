@@ -55,7 +55,9 @@ pytest tests/ -q --cov=stegodng --cov=stego_dng --cov-report=term-missing  # cov
   across numbered DNGs with a shared UUID + sequence in metadata.
 - **Every file looks different.** Cover pixels, thumbnail picture, and
   identifiable EXIF fields are re-rolled per encode (seeded by `--seed`).
-  See §6 for the full field list.
+  `--image-time` can instead pin the capture time to the input's birth
+  time, its mtime, or the encode time (see §2.7). See §6 for the full
+  field list.
 - **Covers and previews are synthetic by default.** The raw is a
   gradient + noise field; the IFD0 JPEG is a random Commons photo
   (with offline noise fallback), a built-in gradient, or your own image.
@@ -195,6 +197,7 @@ Module layout:
 | `profile.py` | `CameraProfile` | GFX reference constants, per-depth levels, geometry presets/limits |
 | `framing.py` | `PayloadFrame` | magic/length/CRC framing + keystream |
 | `metadata.py` | `MetadataRandomizer` | per-file metadata re-rolling |
+| `filetime.py` | — | `--image-time` sources: input birth time (statx), mtime, now |
 | `cover.py` | `CoverGenerator` | synthetic raw covers + JPEG thumbnails |
 | `debugmeta.py` | — | JSON debug sidecar: options, metadata, tag inventory, blob hashes |
 | `codec.py` | `LsbCodec` | LSB embed/extract, capacity, KB formatting |
@@ -249,10 +252,10 @@ The sidecar records everything the encode used or stamped into the file:
   dimensions, bit depth, planes, frames, compression, BigTIFF flag,
   thumbnail source, payload bytes and chunk N/M when split;
 - resolved options and seeds (`seed`, cover seed, metadata seed, planes,
-  bit depth, mode, frames, compression, profile, level policy); when
-  `--seed` is omitted the metadata seed is drawn fresh and recorded, so
-  the metadata values are reproducible from that seed (e.g. with
-  `MetadataRandomizer`) even though the CLI seed is unset;
+  bit depth, mode, frames, compression, profile, level policy, pinned
+  `image_time`); when `--seed` is omitted the metadata seed is drawn fresh
+  and recorded, so the metadata values are reproducible from that seed
+  (e.g. with `MetadataRandomizer`) even though the CLI seed is unset;
 - payload and chunk statistics (plaintext bytes, framed bytes and CRC32,
   chunk number/total, split UUID and field names) without the payload
   itself; the CRC covers the framed bytes that go into the raw (XOR-masked
@@ -298,6 +301,46 @@ so a failure to write it reports an `error:` but leaves the image in
 place. The Python API uses the same flag:
 `encode(..., debug_metadata=True)` returns `info["debug_metadata_path"]`.
 
+### 2.7 Image creation time
+
+By default the capture timestamp is randomized with the rest of the
+metadata. `--image-time` pins it when an upload site groups images by
+time and a random date would scatter related files:
+
+```bash
+# use the payload file's birth time
+python stego_dng.py encode -i scan.bin -o scan.dng --image-time input-created
+# use its last-modified time
+python stego_dng.py encode -i scan.bin -o scan.dng --image-time input-modified
+# use the moment this encode runs
+python stego_dng.py encode -i scan.bin -o scan.dng --image-time now
+```
+
+| value | timestamp used |
+|---|---|
+| `random` (default) | seeded random date, same behaviour as before |
+| `input-created` | birth time of `--input` |
+| `input-modified` | last-modified time of `--input` |
+| `now` | current local time when the encode starts |
+
+The chosen value drives `DateTime`, `DateTimeOriginal`,
+`DateTimeDigitized`, the three `OffsetTime*` tags, and the GPS date/time.
+The UTC offset is derived from the system timezone for that moment, so
+the wall clock and offset agree; the GPS IFD gets the same moment in UTC
+(GPSDateStamp/GPSTimeStamp are defined as UTC). An explicit time also
+wins over a profile's `date_range`/`date_window_days` fidelity window;
+other metadata fields remain seeded as usual.
+
+`input-created` uses `st_birthtime` where the OS exposes it and the
+Linux `statx` birth-time field otherwise. Filesystems without birth-time
+support fall back to `ctime` (on Windows `ctime` is the creation time).
+With `--split-file`, the timestamp is resolved once and written to every
+chunk, so a set shares one capture time.
+
+The Python API takes the same override as a `datetime`:
+`encode(..., image_time=when)`, `encode_split(..., image_time=when)`, or
+`MetadataRandomizer(seed).randomize(image_time=when)`.
+
 ## 3. Options reference
 
 ### 3.1 `encode` flags
@@ -317,6 +360,7 @@ place. The Python API uses the same flag:
 | `--compression` | none | `none` (widest support) or `adobe_deflate` (lossless, only with 8/16-bit) |
 | `--key` | none | passphrase; header + body are XOR-masked with a SHA-256 keystream |
 | `--seed` | random | seeds cover pixels, thumbnail choice, and metadata re-rolling |
+| `--image-time` | random | capture time source: `random`, `input-created` (birth time of the input), `input-modified` (input mtime), or `now`; see §2.7 |
 | `--no-randomize` | off | keep reference metadata as-is instead of re-rolling identifiable fields |
 | `--thumbnail` | random | `random` (Commons photo, noise fallback offline), `synthetic` (built-in gradient), or path to an image |
 | `--split-file SIZE` | off | split into chunks of at most SIZE per DNG (`500k`, `100m`, `1g`, `2G`, `64KB`, bare bytes) |
@@ -450,6 +494,7 @@ Regenerated with `COLUMNS=80`; if these blocks ever disagree with
 ```text
 usage: stego_dng.py encode [-h] --input INPUT [--output OUTPUT]
                            [--width WIDTH] [--height HEIGHT] [--seed SEED]
+                           [--image-time {random,input-created,input-modified,now}]
                            [--key KEY]
                            [--lsb-planes {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16}]
                            [--bit-depth {8,10,12,14,16}] [--mode {linear,cfa}]
@@ -476,6 +521,14 @@ options:
   --width WIDTH         raw image width (default: auto from input size)
   --height HEIGHT       raw image height (default: auto from input size)
   --seed SEED
+  --image-time {random,input-created,input-modified,now}
+                        EXIF capture time
+                        (DateTimeOriginal/DateTimeDigitized/OffsetTime*, plus
+                        GPS date/time in UTC): random (default, seeded like
+                        other metadata), input-created (birth time of --input;
+                        falls back to ctime where the filesystem has no birth
+                        time), input-modified (mtime of --input), or now
+                        (generation time). Split chunks share one timestamp.
   --key KEY             passphrase for payload encryption
   --lsb-planes {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16}
                         LSB planes used (default: the profile maximum for
@@ -739,6 +792,8 @@ inspectors and the curious.
   `LensSerialNumber`, `AsShotNeutral`, `BaselineExposure`, plus fresh
   cover and thumbnail pixels. `ImageNumber` is *not* randomized — on
   split chunks it carries the deterministic sequence; plain files omit it.
+  `--image-time` replaces only the timestamp/GPS time draws (see §2.7);
+  everything else still comes from the seeded stream.
 
 ## 7. Development tasks and PyPI releases
 

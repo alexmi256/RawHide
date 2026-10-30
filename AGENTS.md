@@ -13,6 +13,7 @@ is the operator's guide for changing code.
 | `stegodng/profile.py` | `CameraProfile` reference constants, depth/geometry limits |
 | `stegodng/framing.py` | `PayloadFrame` (magic/len/CRC framing + keystream) |
 | `stegodng/metadata.py` | `MetadataRandomizer` (seeded per-file EXIF variety) |
+| `stegodng/filetime.py` | `--image-time` sources (birth time/statx, mtime, now) |
 | `stegodng/cover.py` | `CoverGenerator` (synthetic raw covers + gradient thumbnails) |
 | `stegodng/debugmeta.py` | JSON debug sidecar (`--debug-metadata-output`: tag inventory + blob hashes) |
 | `stegodng/codec.py` | `LsbCodec` (LSB embed/extract, capacity, KB formatters) |

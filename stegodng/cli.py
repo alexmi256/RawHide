@@ -7,6 +7,7 @@ import sys
 
 from .codec import capacity_bytes, format_kb
 from .container import DngContainer
+from .filetime import IMAGE_TIME_CHOICES, resolve_image_time
 from .profile import (
     MAX_FRAMES,
     MAX_LSB_PLANES,
@@ -41,6 +42,15 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("--height", type=int, default=None,
                    help="raw image height (default: auto from input size)")
     e.add_argument("--seed", type=int, default=None)
+    e.add_argument("--image-time", default="random",
+                   choices=IMAGE_TIME_CHOICES,
+                   help="EXIF capture time (DateTimeOriginal/"
+                   "DateTimeDigitized/OffsetTime*, plus GPS date/time in "
+                   "UTC): random (default, seeded like other metadata), "
+                   "input-created (birth time of --input; falls back to "
+                   "ctime where the filesystem has no birth time), "
+                   "input-modified (mtime of --input), or now (generation "
+                   "time). Split chunks share one timestamp.")
     e.add_argument("--key", default=None, help="passphrase for payload encryption")
     e.add_argument("--lsb-planes", type=int, default=None,
                    choices=tuple(range(1, MAX_LSB_PLANES + 1)),
@@ -201,6 +211,12 @@ def main(argv: list[str] | None = None) -> int:
             except ValueError as exc:
                 print(f"error: {exc}", file=sys.stderr)
                 return 1
+        try:
+            image_time = resolve_image_time(args.image_time, args.input)
+        except (OSError, OverflowError, ValueError) as exc:
+            print(f"error: cannot resolve --image-time {args.image_time} "
+                  f"for {args.input}: {exc}", file=sys.stderr)
+            return 1
         album = None
         album_preexisted = False
         try:
@@ -257,10 +273,12 @@ def main(argv: list[str] | None = None) -> int:
                 progress=forced, profile=profile,
                 level_policy=args.level_policy,
                 debug_metadata=args.debug_metadata_output,
+                image_time=image_time,
                 # Provenance only; never add the passphrase (argv) here.
                 debug_context=(
                     {"input": args.input,
                      "camera_profile_requested": args.camera_profile,
+                     "image_time_source": args.image_time,
                      "auto_config": {"preset": cfg.get("preset"),
                                      "auto": list(cfg.get("auto") or [])}}
                     if args.debug_metadata_output else None),
