@@ -11,6 +11,7 @@ import datetime as _dt
 import math
 import random
 
+from . import geo
 from .filetime import normalize_image_time, utc_image_time
 
 
@@ -41,8 +42,14 @@ class MetadataRandomizer:
     EXPPROG_CHOICES = [1, 2, 3, 4]  # manual, program, aperture-prio, shutter-prio
 
     def __init__(self, seed: int | None = None,
-                 profile=None) -> None:
+                 profile=None,
+                 gps_radius_km: float = geo.MAX_RADIUS_KM) -> None:
         self._rng = random.Random(seed)
+        # GPS sampling has a variable draw count (rejections/shrinking), so
+        # it gets its own stream: pinning the time then cannot shift the
+        # serials/exposure fields that follow it.
+        self._location_rng = random.Random(seed)
+        self._gps_radius_km = geo.validate_radius(gps_radius_km)
         # Per-camera pools (None -> GFX reference pools above).
         self._profile = profile
         self._lenses = (list(profile.lenses) if profile is not None
@@ -109,14 +116,34 @@ class MetadataRandomizer:
         body = "".join(rng.choice(alphabet) for _ in range(8 - len(prefix)))
         return prefix + body
 
-    def randomize(self, image_time: _dt.datetime | None = None) -> dict:
+    @staticmethod
+    def _dms(value: float) -> tuple[int, int, tuple[int, int]]:
+        """Degrees/minutes/seconds with 0.01\" rationals (phone style).
+
+        Phones write degrees and minutes over 1 and seconds over 100
+        (0.01\" ~ 31 cm), so this rounds to that step and carries
+        cleanly instead of emitting a power-of-two denominator.
+        """
+        hundredths = int(round(abs(value) * 360_000.0))
+        deg, rest = divmod(hundredths, 360_000)
+        minute, seconds = divmod(rest, 6_000)
+        return deg, minute, (seconds, 100)
+
+    def randomize(self, image_time: _dt.datetime | None = None,
+                  location: geo.Location | None = None) -> dict:
         """Fresh metadata dict with identifiable fields randomized.
 
         ``image_time`` pins the capture timestamp (DateTimeOriginal,
         DateTimeDigitized, OffsetTime* and GPS date/time) instead of
         drawing a random one; the remaining fields still come from the
-        seeded stream.  The RNG draw order is unchanged so a given seed
-        produces the same non-time metadata either way.
+        seeded stream.  The location draws from its own seeded stream, so
+        a pinned time does not shift the serials/exposure fields that
+        follow it (the city pool is filtered to a matching zone offset,
+        so the coordinates themselves can differ).
+
+        ``location`` reuses a point already drawn for another file (split
+        sets share one location); ``None`` samples a new one when the
+        profile emits GPS.
         """
         rng = self._rng
         lens = rng.choice(self._lenses)
@@ -168,34 +195,39 @@ class MetadataRandomizer:
             subject_distance = (0, 0)
             subject_range = 0
         gps = None
+        zone_offset = None
         if self._gps:
-            def _deg(max_deg: int) -> tuple[int, int, tuple[int, int]]:
-                deg = rng.randint(0, max_deg)
-                minute = rng.randint(0, 59)
-                sec = rng.randint(0, 59 * 32768 + 32767)
-                return deg, minute, (sec, 32768)
-            lat = _deg(89)
-            lon = _deg(179)
-            lat_ref = rng.choice(("N", "S"))
-            lon_ref = rng.choice(("E", "W"))
-            altitude_mm = rng.randint(0, 500_000)
-            gps_hour = rng.randint(0, 23)
-            gps_minute = rng.randint(0, 59)
-            gps_second = rng.randint(0, 59)
-            dop = rng.randint(5_000, 20_000)
+            if location is None:
+                location = geo.sample_location(
+                    self._location_rng, self._gps_radius_km, local_time=base,
+                    offset=offset)
+            if image_time is not None:
+                # The caller pinned the local wall clock and its offset;
+                # the zone pool was filtered to match it.
+                utc_dt = gps_base
+            else:
+                delta = location.offset_at(base)
+                utc_dt = base - delta
+                zone_offset = geo.format_offset(delta)
+            lat_d, lat_m, lat_s = self._dms(location.lat)
+            lon_d, lon_m, lon_s = self._dms(location.lon)
+            # Phone GPS altitude follows the local terrain, not sea level.
+            altitude_m = location.altitude_m
+            altitude_mm = int(round(abs(altitude_m) * 1000))
             gps = {
-                "lat_ref": lat_ref,
-                "lat": (lat[0], lat[1], lat[2]),
-                "lon_ref": lon_ref,
-                "lon": (lon[0], lon[1], lon[2]),
+                "lat_ref": "N" if location.lat >= 0 else "S",
+                "lat": (lat_d, lat_m, lat_s),
+                "lon_ref": "E" if location.lon >= 0 else "W",
+                "lon": (lon_d, lon_m, lon_s),
+                "altitude_ref": 0 if altitude_m >= 0 else 1,
                 "altitude_mm": altitude_mm,
-                # GPSDateStamp/GPSTimeStamp are UTC; derive them from the
-                # pinned local capture time so the two IFDs agree.
-                "time": ((gps_base.hour, gps_base.minute, gps_base.second)
-                         if image_time is not None
-                         else (gps_hour, gps_minute, gps_second)),
-                "dop": dop,
-                "date": gps_base.strftime("%Y:%m:%d"),
+                # GPSDateStamp/GPSTimeStamp are UTC; they now come from
+                # the same instant as the EXIF local time.
+                "time": (utc_dt.hour, utc_dt.minute, utc_dt.second),
+                "dop": rng.randint(5_000, 20_000),
+                "date": utc_dt.strftime("%Y:%m:%d"),
+                # Kept for debug sidecars/tests; never written to EXIF.
+                "zone": location.zone,
             }
         noise_profile = None
         if self._noise_s and self._noise_o:
@@ -254,8 +286,9 @@ class MetadataRandomizer:
             "subsec": str(rng.randint(
                 0, 10 ** self._subsec_digits - 1)).zfill(self._subsec_digits),
             "offset": (offset if image_time is not None
-                       else rng.choice(["+08:00", "+09:00", "+01:00",
-                                        "+02:00", "-05:00"])),
+                       else (zone_offset if zone_offset is not None
+                             else rng.choice(["+08:00", "+09:00", "+01:00",
+                                              "+02:00", "-05:00"]))),
         }
 
 

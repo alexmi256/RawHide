@@ -17,6 +17,7 @@ import numpy as np
 import tifffile
 from PIL import Image
 
+from . import geo
 from .codec import LsbCodec, format_kb_hi, format_kb_lo
 from .container import (
     DngContainer,
@@ -28,6 +29,7 @@ from .container import (
 from .cover import CoverGenerator
 from .debugmeta import build_debug_document, crc32_hex, write_debug_metadata
 from .digests import new_raw_image_digest, raw_data_unique_id
+from .filetime import normalize_image_time
 from .framing import PayloadFrame
 from .metadata import MetadataRandomizer
 from .opcodes import build_opcode_list2
@@ -476,7 +478,9 @@ class DngStego:
                        lsb_planes: int, bit_depth: int, mode: str,
                        compression: str, no_randomize: bool, frames: int,
                        thumbnail: str,
-                       image_time: _dt.datetime | None = None) -> dict:
+                       image_time: _dt.datetime | None = None,
+                       gps_radius_km: float = geo.MAX_RADIUS_KM,
+                       location_seed: int | None = None) -> dict:
         """The resolved encode knobs recorded in the debug sidecar."""
         return {
             "width": width,
@@ -492,6 +496,10 @@ class DngStego:
             "thumbnail": thumbnail,
             "image_time": (image_time.isoformat(timespec="seconds")
                            if image_time is not None else None),
+            "gps_radius_km": gps_radius_km,
+            # Split sets draw the shared fix outside the per-chunk stream;
+            # record that seed so the sidecar stays reproducible.
+            "location_seed": location_seed,
             "camera_profile": self.profile.slug,
             "camera_profile_name": (self.profile.display_name
                                     or self.profile.model),
@@ -540,6 +548,8 @@ class DngStego:
         debug_metadata: bool = False,
         debug_context: dict | None = None,
         image_time: _dt.datetime | None = None,
+        gps_radius_km: float = geo.MAX_RADIUS_KM,
+        location: geo.Location | None = None,
     ) -> dict:
         """Embed `payload` into a new DNG file. Returns info dict.
 
@@ -557,6 +567,10 @@ class DngStego:
         ``image_time`` pins the EXIF capture time (local wall clock) and
         the matching UTC offset instead of randomizing it; ``None`` keeps
         the default seeded random timestamp.
+
+        ``gps_radius_km`` is how far (up to 25 km) the GPS fix may sit
+        from the sampled city, and ``location`` reuses a point already
+        drawn for another file (split sets share one).
         """
         self._validate_options(bit_depth, lsb_planes, frames, mode,
                                compression)
@@ -566,8 +580,10 @@ class DngStego:
             # Unseeded run: draw a concrete seed so the debug sidecar can
             # record (and reproduce) the metadata randomization.
             metadata_seed = random.randrange(1 << 30)
-        meta = MetadataRandomizer(metadata_seed, self.profile).randomize(
-            image_time=image_time)
+        meta = MetadataRandomizer(
+            metadata_seed, self.profile,
+            gps_radius_km=gps_radius_km).randomize(
+                image_time=image_time, location=location)
         if seed is None:
             seed = 0
 
@@ -620,7 +636,7 @@ class DngStego:
                     lsb_planes=lsb_planes, bit_depth=bit_depth, mode=mode,
                     compression=compression, no_randomize=no_randomize,
                     frames=frames, thumbnail=thumbnail,
-                    image_time=image_time),
+                    image_time=image_time, gps_radius_km=gps_radius_km),
                 meta=meta, thumbnail_requested=thumbnail,
                 thumbnail_label=thumb_label, thumbnail_rgb=thumb,
                 stegos=stegos, cover_seed=seed,
@@ -697,6 +713,7 @@ class DngStego:
         debug_metadata: bool = False,
         debug_context: dict | None = None,
         image_time: _dt.datetime | None = None,
+        gps_radius_km: float = geo.MAX_RADIUS_KM,
     ) -> list[dict]:
         """Split `payload` into ≤`split_size`-byte chunks across DNG files.
 
@@ -713,7 +730,9 @@ class DngStego:
         chunk-set UUID and per-chunk metadata.
 
         ``image_time`` applies the same pinned capture time to every
-        chunk, so a split set shares one timestamp.
+        chunk, so a split set shares one timestamp.  ``gps_radius_km``
+        widens or narrows the city disk; every chunk of a set shares one
+        sampled location (coordinates and altitude), as a real set would.
         """
         if isinstance(split_size, bool) or not isinstance(split_size, int) \
                 or split_size <= 0:
@@ -721,6 +740,7 @@ class DngStego:
                 f"split_size must be a positive byte count (got {split_size!r})")
         self._validate_options(bit_depth, lsb_planes, frames, mode,
                                compression)
+        geo.validate_radius(gps_radius_km)
         id_spec, seq_spec = resolve_split_fields(split_id_field,
                                                  split_seq_field)
         uid = split_id if split_id is not None else new_split_id()
@@ -736,6 +756,26 @@ class DngStego:
         # payload bytes up front.
         first = next(chunks)
         _, total, _, _ = first
+        shared_location = None
+        location_seed = None
+        if (total > 1 and self.profile.fidelity is not None
+                and self.profile.fidelity.emit_gps):
+            # One draw for the whole set, independent of the per-chunk
+            # seeds so every file carries the same coordinates.  An
+            # unseeded run still needs a fresh location seed (Random(0)
+            # would repeat the same city for every unrelated set), but
+            # --no-randomize keeps the reference draw at seed 0.
+            location_seed = seed if seed is not None else (
+                0 if no_randomize else random.randrange(1 << 30))
+            location_rng = random.Random(location_seed)
+            if image_time is not None:
+                local, offset = normalize_image_time(image_time)
+                shared_location = geo.sample_location(
+                    location_rng, gps_radius_km, local_time=local,
+                    offset=offset)
+            else:
+                shared_location = geo.sample_location(
+                    location_rng, gps_radius_km)
         if total == 1:
             # Fits in one chunk: plain single file, no split markers.
             return [self.encode(
@@ -746,6 +786,7 @@ class DngStego:
                 thumbnail=thumbnail, progress=progress,
                 debug_metadata=debug_metadata,
                 debug_context=debug_context, image_time=image_time,
+                gps_radius_km=gps_radius_km,
             )]
         ifd0_dummies = ((id_spec is not None and id_spec["ifd"] == "ifd0")
                         + (seq_spec is not None and seq_spec["ifd"] == "ifd0"))
@@ -767,8 +808,10 @@ class DngStego:
                     cseed = random.randrange(1 << 30)
                 else:
                     cseed = (0 if seed is None else seed) + seq - 1
-                meta = MetadataRandomizer(cseed, self.profile).randomize(
-                    image_time=image_time)
+                meta = MetadataRandomizer(
+                    cseed, self.profile,
+                    gps_radius_km=gps_radius_km).randomize(
+                        image_time=image_time, location=shared_location)
                 split_exif: dict[int, Any] = {}
                 if id_spec is not None and id_spec["ifd"] == "exif":
                     split_exif[id_spec["tag"]] = uid
@@ -841,7 +884,9 @@ class DngStego:
                             lsb_planes=lsb_planes, bit_depth=bit_depth,
                             mode=mode, compression=compression,
                             no_randomize=no_randomize, frames=frames,
-                            thumbnail=thumbnail, image_time=image_time),
+                            thumbnail=thumbnail, image_time=image_time,
+                            gps_radius_km=gps_radius_km,
+                            location_seed=location_seed),
                         meta=meta, thumbnail_requested=thumbnail,
                         thumbnail_label=thumb_label, thumbnail_rgb=thumb,
                         stegos=stegos, cover_seed=cs,
@@ -1226,6 +1271,7 @@ def encode(
     debug_metadata: bool = False,
     debug_context: dict | None = None,
     image_time: _dt.datetime | None = None,
+    gps_radius_km: float = geo.MAX_RADIUS_KM,
 ) -> dict:
     """Backwards-compatible wrapper (see :meth:`DngStego.encode`)."""
     stego = (_DEFAULT if profile is None
@@ -1236,7 +1282,7 @@ def encode(
         compression=compression, no_randomize=no_randomize, frames=frames,
         thumbnail=thumbnail, progress=progress,
         debug_metadata=debug_metadata, debug_context=debug_context,
-        image_time=image_time,
+        image_time=image_time, gps_radius_km=gps_radius_km,
     )
 
 
@@ -1280,6 +1326,7 @@ def encode_split(
     debug_metadata: bool = False,
     debug_context: dict | None = None,
     image_time: _dt.datetime | None = None,
+    gps_radius_km: float = geo.MAX_RADIUS_KM,
 ) -> list[dict]:
     """Backwards-compatible wrapper (see :meth:`DngStego.encode_split`)."""
     stego = (_DEFAULT if profile is None
@@ -1291,7 +1338,8 @@ def encode_split(
         frames=frames, thumbnail=thumbnail, split_id=split_id,
         split_id_field=split_id_field, split_seq_field=split_seq_field,
         progress=progress, debug_metadata=debug_metadata,
-        debug_context=debug_context, image_time=image_time)
+        debug_context=debug_context, image_time=image_time,
+        gps_radius_km=gps_radius_km)
 
 
 def generate_tiff(

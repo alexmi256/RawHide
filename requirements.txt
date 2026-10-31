@@ -2,6 +2,7 @@ numpy
 pillow
 tifffile[all]
 tqdm
+tzdata
 # Optional, only needed to verify that generated files open in a real RAW
 # decoder (used during development with `rawpy.imread(...)`):
 # rawpy

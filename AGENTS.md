@@ -13,6 +13,7 @@ is the operator's guide for changing code.
 | `stegodng/profile.py` | `CameraProfile` reference constants, depth/geometry limits |
 | `stegodng/framing.py` | `PayloadFrame` (magic/len/CRC framing + keystream) |
 | `stegodng/metadata.py` | `MetadataRandomizer` (seeded per-file EXIF variety) |
+| `stegodng/geo/` | `zones.bin` (tz city coordinates + land grids + elevations) and the sampler |
 | `stegodng/filetime.py` | `--image-time` sources (birth time/statx, mtime, now) |
 | `stegodng/cover.py` | `CoverGenerator` (synthetic raw covers + gradient thumbnails) |
 | `stegodng/debugmeta.py` | JSON debug sidecar (`--debug-metadata-output`: tag inventory + blob hashes) |
@@ -28,6 +29,7 @@ is the operator's guide for changing code.
 | `stegodng/thumbnails.py` | `ThumbnailProvider` (Commons random photo / synthetic / file) |
 | `stegodng/cli.py` | `main()` — argparse commands |
 | `stego_dng.py` | **thin compat shim** re-exporting the old single-file API |
+| `tools/make_geo_data.py` | regenerates `stegodng/geo/zones.bin` (tz table, land grids, elevations) |
 | `tests/test_stego.py` | full suite (plain asserts, runnable directly) |
 | `images/` | reference RAF/DNG samples (read-only, ~15 GB total, do not modify) |
 
@@ -112,7 +114,11 @@ is the operator's guide for changing code.
 - `DngStego.encode()` output must stay byte-identical for fixed inputs:
   verify with `thumbnail="synthetic"` against known-good files by
   comparing raw arrays + all non-offset tags (offsets legitimately shift
-  with JPEG size; skip tags 273/279/324/325/330/34665).
+  with JPEG size; skip tags 273/279/324/325/330/34665). GPS fixes for
+  `fidelity.emit_gps` profiles are part of that baseline: the city
+  sampler re-baselined them once, and
+  `test_default_metadata_stream_matches_reference` pins the new values.
+  Reference profiles (no GPS) are unchanged.
 - `README.md` is the user manual: document every new flag, field,
   warning, and detection tradeoff there (see §1.6/§3 for the pattern).
 

@@ -25,6 +25,30 @@ by the registry alongside the harvested ones and are listed in the
 After regen: `python3 -m pytest tests/ -q` (includes
 `test_camera_profile_data_valid`, which validates every `profile.json`).
 
+## GPS location data
+
+`make_geo_data.py` regenerates `stegodng/geo/zones.bin`, the table behind
+`--gps-radius`. It reads the principal locations from
+`zone1970.tab` (IANA tz database, public domain), packs a 0.5 km land
+bitmap for each 25 km disk from the 1 km GLOBE mask, and stores one city
+elevation per location. Zones whose disk has no land in the 1 km mask
+(narrow atolls such as Malé or Kwajalein) are dropped, because their tz
+coordinate can sit a kilometre offshore.
+
+```bash
+# build-time only dependency; never imported by stegodng itself
+pip install global-land-mask
+
+# elevations are cached in /tmp/opencode/geo_elevation_cache.json;
+# the Open-Meteo call is made once per location and reused on reruns
+python3 tools/make_geo_data.py
+python3 tools/make_geo_data.py --tab /path/to/zone1970.tab --refresh-elevation
+```
+
+The committed blob is ~35 KB and keeps encodes offline. Re-run this
+only when the tz table changes; check the result with
+`python3 -m pytest tests/test_stego.py -k geo`.
+
 ## GainMap / OpcodeList2
 
 `gainmap.py` inspects the `OpcodeList2` of a DNG or generates one from a
