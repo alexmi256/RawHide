@@ -52,6 +52,10 @@ def main(argv: list[str] | None = None) -> int:
                    "input-modified (mtime of --input), or now (generation "
                    "time). Split chunks share one timestamp.")
     e.add_argument("--key", default=None, help="passphrase for payload encryption")
+    e.add_argument("--gps-radius", type=float, default=25.0, metavar="KM",
+                   help="how far a randomized GPS fix may sit from its "
+                   "city, in km (default 25, max 25); profiles that emit "
+                   "GPS place points near a principal tz location on land")
     e.add_argument("--lsb-planes", type=int, default=None,
                    choices=tuple(range(1, MAX_LSB_PLANES + 1)),
                    help="LSB planes used (default: the profile maximum for "
@@ -274,6 +278,7 @@ def main(argv: list[str] | None = None) -> int:
                 level_policy=args.level_policy,
                 debug_metadata=args.debug_metadata_output,
                 image_time=image_time,
+                gps_radius_km=args.gps_radius,
                 # Provenance only; never add the passphrase (argv) here.
                 debug_context=(
                     {"input": args.input,

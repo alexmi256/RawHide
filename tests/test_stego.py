@@ -160,9 +160,292 @@ def test_default_metadata_stream_matches_reference():
         "gps"]
     assert (
         gps["lat_ref"], gps["lat"], gps["lon_ref"], gps["lon"],
-        gps["altitude_mm"], gps["dop"],
-    ) == ("S", (62, 48, (241008, 32768)), "E",
-          (21, 30, (1459141, 32768)), 137950, 8032)
+        gps["altitude_ref"], gps["altitude_mm"], gps["dop"],
+        gps["zone"],
+    ) == ("N", (46, 26, (1472, 100)), "E", (47, 45, (2256, 100)),
+          1, 5228, 13010, "Europe/Astrakhan")
+
+
+def _dms_degrees(parts, negative: bool) -> float:
+    deg, minute, (sec100, denom) = parts
+    value = deg + minute / 60 + (sec100 / denom) / 3600
+    return -value if negative else value
+
+
+def _km_between(lat1, lon1, lat2, lon2) -> float:
+    import math
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = p2 - p1
+    dl = math.radians(lon2 - lon1)
+    a = (math.sin(dp / 2) ** 2
+         + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2)
+    return 6371.0 * 2 * math.asin(math.sqrt(a))
+
+
+def test_gps_location_is_on_land_near_a_zone():
+    from stegodng import geo
+    from stegodng.metadata import MetadataRandomizer
+    from stegodng.profiles import get_profile
+
+    profile = get_profile("custom_pixel_xl")
+    table = {zone.name: zone for zone in geo.zones()}
+    for seed in range(60):
+        gps = MetadataRandomizer(seed, profile).randomize()["gps"]
+        zone = table[gps["zone"]]
+        lat = _dms_degrees(gps["lat"], gps["lat_ref"] == "S")
+        lon = _dms_degrees(gps["lon"], gps["lon_ref"] == "W")
+        assert zone.point_is_land(lat, lon)
+        assert _km_between(lat, lon, zone.lat, zone.lon) <= 25.001
+        # Phone-style resolution: deg/1, min/1, sec/100 (0.01").
+        assert gps["lat"][2][1] == 100 and gps["lon"][2][1] == 100
+        assert 0 <= gps["lat"][2][0] < 6000
+        assert 0 <= gps["lon"][2][0] < 6000
+        assert 0 <= gps["lat"][1] < 60 and 0 <= gps["lon"][1] < 60
+
+
+def test_gps_offset_and_utc_timestamp_agree():
+    import datetime as dt
+    from stegodng import geo
+    from stegodng.metadata import MetadataRandomizer
+    from stegodng.profiles import get_profile
+
+    profile = get_profile("custom_pixel_xl")
+    for seed in range(20):
+        meta = MetadataRandomizer(seed, profile).randomize()
+        local = dt.datetime.strptime(meta["datetime"], "%Y:%m:%d %H:%M:%S")
+        delta = geo.offset_delta(meta["gps"]["zone"], local)
+        assert meta["offset"] == geo.format_offset(delta)
+        utc = local - delta
+        assert meta["gps"]["date"] == utc.strftime("%Y:%m:%d")
+        assert meta["gps"]["time"] == (utc.hour, utc.minute, utc.second)
+
+
+def test_gps_pinned_time_uses_a_zone_with_that_offset():
+    import datetime as dt
+    from stegodng import geo
+    from stegodng.metadata import MetadataRandomizer
+    from stegodng.profiles import get_profile
+
+    when = dt.datetime(2024, 5, 6, 7, 8, 9)
+    meta = MetadataRandomizer(4, get_profile("custom_pixel_xl")).randomize(
+        image_time=when)
+    local = dt.datetime(2024, 5, 6, 7, 8, 9)
+    matching = {zone.name for zone in geo.zones()
+                if zone.offset_string(local) == meta["offset"]}
+    if matching:  # unusual system offsets may match no zone at all
+        assert meta["gps"]["zone"] in matching
+
+
+def test_gps_radius_validation_and_distribution():
+    import random
+    import pytest
+    from stegodng import geo
+
+    for bad in (0, -1, 25.1, float("nan")):
+        with pytest.raises(ValueError, match="gps radius"):
+            geo.validate_radius(bad)
+    table = {zone.name: zone for zone in geo.zones()}
+    for seed in range(30):
+        loc = geo.sample_location(
+            random.Random(seed), 2.0, zone="Europe/Paris")
+        zone = table[loc.zone]
+        assert zone.point_is_land(loc.lat, loc.lon)
+        assert _km_between(loc.lat, loc.lon, zone.lat, zone.lon) <= 2.001
+
+
+def test_geo_zone_table_is_sane():
+    from stegodng import geo
+
+    table = geo.zones()
+    assert len(table) >= 300
+    assert len({zone.name for zone in table}) == len(table)
+    for zone in table:
+        assert -90 <= zone.lat <= 90 and -180 <= zone.lon <= 180
+        assert -500 <= zone.elevation_m <= 5000, zone.name
+        assert len(zone.mask) == geo.MASK_BYTES
+        assert any(zone.mask), zone.name  # no all-water disks
+
+
+def test_dms_carries_at_the_second_boundary():
+    from stegodng.metadata import MetadataRandomizer
+
+    assert MetadataRandomizer._dms(1.9999999) == (2, 0, (0, 100))
+    assert MetadataRandomizer._dms(59.999999) == (60, 0, (0, 100))
+    assert MetadataRandomizer._dms(-0.000005) == (0, 0, (2, 100))
+
+
+def test_gps_pinned_time_keeps_seeded_non_time_fields():
+    import datetime as dt
+    from stegodng.metadata import MetadataRandomizer
+    from stegodng.profiles import get_profile
+
+    when = dt.datetime(2024, 5, 6, 7, 8, 9)
+    profile = get_profile("custom_pixel_xl")
+    free = MetadataRandomizer(12345, profile).randomize()
+    pinned = MetadataRandomizer(12345, profile).randomize(image_time=when)
+    for key in free:
+        if key in ("datetime", "offset", "gps"):
+            continue
+        assert pinned[key] == free[key], key
+
+
+def test_gps_radius_reaches_encoder_and_sidecar(tmp_path):
+    import json
+    from stegodng import geo
+    from stegodng.metadata import MetadataRandomizer
+    from stegodng.profiles import get_profile
+
+    profile = get_profile("custom_pixel_xl")
+    info = stego_dng.encode(
+        b"radius", str(tmp_path / "radius.dng"), width=256, height=192,
+        seed=12, thumbnail="synthetic", profile=profile,
+        gps_radius_km=1.0, debug_metadata=True)
+    gps = info["metadata"]["gps"]
+    zone = {z.name: z for z in geo.zones()}[gps["zone"]]
+    lat = _dms_degrees(gps["lat"], gps["lat_ref"] == "S")
+    lon = _dms_degrees(gps["lon"], gps["lon_ref"] == "W")
+    assert _km_between(lat, lon, zone.lat, zone.lon) <= 1.001
+    with open(info["debug_metadata_path"], encoding="utf-8") as f:
+        doc = json.load(f)
+    assert doc["encode"]["options"]["gps_radius_km"] == 1.0
+    # The recorded seed + radius reproduces the fix.
+    seed = doc["cover"]["metadata_seed"]
+    repro = MetadataRandomizer(
+        seed, profile, gps_radius_km=1.0).randomize()
+    assert repro["gps"]["zone"] == gps["zone"]
+    assert (repro["gps"]["lat"], repro["gps"]["lon"],
+            repro["gps"]["altitude_mm"]) == (
+                gps["lat"], gps["lon"], gps["altitude_mm"])
+
+
+def test_unseeded_split_gps_differs_between_runs(tmp_path):
+    import json
+    import random
+    from stegodng import geo
+    from stegodng.profiles import get_profile
+
+    profile = get_profile("custom_pixel_xl")
+    fixes = []
+    for run in ("a", "b"):
+        infos = stego_dng.encode_split(
+            os.urandom(5000), str(tmp_path / f"{run}.dng"), 3000,
+            width=256, height=192, thumbnail="synthetic", profile=profile,
+            split_id=f"unseeded{run}", debug_metadata=True)
+        gps = infos[0]["metadata"]["gps"]
+        fixes.append((gps["zone"], gps["lat"], gps["lon"],
+                      gps["altitude_mm"]))
+        with open(infos[0]["debug_metadata_path"], encoding="utf-8") as f:
+            doc = json.load(f)
+        assert isinstance(doc["encode"]["options"]["location_seed"], int)
+        assert doc["encode"]["options"]["gps_radius_km"] == 25.0
+    assert fixes[0] != fixes[1]
+
+    # The recorded seed alone reproduces the shared fix (no --image-time).
+    gps = infos[0]["metadata"]["gps"]
+    location = geo.sample_location(
+        random.Random(doc["encode"]["options"]["location_seed"]), 25.0)
+    assert _dms_degrees(gps["lat"], gps["lat_ref"] == "S") == pytest.approx(
+        location.lat, abs=1e-5)
+    assert _dms_degrees(gps["lon"], gps["lon_ref"] == "W") == pytest.approx(
+        location.lon, abs=1e-5)
+    assert gps["altitude_mm"] == int(round(abs(location.altitude_m) * 1000))
+
+
+def test_split_no_randomize_gps_is_deterministic(tmp_path):
+    import json
+    from stegodng.profiles import get_profile
+
+    profile = get_profile("custom_pixel_xl")
+    fixes = []
+    for run in ("a", "b"):
+        infos = stego_dng.encode_split(
+            os.urandom(5000), str(tmp_path / f"{run}.dng"), 3000,
+            width=256, height=192, thumbnail="synthetic", profile=profile,
+            split_id=f"nr{run}", no_randomize=True, debug_metadata=True)
+        gps = infos[0]["metadata"]["gps"]
+        fixes.append((gps["zone"], gps["lat"], gps["lon"],
+                      gps["altitude_mm"]))
+        with open(infos[0]["debug_metadata_path"], encoding="utf-8") as f:
+            doc = json.load(f)
+        assert doc["encode"]["options"]["location_seed"] == 0
+    assert fixes[0] == fixes[1]
+
+
+def test_split_gps_with_image_time_filters_offsets(tmp_path):
+    import datetime as dt
+    from stegodng import geo
+    from stegodng.filetime import normalize_image_time
+    from stegodng.profiles import get_profile
+
+    when = dt.datetime(2024, 5, 6, 7, 8, 9)
+    local, pinned = normalize_image_time(when)
+    infos = stego_dng.encode_split(
+        os.urandom(30000), str(tmp_path / "pinned.dng"), 12000,
+        width=256, height=192, seed=4, thumbnail="synthetic",
+        profile=get_profile("custom_pixel_xl"), split_id="pinnedgps1",
+        image_time=when)
+    assert len(infos) == 3
+    fixes = {(i["metadata"]["gps"]["lat"], i["metadata"]["gps"]["lon"],
+              i["metadata"]["gps"]["altitude_mm"]) for i in infos}
+    assert len(fixes) == 1
+    matching = {z.name for z in geo.zones()
+                if z.offset_string(local) == pinned}
+    if matching:
+        assert infos[0]["metadata"]["gps"]["zone"] in matching
+    assert all(i["metadata"]["offset"] == pinned for i in infos)
+    assert all(i["metadata"]["datetime"] == local.strftime(
+        "%Y:%m:%d %H:%M:%S") for i in infos)
+
+
+def test_single_chunk_split_matches_plain_encode(tmp_path):
+    from stegodng.profiles import get_profile
+
+    profile = get_profile("custom_pixel_xl")
+    payload = b"single chunk"
+    plain = str(tmp_path / "plain.dng")
+    stego_dng.encode(payload, plain, width=256, height=192, seed=3,
+                     thumbnail="synthetic", profile=profile)
+    infos = stego_dng.encode_split(
+        payload, str(tmp_path / "split.dng"), 10 ** 6, width=256,
+        height=192, seed=3, thumbnail="synthetic", profile=profile)
+    assert len(infos) == 1
+    with open(plain, "rb") as a, open(infos[0]["path"], "rb") as b:
+        assert a.read() == b.read()
+
+
+def test_gps_altitude_below_sea_level_sets_ref():
+    from stegodng.container import _gps_values
+
+    gps = {
+        "lat_ref": "N", "lat": (1, 2, (3, 100)),
+        "lon_ref": "E", "lon": (4, 5, (6, 100)),
+        "altitude_ref": 1, "altitude_mm": 430000,
+        "time": (1, 2, 3), "dop": 5000, "date": "2024:01:01",
+    }
+    assert _gps_values(gps)[5] == (1,)
+
+
+def test_split_chunks_share_gps_fix(tmp_path):
+    from stegodng.container import read_gps
+    from stegodng.profiles import get_profile
+
+    infos = stego_dng.encode_split(
+        os.urandom(50000), str(tmp_path / "gps.dng"), 20000,
+        width=512, height=384, seed=7, thumbnail="synthetic",
+        split_id="gpsfix0001", profile=get_profile("custom_pixel_xl"))
+    assert len(infos) == 3
+    fixes = {(i["metadata"]["gps"]["lat"], i["metadata"]["gps"]["lon"],
+              i["metadata"]["gps"]["altitude_mm"]) for i in infos}
+    assert len(fixes) == 1
+    for info in infos:
+        gps = read_gps(info["path"])
+        assert gps["lat"] == tuple(
+            (v if isinstance(v, tuple) else (v, 1))
+            for v in info["metadata"]["gps"]["lat"])
+        assert gps["altitude"][0] == (
+            info["metadata"]["gps"]["altitude_mm"], 1000)
+    # Times still follow each chunk's own (random) capture moment.
+    assert all(info["metadata"]["gps"]["date"] for info in infos)
 
 
 def test_image_time_keeps_seeded_non_time_fields():
@@ -286,6 +569,47 @@ def test_cli_image_time_modified_split(tmp_path):
         assert doc["invocation"]["image_time_source"] == "input-modified"
         assert doc["encode"]["options"]["image_time"] == (
             dt.datetime.fromtimestamp(known).isoformat(timespec="seconds"))
+
+
+def test_cli_gps_radius_flag(tmp_path, capsys):
+    from stegodng import cli
+
+    src = tmp_path / "in.bin"
+    src.write_bytes(b"gps radius")
+    r = subprocess.run(
+        [sys.executable, STEGO_SCRIPT, "encode", "--help"],
+        capture_output=True, text=True)
+    assert "--gps-radius" in r.stdout
+    assert "principal tz location" in r.stdout
+    assert cli.main([
+        "encode", "-i", str(src), "-o", str(tmp_path / "bad.dng"),
+        "--width", "256", "--height", "192", "--seed", "5",
+        "--thumbnail", "synthetic", "--gps-radius", "30",
+    ]) == 1
+    captured = capsys.readouterr()
+    assert "gps radius must be between 0 and 25 km" in captured.err
+    assert not (tmp_path / "bad.dng").exists()
+
+    # A valid radius reaches the encoder, the fix respects it, and the
+    # sidecar records the value.
+    import json
+    from stegodng import geo
+
+    out = tmp_path / "radius.dng"
+    assert cli.main([
+        "encode", "-i", str(src), "-o", str(out),
+        "--width", "256", "--height", "192", "--seed", "5",
+        "--thumbnail", "synthetic", "--camera-profile", "custom_pixel_xl",
+        "--gps-radius", "1", "--debug-metadata-output",
+    ]) == 0
+    with open(tmp_path / "radius.json", encoding="utf-8") as f:
+        doc = json.load(f)
+    assert doc["encode"]["options"]["gps_radius_km"] == 1.0
+    gps = doc["metadata"]["gps"]
+    zone = {z.name: z for z in geo.zones()}[gps["zone"]]
+    lat = _dms_degrees(gps["lat"], gps["lat_ref"] == "S")
+    lon = _dms_degrees(gps["lon"], gps["lon_ref"] == "W")
+    assert _km_between(lat, lon, zone.lat, zone.lon) <= 1.001
 
 
 def test_capacity():

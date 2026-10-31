@@ -24,7 +24,7 @@ classifiers = [
     "Topic :: Multimedia :: Graphics",
     "Topic :: Security :: Cryptography",
 ]
-dependencies = ["numpy", "pillow", "tifffile[all]", "tqdm"]
+dependencies = ["numpy", "pillow", "tifffile[all]", "tqdm", "tzdata"]
 
 [project.urls]
 Homepage = "https://github.com/alexmi256/RawHide"
@@ -45,6 +45,9 @@ include = ["stegodng*"]
 # the package so --camera-profile works from an install, not just a
 # checkout. Custom profiles are nested one level deeper.
 [tool.setuptools.package-data]
+# The tz location table + land grids for the GPS sampler (see
+# tools/make_geo_data.py).
+"stegodng.geo" = ["zones.bin"]
 "stegodng.profiles" = [
     "*/profile.json",
     "*/README.md",

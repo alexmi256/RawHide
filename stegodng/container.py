@@ -668,7 +668,7 @@ def _gps_values(gps: dict) -> dict[int, object]:
         2: [(gps["lat"][0], 1), (gps["lat"][1], 1), gps["lat"][2]],
         3: gps["lon_ref"],
         4: [(gps["lon"][0], 1), (gps["lon"][1], 1), gps["lon"][2]],
-        5: (0,),
+        5: (int(gps.get("altitude_ref", 0)),),
         6: [(int(gps["altitude_mm"]), 1000)],
         7: [(int(gps["time"][0]), 1), (int(gps["time"][1]), 1),
             (int(gps["time"][2]), 1)],
