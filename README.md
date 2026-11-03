@@ -108,6 +108,16 @@ Pick a different camera cover story with `--camera-profile` (see §3.5);
 the base slug keeps this auto-sizing, a `-native`/`-pixelshift` suffix
 pins that camera's geometry instead.
 
+A profile may also set CLI defaults in its `"defaults"` block; an
+explicit flag always wins. `custom_pixel_xl` ships with
+`{"split_file": "190m", "auto_size": true}`, so the flagless invocation
+splits at 190 MiB and sizes each chunk to its payload (this split path
+skips `prefer_native`; see §2.3). Pass
+`--no-split-file` to write one DNG, or `--no-auto-size` to keep one
+fixed frame across all chunks. Profile defaults only apply when neither
+`--width/--height` nor a `--camera-profile` subprofile pins the
+geometry.
+
 ```bash
 # exact-fit dimensions for the smallest possible file (see tradeoff below)
 python stego_dng.py encode -i secret.bin -o small.dng --auto-size --seed 42
@@ -170,6 +180,27 @@ python stego_dng.py encode -i huge.raw -o vol.dng --split-file 100m \
 - Each chunk is an independent framed payload (own header/CRC), so a
   short last chunk needs no padding. If everything fits in one chunk,
   output is a plain single DNG with no split markers.
+- With `--auto-size`, chunks are sized independently: full chunks get
+  the smallest frame that holds the split size, and the short last chunk
+  gets a smaller DNG instead of reusing the full-chunk geometry. That
+  per-chunk exact fit skips the profile's native-sensor preference, so
+  split sets do not stay at the camera's sensor size. The
+  `custom_pixel_xl` default (`190m` + auto-size) needs roughly
+  11500x8600 for each full chunk, because a 190 MiB payload is far past
+  the Pixel XL's 4048x3036 capacity (~24,000 KB at 1 frame, ~187.5 MiB
+  even at the 8-frame maximum). Nothing at 190 MiB can keep Pixel XL
+  sensor geometry. To keep 4048x3036, pin the geometry *and* cap each
+  chunk to what it holds, e.g.
+  `--camera-profile custom_pixel_xl-native --split-file 23m` (or
+  `--width 4048 --height 3036 --split-file 23m`). `--no-auto-size` alone
+  does not restore sensor geometry: with the 190 MiB default it selects
+  one fixed frame sized for the split. `--no-split-file` writes one DNG,
+  which auto-size keeps at 4048x3036 only while the payload fits that
+  capacity.
+- Very short final chunks still have a floor: the profile's fixed
+  metadata/Adobe blobs plus one 256x256 raw tile keep a sub-kilobyte
+  chunk near ~270 KB, even though the preview is capped to the raw frame
+  instead of staying at the 676x506 reference size.
 - Chunks share a UUID and carry a sequence number in metadata (see §3.3).
   Decode verifies the set: one UUID, sequences 1..N, matching totals when
   the field stores them. Gaps, mixed sets, and starts past 0001 fail with
@@ -190,11 +221,16 @@ payload = stego.decode("out.dng")                 # planes auto-detected
 cfg = AutoSizer().recommend(len(payload))         # auto-sizing
 ```
 
+`DngStego.encode_split(..., chunk_configs=[...])` takes one
+`{"width", "height", "lsb_planes"}` dict per chunk, which is how the CLI
+gives the short last chunk a smaller frame; omit it to keep one fixed
+geometry for the whole set.
+
 Module layout:
 
 | module | classes | responsibility |
 |---|---|---|
-| `profile.py` | `CameraProfile` | GFX reference constants, per-depth levels, geometry presets/limits |
+| `profile.py` | `CameraProfile`, `ProfileDefaults` | GFX reference constants, per-depth levels, geometry presets/limits, per-profile CLI defaults |
 | `framing.py` | `PayloadFrame` | magic/length/CRC framing + keystream |
 | `metadata.py` | `MetadataRandomizer` | per-file metadata re-rolling |
 | `filetime.py` | — | `--image-time` sources: input birth time (statx), mtime, now |
@@ -398,7 +434,7 @@ a system zone database).
 | `-o, --output` | `<input>.dng` | output DNG path; with `--split-file`, `0001`-style numbers go before the extension; with `--split-file-album` (on) chunks move into `<output-dir>/<input-stem>/` |
 | `--width, --height` | auto | raw frame size; one-sided values complete via 4:3; pinned geometry only bumps planes; cannot be combined with a `--camera-profile` subprofile |
 | `--camera-profile SLUG[-SUB]` | `gfx_100` | camera cover story: Make/Model/lenses/pools stamped into the file; base slug keeps auto-sizing, `-native` pins that camera's sensor geometry, `-pixelshift` (GFX 100 only) pins `23296x17472` (GB-size file, needs lots of RAM); unknown names list choices; see §3.5 |
-| `--auto-size` | off | prefer the profile's native sensor size when it fits, else the smallest even 4:3 frame; smallest files use non-standard dims |
+| `--auto-size, --no-auto-size` | profile (off; `custom_pixel_xl`: on) | prefer the profile's native sensor size when it fits, else the smallest even 4:3 frame; smallest files use non-standard dims |
 | `--level-policy` | `profile` | `profile` follows the profile's raw policy; `strict` keeps its effective WhiteLevel/plane cap; `capacity` restores full 16-bit range and up to 16 planes |
 | `--lsb-planes 1–16` | profile max for `prefer_native`, else fewest fitting | payload bit planes per sample; capacity scales linearly; 3+ visibly degrade, 9+ destroy most cover, 16 = pure payload |
 | `--bit-depth 8/10/12/14/16` | 16 | packed `BitsPerSample`; controls plausibility and file size, not capacity per plane |
@@ -411,7 +447,8 @@ a system zone database).
 | `--gps-radius KM` | 25 | land-only GPS fix within KM of a principal tz location; capped at 25; range-checked but unused by profiles without GPS (see §2.8) |
 | `--no-randomize` | off | keep reference metadata as-is instead of re-rolling identifiable fields |
 | `--thumbnail` | random | `random` (Commons photo, noise fallback offline), `synthetic` (built-in gradient), or path to an image |
-| `--split-file SIZE` | off | split into chunks of at most SIZE per DNG (`500k`, `100m`, `1g`, `2G`, `64KB`, bare bytes) |
+| `--split-file SIZE` | profile (off; `custom_pixel_xl`: `190m`) | split into chunks of at most SIZE per DNG (`500k`, `100m`, `1g`, `2G`, `64KB`, bare bytes); with `--auto-size`, every chunk is sized to its own payload |
+| `--no-split-file` | off | ignore the profile's split default and write one DNG (explicit `--width/--height` or a pinned subprofile also skips the default) |
 | `--split-file-album, --no-split-file-album` | on | group split chunks in `<output-dir>/<input-stem>/` (only with `--split-file`) |
 | `--split-file-metadata-id` | ImageUniqueID | metadata field for the shared chunk UUID (`ImageDescription`, or `none` for filenames only) |
 | `--split-file-metadata-seq` | ImageNumber | metadata field for the chunk number (`PageNumber`, `ImageDescription`, or `none`); see §3.3 |
@@ -481,6 +518,13 @@ python stego_dng.py encode -i big.bin -o ps.dng --camera-profile gfx_100-pixelsh
   `list_profiles()` lists slugs. Regenerate the whole tree from samples
   with `tools/` (see `tools/README.md`); the `-native` pin is the most
   common decoded geometry per model (hi-res composites excluded).
+- Optional `"defaults"` block: CLI defaults that apply only when the
+  matching flag is absent. Supported keys are `split_file` (size string
+  or byte count) and `auto_size` (bool). `--split-file`,
+  `--no-split-file`, `--auto-size` and `--no-auto-size` always override
+  them, and geometry-pinning flags (`--width`/`--height` or a
+  `-SUB` subprofile) bypass the split default. `custom_pixel_xl` sets
+  `"split_file": "190m"` and `"auto_size": true` (see §2.3).
 - Optional `"gainmap"` block (currently the custom Pixel XL profile):
   CFA encodes write four per-phase `GainMap` opcodes in `OpcodeList2`
   from a compact base grid plus seeded per-file jitter, instead of an
@@ -497,8 +541,9 @@ python stego_dng.py encode -i big.bin -o ps.dng --camera-profile gfx_100-pixelsh
   `--level-policy profile|strict|capacity` overrides the profile default
   (strict caps planes and keeps the effective white; capacity restores
   the full 16-bit range). `--auto-size` prefers the profile's
-  `sensor_sizes` when the payload fits, so Pixel XL outputs stay at
-  4048x3036 before growing. See `stegodng/fidelity.py`.
+  `sensor_sizes` when the payload fits, so single-DNG Pixel XL outputs
+  stay at 4048x3036 before growing; split chunks are sized exactly
+  instead (§2.3). See `stegodng/fidelity.py`.
 - Optional fidelity sub-blocks for writers whose files carry extra
   identity tags:
   - `"tag_conventions": "adobe"` reproduces Adobe's tag inventory: no
@@ -549,12 +594,14 @@ usage: stego_dng.py encode [-h] --input INPUT [--output OUTPUT]
                            [--level-policy {profile,strict,capacity}]
                            [--compression {none,adobe_deflate}]
                            [--thumbnail THUMBNAIL] [--split-file SIZE]
+                           [--no-split-file]
                            [--split-file-metadata-id {ImageDescription,ImageUniqueID,none}]
                            [--split-file-metadata-seq {ImageDescription,ImageNumber,PageNumber,none}]
                            [--split-file-id UUID]
                            [--split-file-album | --no-split-file-album]
                            [--no-randomize] [--camera-profile CAMERA_PROFILE]
-                           [--raw-frames {1,2,3,4,5,6,7,8}] [--auto-size]
+                           [--raw-frames {1,2,3,4,5,6,7,8}]
+                           [--auto-size | --no-auto-size]
                            [--debug-metadata-output] [--progress]
                            [--no-progress] [--gps-radius KM]
 
@@ -603,7 +650,9 @@ options:
   --split-file SIZE     split the payload into chunks of at most SIZE per DNG
                         (e.g. 1g, 100m, 500k, 2G, 64KB, or bytes); files are
                         named <stem>0001<suffix> ... (DCF-style 4-digit
-                        sequence)
+                        sequence); profiles may set a default size
+  --no-split-file       ignore a profile's default split size and write one
+                        DNG
   --split-file-metadata-id {ImageDescription,ImageUniqueID,none}
                         metadata field for the UUID shared by all chunks of
                         one split (default ImageUniqueID: a genuine EXIF UUID
@@ -637,11 +686,13 @@ options:
                         (burst/stack style, 1-8); capacity scales with frames
                         but so does file size, and multiple raw frames are
                         non-standard for still DNGs)
-  --auto-size           prefer the profile's native sensor size when the input
+  --auto-size, --no-auto-size
+                        prefer the profile's native sensor size when the input
                         fits, otherwise compute the smallest 4:3 frame
                         (unusual dimensions may look suspicious; cannot be
                         combined with --width/--height/--camera-profile
-                        subprofiles)
+                        subprofiles); profiles may enable this by default,
+                        --no-auto-size disables it
   --debug-metadata-output
                         also write a JSON sidecar next to each encoded file
                         (same name minus the extension, e.g. out.dng ->
@@ -787,6 +838,7 @@ options:
 | `--raw-frames 2–8` | N full-res SubIFDs in `tiffdump`; ~N× file size; no still-DNG camera output looks like this |
 | `--bit-depth 8/10/12` | `BitsPerSample` below the profile camera's native options (usually 14/16) |
 | `--auto-size` | dimensions match no camera preset (e.g. 462×348) |
+| split + `--auto-size` | chunk dimensions change with each chunk's payload and match no camera; the short last chunk is visibly smaller, but profile metadata and one 256x256 tile impose a ~270 KB floor on very short chunks |
 | split shared UUID | links the chunk set (its purpose); `none`/`none` leaves only filenames |
 
 - **Out of scope by design:** video/animation timelines (still DNG has

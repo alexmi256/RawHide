@@ -12,4 +12,6 @@ profiles.
 
 Each `profile.json` follows the same schema as a harvested profile; the
 per-profile `README.md` documents where the values came from and what the
-current writer does and does not reproduce.
+current writer does and does not reproduce. Custom profiles may also add
+an optional `"defaults"` block (`split_file` size and/or `auto_size`) to
+set flagless CLI behavior; explicit flags always override it.

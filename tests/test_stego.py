@@ -1312,6 +1312,164 @@ def test_cli_split_roundtrip(tmp_path):
     assert r.returncode == 1 and "0002" in r.stderr
 
 
+def test_custom_pixel_xl_profile_defaults():
+    from stegodng.profiles import get_profile
+
+    defaults = get_profile("custom_pixel_xl").defaults
+    assert defaults is not None
+    assert defaults.split_file == "190m"
+    assert defaults.auto_size is True
+
+
+def test_profile_defaults_validation():
+    from stegodng.profile import ProfileDefaults
+
+    parsed = ProfileDefaults.from_dict({"split_file": 190 * 1024 ** 2,
+                                        "auto_size": False})
+    assert parsed.split_file == 190 * 1024 ** 2
+    assert parsed.auto_size is False
+    for bad in ({"nope": 1}, {"split_file": True}, {"auto_size": "yes"}):
+        with pytest.raises(ValueError):
+            ProfileDefaults.from_dict(bad)
+    with pytest.raises(ValueError):
+        ProfileDefaults.from_dict({"split_file": 0})
+
+
+def test_cli_profile_defaults_split_and_autosize(tmp_path):
+    from stegodng.container import DngContainer
+
+    src_p = str(tmp_path / "in.bin")
+    enc = str(tmp_path / "vol.dng")
+    rec = str(tmp_path / "back.bin")
+    with open(src_p, "wb") as f:
+        f.write(os.urandom(3000))
+    r = subprocess.run(
+        [sys.executable, STEGO_SCRIPT, "encode", "-i", src_p, "-o", enc,
+         "--seed", "5", "--thumbnail", "synthetic",
+         "--camera-profile", "custom_pixel_xl"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    # The profile split default still routes the single small chunk into
+    # the album directory (no sequence digits for a one-chunk payload).
+    album = tmp_path / "in"
+    assert album.is_dir()
+    files = sorted(glob.glob(str(album / "vol*.dng")))
+    assert len(files) == 1
+    # The auto-size default keeps the exact-fit (small) frame.
+    height, width = DngContainer(files[0]).raw_frames()[0].shape[-2:]
+    assert width < 2048 and height < 1536
+    r = subprocess.run(
+        [sys.executable, STEGO_SCRIPT, "decode", "-i", files[0],
+         "-o", rec], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    with open(src_p, "rb") as f1, open(rec, "rb") as f2:
+        assert f1.read() == f2.read()
+
+
+def test_cli_profile_defaults_can_be_disabled(tmp_path):
+    from stegodng.container import DngContainer
+
+    src_p = str(tmp_path / "in.bin")
+    enc = str(tmp_path / "plain.dng")
+    with open(src_p, "wb") as f:
+        f.write(os.urandom(3000))
+    r = subprocess.run(
+        [sys.executable, STEGO_SCRIPT, "encode", "-i", src_p, "-o", enc,
+         "--seed", "5", "--thumbnail", "synthetic",
+         "--camera-profile", "custom_pixel_xl",
+         "--no-split-file", "--no-auto-size"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert os.path.isfile(enc)
+    assert not (tmp_path / "in").exists()
+    assert DngContainer(enc).raw_frames()[0].shape[-2:] == (1536, 2048)
+
+
+def test_cli_explicit_geometry_bypasses_profile_defaults(tmp_path):
+    from stegodng.container import DngContainer
+
+    src_p = str(tmp_path / "in.bin")
+    enc = str(tmp_path / "fixed.dng")
+    with open(src_p, "wb") as f:
+        f.write(os.urandom(3000))
+    r = subprocess.run(
+        [sys.executable, STEGO_SCRIPT, "encode", "-i", src_p, "-o", enc,
+         "--seed", "5", "--thumbnail", "synthetic",
+         "--camera-profile", "custom_pixel_xl",
+         "--width", "256", "--height", "192"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert os.path.isfile(enc)
+    assert not (tmp_path / "in").exists()
+    assert DngContainer(enc).raw_frames()[0].shape[-2:] == (192, 256)
+
+
+def test_cli_native_subprofile_bypasses_profile_defaults(tmp_path):
+    from stegodng.container import DngContainer
+
+    src_p = str(tmp_path / "in.bin")
+    enc = str(tmp_path / "native.dng")
+    with open(src_p, "wb") as f:
+        f.write(os.urandom(3000))
+    r = subprocess.run(
+        [sys.executable, STEGO_SCRIPT, "encode", "-i", src_p, "-o", enc,
+         "--seed", "5", "--thumbnail", "synthetic",
+         "--camera-profile", "custom_pixel_xl-native"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert os.path.isfile(enc)
+    assert not (tmp_path / "in").exists()
+    assert DngContainer(enc).raw_frames()[0].shape[-2:] == (3036, 4048)
+
+
+def test_cli_split_auto_size_last_chunk_is_smaller(tmp_path):
+    from stegodng.container import DngContainer
+
+    src_p = str(tmp_path / "in.bin")
+    with open(src_p, "wb") as f:
+        f.write(os.urandom(60000))
+    r = subprocess.run(
+        [sys.executable, STEGO_SCRIPT, "encode", "-i", src_p,
+         "-o", str(tmp_path / "vol.dng"), "--seed", "5",
+         "--thumbnail", "synthetic", "--camera-profile", "custom_pixel_xl",
+         "--split-file", "20k", "--no-split-file-album"],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert "last chunk" in r.stdout
+    files = sorted(glob.glob(str(tmp_path / "vol0*.dng")))
+    assert len(files) == 3
+    dims = [DngContainer(path).raw_frames()[0].shape[-2:] for path in files]
+    assert dims[0] > dims[-1]
+    assert os.path.getsize(files[-1]) < os.path.getsize(files[0])
+
+
+def test_encode_split_chunk_configs_per_chunk(tmp_path):
+    from stegodng import DngStego
+
+    payload = os.urandom(50000)
+    out = str(tmp_path / "cfg.dng")
+    configs = [
+        {"width": 512, "height": 384, "lsb_planes": 2},
+        {"width": 512, "height": 384, "lsb_planes": 2},
+        {"width": 256, "height": 192, "lsb_planes": 2},
+    ]
+    infos = DngStego().encode_split(
+        payload, out, 20000, thumbnail="synthetic", split_id="cfguid",
+        chunk_configs=configs)
+    assert [i["chunk_seq"] for i in infos] == [1, 2, 3]
+    assert [(i["width"], i["height"]) for i in infos] == [
+        (512, 384), (512, 384), (256, 192)]
+    assert DngStego().decode([i["path"] for i in infos]) == payload
+    with pytest.raises(ValueError, match="chunk_configs has 2 entries"):
+        DngStego().encode_split(
+            payload, out, 20000, thumbnail="synthetic",
+            chunk_configs=configs[:2])
+    with pytest.raises(ValueError, match="needs int"):
+        DngStego().encode_split(
+            payload, out, 20000, thumbnail="synthetic",
+            chunk_configs=[{}] * 3)
+
+
 def test_cli_debug_metadata_sidecar(tmp_path):
     import json
     import zlib
@@ -2284,7 +2442,8 @@ def test_fidelity_tag_emission_and_raw_layout(tmp_path):
         tags = ifd0.tags
         assert tags[274].value in (6, 3)
         assert str(tags[305].value) in p.fidelity.software_variants
-        assert ifd0.shape == (506, 676, 3)
+        # The 676x506 reference preview is capped to the 256x192 raw.
+        assert ifd0.shape == (192, 256, 3)
         assert 700 not in tags          # XMP suppressed
         assert 50735 not in tags        # camera serial suppressed
         assert 50736 not in tags        # lens info suppressed
@@ -2342,6 +2501,23 @@ def test_fidelity_tag_emission_and_raw_layout(tmp_path):
     assert gps["lat"] == tuple(
         (v if isinstance(v, tuple) else (v, 1))
         for v in info["metadata"]["gps"]["lat"])
+
+
+def test_preview_never_larger_than_raw(tmp_path):
+    import tifffile
+    from stegodng.profiles import get_profile
+
+    p = get_profile("custom_pixel_xl")
+    small = str(tmp_path / "small-preview.dng")
+    stego_dng.encode(b"tiny", small, width=128, height=96, seed=3,
+                     mode="cfa", thumbnail="synthetic", profile=p)
+    with tifffile.TiffFile(small) as tif:
+        assert tif.pages[0].shape == (96, 128, 3)
+    large = str(tmp_path / "large-preview.dng")
+    stego_dng.encode(b"tiny", large, width=1024, height=768, seed=3,
+                     mode="cfa", thumbnail="synthetic", profile=p)
+    with tifffile.TiffFile(large) as tif:
+        assert tif.pages[0].shape == (506, 676, 3)
 
 
 def test_fidelity_subject_distance_infinity(tmp_path):
@@ -3014,6 +3190,10 @@ def test_registry_skips_corrupt_entries(tmp_path, monkeypatch):
     nondict = tmp_path / "nondict"
     nondict.mkdir()
     (nondict / "profile.json").write_text("[1, 2]")
+    baddefaults = tmp_path / "baddefaults"
+    baddefaults.mkdir()
+    (baddefaults / "profile.json").write_text(
+        '{"slug": "baddefaults", "defaults": {"nope": 1}}')
     monkeypatch.setattr(reg, "_DATA_DIR", tmp_path)
     monkeypatch.setattr(reg, "_CACHE", None)
     slugs = reg.list_profiles()

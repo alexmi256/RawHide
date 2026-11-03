@@ -94,7 +94,14 @@ class DngStego:
     def _thumbnail_size(self, width: int, height: int) -> tuple[int, int]:
         fidelity = self.profile.fidelity
         if fidelity and fidelity.preview_size:
-            return fidelity.preview_size
+            tw, th = fidelity.preview_size
+            # Auto-sized frames can be smaller than the reference preview;
+            # never emit a preview larger than the raw it describes.
+            scale = min(1.0, width / tw, height / th)
+            if scale < 1.0:
+                tw = max(1, round(tw * scale))
+                th = max(1, round(th * scale))
+            return tw, th
         return min(4000, width), min(3000, height)
 
     def _levels(self, mode: str, bit_depth: int):
@@ -714,6 +721,7 @@ class DngStego:
         debug_context: dict | None = None,
         image_time: _dt.datetime | None = None,
         gps_radius_km: float = geo.MAX_RADIUS_KM,
+        chunk_configs: list[dict] | None = None,
     ) -> list[dict]:
         """Split `payload` into ≤`split_size`-byte chunks across DNG files.
 
@@ -724,6 +732,11 @@ class DngStego:
         ``split_seq_field`` (``"none"`` disables either). A payload
         fitting in one chunk yields a single plain file with no split
         markers at all. Returns one info dict per file.
+
+        ``chunk_configs`` optionally supplies one sizing dict per chunk
+        (``width``/``height``/``lsb_planes``), so a short last chunk can
+        use a smaller frame; ``None`` keeps the fixed ``width``/``height``/
+        ``lsb_planes`` for every chunk.
 
         ``debug_metadata`` writes one JSON sidecar per chunk (see
         :meth:`encode`); each document records its own chunk number,
@@ -756,6 +769,28 @@ class DngStego:
         # payload bytes up front.
         first = next(chunks)
         _, total, _, _ = first
+        configs: list[tuple[int, int, int]] | None = None
+        if chunk_configs is not None:
+            if len(chunk_configs) != total:
+                raise ValueError(
+                    f"chunk_configs has {len(chunk_configs)} entries for "
+                    f"{total} chunk(s)")
+            configs = []
+            for i, cfg in enumerate(chunk_configs, 1):
+                try:
+                    cw = int(cfg["width"])
+                    ch = int(cfg["height"])
+                    cp = int(cfg["lsb_planes"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"chunk_configs[{i}] needs int "
+                        f"width/height/lsb_planes") from exc
+                if cw <= 0 or ch <= 0:
+                    raise ValueError(
+                        f"chunk_configs[{i}] needs positive width/height")
+                self._validate_options(bit_depth, cp, frames, mode,
+                                       compression)
+                configs.append((cw, ch, cp))
         shared_location = None
         location_seed = None
         if (total > 1 and self.profile.fidelity is not None
@@ -778,9 +813,10 @@ class DngStego:
                     location_rng, gps_radius_km)
         if total == 1:
             # Fits in one chunk: plain single file, no split markers.
+            cw, ch, cp = configs[0] if configs else (width, height, lsb_planes)
             return [self.encode(
-                payload, output_path, width=width, height=height, seed=seed,
-                key=key, lsb_planes=lsb_planes, bit_depth=bit_depth,
+                payload, output_path, width=cw, height=ch, seed=seed,
+                key=key, lsb_planes=cp, bit_depth=bit_depth,
                 mode=mode, compression=compression,
                 no_randomize=no_randomize, frames=frames,
                 thumbnail=thumbnail, progress=progress,
@@ -800,6 +836,8 @@ class DngStego:
                 # would hold a second full payload beside ``payload``.
                 chunk = payload[start:end]
                 chunk_len = len(chunk)
+                cw, chh, cp = (configs[seq - 1] if configs
+                               else (width, height, lsb_planes))
                 path = chunk_path(output_path, seq)
                 if seed is None and not no_randomize:
                     # Unseeded run: fresh random base per chunk so chunks
@@ -827,21 +865,21 @@ class DngStego:
                     if self.profile.fidelity is not None
                     and self.profile.fidelity.white_level is not None
                     else None)
-                headroom = ((1 << lsb_planes) - 1
+                headroom = ((1 << cp) - 1
                             if white is not None
                             and white < (1 << bit_depth) - 1 else 0)
                 covers = [CoverGenerator(cs + f).cover(
-                    height, width, mode, bit_depth,
+                    chh, cw, mode, bit_depth,
                     white_level=white, headroom=headroom)
                     for f in range(frames)]
                 n_samples = covers[0].size
-                cap = LsbCodec.capacity_bytes_total(n_samples, lsb_planes, frames)
+                cap = LsbCodec.capacity_bytes_total(n_samples, cp, frames)
                 if chunk_len > cap:
                     raise ValueError(
                         f"chunk {seq}/{total} "
                         f"({format_kb_hi(chunk_len)}) exceeds per-file capacity "
-                        f"{format_kb_lo(cap)} ({width}x{height} {mode} "
-                        f"{bit_depth}-bit, {lsb_planes} LSB plane(s)"
+                        f"{format_kb_lo(cap)} ({cw}x{chh} {mode} "
+                        f"{bit_depth}-bit, {cp} LSB plane(s)"
                         f"{f' x {frames} frames' if frames > 1 else ''}). "
                         f"Lower --split-file to at most {format_kb_lo(cap)} or "
                         f"enlarge the geometry / add planes."
@@ -850,26 +888,26 @@ class DngStego:
                 frame_crc = crc32_hex(frame) if debug_metadata else ""
                 del chunk
                 stegos = LsbCodec.stripe_frames(
-                    covers, frame, lsb_planes, progress=show,
+                    covers, frame, cp, progress=show,
                     desc=f"Embedding chunk {seq}/{total}", position=1)
                 # stripe_frames embeds in place: stegos share the covers'
                 # buffers, so drop the extra references promptly.
                 del covers, frame
-                tw, th = self._thumbnail_size(width, height)
+                tw, th = self._thumbnail_size(cw, chh)
                 thumb, thumb_label = ThumbnailProvider(seed=cs).get(
                     tw, th, source=thumbnail)
                 bigtiff = self._write_container(
                     path, stegos=stegos, thumb_rgb=thumb, meta=meta,
-                    width=width, height=height, mode=mode, bit_depth=bit_depth,
+                    width=cw, height=chh, mode=mode, bit_depth=bit_depth,
                     compression=compression, frames=frames, tw=tw, th=th,
                     ifd0_dummies=ifd0_dummies, seed=cs,
                 )
                 self._write_split_tags(path, id_spec, seq_spec, split_id_field,
                                        split_seq_field, uid, seq, total)
                 info = self._file_info(
-                    path, width=width, height=height, mode=mode,
+                    path, width=cw, height=chh, mode=mode,
                     bit_depth=bit_depth, container=str(stegos[0].dtype),
-                    lsb_planes=lsb_planes, frames=frames,
+                    lsb_planes=cp, frames=frames,
                     thumb_label=thumb_label, bigtiff=bigtiff, cap=cap,
                     payload_len=chunk_len, meta=meta,
                 )
@@ -880,8 +918,8 @@ class DngStego:
                     self._debug_sidecar(
                         path, info,
                         options=self._debug_options(
-                            width=width, height=height, seed=seed, key=key,
-                            lsb_planes=lsb_planes, bit_depth=bit_depth,
+                            width=cw, height=chh, seed=seed, key=key,
+                            lsb_planes=cp, bit_depth=bit_depth,
                             mode=mode, compression=compression,
                             no_randomize=no_randomize, frames=frames,
                             thumbnail=thumbnail, image_time=image_time,
@@ -1327,6 +1365,7 @@ def encode_split(
     debug_context: dict | None = None,
     image_time: _dt.datetime | None = None,
     gps_radius_km: float = geo.MAX_RADIUS_KM,
+    chunk_configs: list[dict] | None = None,
 ) -> list[dict]:
     """Backwards-compatible wrapper (see :meth:`DngStego.encode_split`)."""
     stego = (_DEFAULT if profile is None
@@ -1339,7 +1378,7 @@ def encode_split(
         split_id_field=split_id_field, split_seq_field=split_seq_field,
         progress=progress, debug_metadata=debug_metadata,
         debug_context=debug_context, image_time=image_time,
-        gps_radius_km=gps_radius_km)
+        gps_radius_km=gps_radius_km, chunk_configs=chunk_configs)
 
 
 def generate_tiff(
