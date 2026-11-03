@@ -228,6 +228,43 @@ validator are `parse_opcode_list2` / `validate_opcode_list2`.
   `fidelity.suggested_mode`; pass `--mode linear` to override. The Python
   API still defaults to `linear` unless the caller passes `mode="cfa"`.
 
+## Defaults
+
+`profile.json` carries a `"defaults"` block:
+
+- `"split_file": "190m"` — a flagless `encode` splits the payload into
+  chunks of at most 190 MiB, using the usual album directory and
+  `0001`-style chunk names.
+- `"auto_size": true` — each chunk is sized to its own payload. With a
+  split, the auto-sizer skips the native-sensor preference so the short
+  last chunk produces a proportionally smaller DNG instead of reusing
+  the full-chunk frame.
+
+Explicit flags win: `--split-file` overrides the size, `--no-split-file`
+writes one DNG, and `--auto-size`/`--no-auto-size` override the auto
+flag. `--width`/`--height` or the `-native` subprofile also bypass the
+split default.
+
+The 190 MiB default is a payload cap, not a sensor claim: one
+4048x3036 CFA frame holds only ~24,000 KB of payload at 16 planes, and
+even the 8-frame maximum holds ~187.5 MiB, so a 190 MiB chunk can never
+keep Pixel XL geometry. Full chunks auto-size to roughly 11500x8600.
+
+To keep 4048x3036, pin the geometry and cap each chunk to what it holds:
+`--camera-profile custom_pixel_xl-native --split-file 23m` (or
+`--width 4048 --height 3036 --split-file 23m`).
+`--no-auto-size` alone does not restore the sensor size, because it
+still picks one fixed frame sized for the 190 MiB split. The `-native`
+subprofile also bypasses the split default, so it needs an explicit
+`--split-file`. `--no-split-file` writes one DNG and keeps sensor
+geometry only while the payload fits the ~24,000 KB capacity.
+
+The 676x506 preview is capped to the raw frame for frames smaller than
+it, so a tiny auto-sized chunk never carries a preview larger than its
+own raw. Reference/native frames still get 676x506. Very short chunks
+keep a ~270 KB file floor from the fixed profile metadata and one
+256x256 raw tile.
+
 ## Sub-profiles
 
 - `custom_pixel_xl-native`: pins raw storage 4048x3036; the writer trims

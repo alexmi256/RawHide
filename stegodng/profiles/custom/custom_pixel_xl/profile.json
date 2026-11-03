@@ -2,6 +2,10 @@
   "schema": 1,
   "slug": "custom_pixel_xl",
   "display_name": "Google Pixel XL (custom)",
+  "defaults": {
+    "split_file": "190m",
+    "auto_size": true
+  },
   "make": "Google",
   "model": "Pixel XL",
   "unique_camera_model": "Google Pixel XL",

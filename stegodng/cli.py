@@ -17,6 +17,7 @@ from .sizing import recommend, risk_warnings
 from .split import (
     SPLIT_ID_FIELDS,
     SPLIT_SEQ_FIELDS,
+    iter_chunk_bounds,
     parse_size,
     split_album_dir,
     split_album_output,
@@ -83,7 +84,10 @@ def main(argv: list[str] | None = None) -> int:
                    help="split the payload into chunks of at most SIZE per "
                    "DNG (e.g. 1g, 100m, 500k, 2G, 64KB, or bytes); files "
                    "are named <stem>0001<suffix> ... (DCF-style 4-digit "
-                   "sequence)")
+                   "sequence); profiles may set a default size")
+    e.add_argument("--no-split-file", action="store_true",
+                   help="ignore a profile's default split size and write "
+                   "one DNG")
     e.add_argument("--split-file-metadata-id", default="ImageUniqueID",
                    choices=tuple(sorted(SPLIT_ID_FIELDS) + ["none"]),
                    help="metadata field for the UUID shared by all chunks "
@@ -122,12 +126,14 @@ def main(argv: list[str] | None = None) -> int:
                    f"(burst/stack style, 1-{MAX_FRAMES}); capacity scales "
                    "with frames but so does file size, and multiple raw "
                    "frames are non-standard for still DNGs)")
-    e.add_argument("--auto-size", action="store_true",
+    e.add_argument("--auto-size", action=argparse.BooleanOptionalAction,
+                   default=None,
                    help="prefer the profile's native sensor size when the "
                    "input fits, otherwise compute the smallest 4:3 frame "
                    "(unusual dimensions may look suspicious; cannot be "
                    "combined with --width/--height/--camera-profile "
-                   "subprofiles)")
+                   "subprofiles); profiles may enable this by default, "
+                   "--no-auto-size disables it")
     e.add_argument("--debug-metadata-output", action="store_true",
                    help="also write a JSON sidecar next to each encoded "
                    "file (same name minus the extension, e.g. out.dng -> "
@@ -192,11 +198,22 @@ def main(argv: list[str] | None = None) -> int:
         pinned: tuple[int, int] | None = None
         if subprofile is not None:
             pinned = profile.subprofiles[subprofile]
-        if args.auto_size and (args.width is not None
-                               or args.height is not None
-                               or pinned is not None):
+        defaults = profile.defaults
+        auto_size = args.auto_size
+        if auto_size is None:
+            # Profile defaults only fill in an absent flag, and never
+            # override pinned geometry or explicit --width/--height.
+            auto_size = bool(defaults and defaults.auto_size)
+            if (subprofile is not None or args.width is not None
+                    or args.height is not None):
+                auto_size = False
+        if auto_size and (args.width is not None
+                          or args.height is not None
+                          or pinned is not None):
             ap.error("--auto-size cannot be combined with "
                      "--width/--height/--camera-profile subprofiles")
+        if args.no_split_file and args.split_file is not None:
+            ap.error("--split-file and --no-split-file are mutually exclusive")
         if args.no_progress and args.progress:
             ap.error("--progress and --no-progress are mutually exclusive")
         w, h = args.width, args.height
@@ -206,12 +223,24 @@ def main(argv: list[str] | None = None) -> int:
                          "--camera-profile subprofile (it pins the "
                          "geometry)")
             w, h = pinned
+        split_spec = args.split_file
+        if args.no_split_file:
+            split_spec = None
+        elif (split_spec is None and defaults
+              and defaults.split_file is not None
+              and subprofile is None
+              and args.width is None and args.height is None):
+            # Profile split defaults belong to the flagless path: explicit
+            # geometry or a pinned subprofile keeps full control.
+            split_spec = defaults.split_file
         with open(args.input, "rb") as f:
             payload = f.read()
         split_size = None
-        if args.split_file is not None:
+        if split_spec is not None:
             try:
-                split_size = parse_size(args.split_file)
+                split_size = parse_size(
+                    split_spec if isinstance(split_spec, str)
+                    else str(split_spec))
             except ValueError as exc:
                 print(f"error: {exc}", file=sys.stderr)
                 return 1
@@ -229,31 +258,73 @@ def main(argv: list[str] | None = None) -> int:
                     or (fidelity.suggested_mode if fidelity else None))
             max_planes = profile.effective_max_planes(
                 args.bit_depth or 16, args.level_policy)
-            sensor_sizes = (fidelity.sensor_sizes
-                            if fidelity and fidelity.prefer_native else None)
-            cfg = recommend(
-                split_size if split_size is not None else len(payload),
-                width=w, height=h, mode=mode,
-                bit_depth=args.bit_depth, lsb_planes=args.lsb_planes,
-                auto_size=args.auto_size, frames=args.raw_frames,
-                max_planes=max_planes, sensor_sizes=sensor_sizes,
-                prefer_max_planes=bool(fidelity and fidelity.prefer_native),
-            )
-            scope = (f"per {format_kb(split_size)} chunk "
-                     f"(from {format_kb(len(payload))} input)"
-                     if split_size is not None else
-                     f"for {format_kb(len(payload))} input")
+            prefer_max = bool(fidelity and fidelity.prefer_native)
+            chunk_cfgs = None
+            if split_size is not None and auto_size:
+                # Per-chunk exact-fit sizing: the short last chunk gets a
+                # smaller frame instead of reusing the 190 MB geometry.
+                # Skip the native sensor preference so every chunk really
+                # is as small as its payload allows.
+                chunk_cfgs = [
+                    recommend(
+                        end - start, width=w, height=h, mode=mode,
+                        bit_depth=args.bit_depth,
+                        lsb_planes=args.lsb_planes, auto_size=True,
+                        frames=args.raw_frames, max_planes=max_planes,
+                        sensor_sizes=None, prefer_max_planes=prefer_max,
+                    )
+                    for _, _, start, end in iter_chunk_bounds(
+                        len(payload), split_size)
+                ]
+                cfg = chunk_cfgs[0]
+            else:
+                sensor_sizes = (fidelity.sensor_sizes
+                                if fidelity and fidelity.prefer_native
+                                else None)
+                cfg = recommend(
+                    split_size if split_size is not None else len(payload),
+                    width=w, height=h, mode=mode,
+                    bit_depth=args.bit_depth, lsb_planes=args.lsb_planes,
+                    auto_size=bool(auto_size), frames=args.raw_frames,
+                    max_planes=max_planes, sensor_sizes=sensor_sizes,
+                    prefer_max_planes=prefer_max,
+                )
             if cfg["auto"]:
-                print(f"auto-config ({', '.join(cfg['auto'])}): "
-                      f"{cfg['width']}x{cfg['height']} {cfg['mode']} "
-                      f"{cfg['bit_depth']}-bit, "
-                      f"{cfg['lsb_planes']} LSB plane(s), "
-                      f"capacity {format_kb(cfg['capacity'])} {scope}")
-            if cfg["preset"] == "auto-size":
+                if chunk_cfgs is not None and len(chunk_cfgs) > 1:
+                    assert split_size is not None
+                    last = chunk_cfgs[-1]
+                    print(
+                        f"auto-config ({', '.join(cfg['auto'])}) per chunk "
+                        f"({len(chunk_cfgs)} chunks, at most "
+                        f"{format_kb(split_size)} each): chunk 1 "
+                        f"{cfg['width']}x{cfg['height']} capacity "
+                        f"{format_kb(cfg['capacity'])}, last chunk "
+                        f"{last['width']}x{last['height']} capacity "
+                        f"{format_kb(last['capacity'])}")
+                else:
+                    scope = (f"per {format_kb(split_size)} chunk "
+                             f"(from {format_kb(len(payload))} input)"
+                             if split_size is not None else
+                             f"for {format_kb(len(payload))} input")
+                    print(f"auto-config ({', '.join(cfg['auto'])}): "
+                          f"{cfg['width']}x{cfg['height']} {cfg['mode']} "
+                          f"{cfg['bit_depth']}-bit, "
+                          f"{cfg['lsb_planes']} LSB plane(s), "
+                          f"capacity {format_kb(cfg['capacity'])} {scope}")
+            auto_presets = ([c for c in chunk_cfgs
+                             if c["preset"] == "auto-size"]
+                            if chunk_cfgs is not None else
+                            [cfg] if cfg["preset"] == "auto-size" else [])
+            if auto_presets:
+                dims = sorted({f"{c['width']}x{c['height']}"
+                               for c in auto_presets})
+                shown = ", ".join(dims[:3])
+                if len(dims) > 3:
+                    shown += ", ..."
                 print(f"warning: --auto-size chose non-standard dimensions "
-                      f"{cfg['width']}x{cfg['height']} (no camera preset "
-                      f"matches); the file is smaller, but unusual "
-                      f"dimensions may look suspicious under inspection.")
+                      f"{shown} (no camera preset matches); the file is "
+                      f"smaller, but unusual dimensions may look suspicious "
+                      f"under inspection.")
             for line in risk_warnings(cfg, key=bool(args.key),
                                        profile=profile):
                 print(line)
@@ -294,6 +365,7 @@ def main(argv: list[str] | None = None) -> int:
                     split_id=args.split_file_id,
                     split_id_field=args.split_file_metadata_id,
                     split_seq_field=args.split_file_metadata_seq,
+                    chunk_configs=chunk_cfgs,
                     **common,
                 )
             else:

@@ -50,6 +50,39 @@ AUTO_MIN_W, AUTO_MIN_H = 64, 48
 
 
 @dataclass(frozen=True)
+class ProfileDefaults:
+    """Optional per-profile CLI defaults (``profile.json`` ``"defaults"``).
+
+    These only fill in flags the caller did not pass; an explicit CLI flag
+    always wins. ``split_file`` is a size string (``"190m"``) or a positive
+    byte count; ``auto_size`` opts into exact-fit geometry.
+    """
+
+    split_file: str | int | None = None
+    auto_size: bool | None = None
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "ProfileDefaults":
+        if not isinstance(data, dict):
+            raise ValueError("defaults must be a dict")
+        unknown = set(data) - {"split_file", "auto_size"}
+        if unknown:
+            raise ValueError(
+                f"unknown defaults key(s): {', '.join(sorted(unknown))}")
+        split_file = data.get("split_file")
+        if isinstance(split_file, bool) or not isinstance(
+                split_file, (str, int, type(None))):
+            raise ValueError(
+                "defaults.split_file must be a size string or byte count")
+        if isinstance(split_file, int) and split_file <= 0:
+            raise ValueError("defaults.split_file must be positive")
+        auto_size = data.get("auto_size")
+        if auto_size is not None and not isinstance(auto_size, bool):
+            raise ValueError("defaults.auto_size must be true or false")
+        return cls(split_file=split_file, auto_size=auto_size)
+
+
+@dataclass(frozen=True)
 class CameraProfile:
     """Static reference values for one camera/cover story.
 
@@ -102,6 +135,9 @@ class CameraProfile:
     # Optional metadata/raw fidelity overlay (all fields default to the
     # historical writer behaviour when the block is absent).
     fidelity: FidelityConfig | None = None
+    # Optional CLI defaults (split size / exact-fit sizing) that only apply
+    # when the corresponding flag is absent.
+    defaults: ProfileDefaults | None = None
     # -- per-camera overlay (registry profiles) -------------------------
     # CLI slug, e.g. "sony_ilce_7rm5" (+ "-native"/"-pixelshift" suffix).
     slug: str = "gfx_100"
@@ -266,6 +302,8 @@ class CameraProfile:
             if data.get("gainmap") else None,
             fidelity=FidelityConfig.from_dict(data["fidelity"], base_dir)
             if data.get("fidelity") else None,
+            defaults=ProfileDefaults.from_dict(data["defaults"])
+            if data.get("defaults") else None,
             slug=data.get("slug", ""),
             display_name=data.get("display_name", ""),
             native_width=data.get("native_width"),
