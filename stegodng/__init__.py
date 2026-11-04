@@ -44,7 +44,7 @@ from .digests import (
     raw_data_unique_id,
 )
 from .fidelity import AdobeProfile, FidelityConfig
-from .framing import PayloadFrame
+from .framing import FrameSink, FramedPayload, PayloadFrame, PayloadReader
 from .makernote import MakernoteConfig
 from .opcodes import (
     GainMap,
@@ -79,7 +79,7 @@ from .split import (
     split_album_dir,
     split_album_output,
 )
-from .stego import DngStego, decode, encode, encode_split, generate_tiff
+from .stego import DngStego, decode, decode_to, encode, encode_split, generate_tiff
 from .thumbnails import ThumbnailError, ThumbnailProvider, prepare
 
 __version__ = "1.0.0"
@@ -93,11 +93,14 @@ __all__ = [
     "DngContainer",
     "DngStego",
     "FidelityConfig",
+    "FrameSink",
+    "FramedPayload",
     "GainMap",
     "GainMapConfig",
     "LsbCodec",
     "MakernoteConfig",
     "PayloadFrame",
+    "PayloadReader",
     "MetadataRandomizer",
     "build_exif_block",
     "build_opcode_list2",
@@ -115,6 +118,7 @@ __all__ = [
     "capacity_bytes_total",
     "debug_metadata_path",
     "decode",
+    "decode_to",
     "embed_bits",
     "encode",
     "encode_split",
