@@ -11,7 +11,7 @@ is the operator's guide for changing code.
 | path | what |
 |---|---|
 | `stegodng/profile.py` | `CameraProfile` reference constants, depth/geometry limits |
-| `stegodng/framing.py` | `PayloadFrame` (magic/len/CRC framing + keystream) |
+| `stegodng/framing.py` | `PayloadFrame` (magic/len/CRC framing + keystream), `PayloadReader`/`FramedPayload` (file-backed streaming), `FrameSink` (streaming unpack + CRC) |
 | `stegodng/metadata.py` | `MetadataRandomizer` (seeded per-file EXIF variety) |
 | `stegodng/geo/` | `zones.bin` (tz city coordinates + land grids + elevations) and the sampler |
 | `stegodng/filetime.py` | `--image-time` sources (birth time/statx, mtime, now) |
@@ -88,6 +88,13 @@ is the operator's guide for changing code.
   behavior runs — import success proves nothing.
 - `tifffile` merges identical SubIFDs into one series (C-order preserved,
   which striped decode relies on); `DngContainer.raw_frames()` documents this.
+- `PayloadReader` closes only files it opened (`_owns`); a caller-supplied
+  file object is left open.  `FramedPayload` is a view and is only valid
+  while its reader is open.  Sequence sources (`__len__`/`__getitem__`)
+  are sliced lazily and read twice per chunk (CRC pass + embed pass).
+  Non-seekable streams and non-regular paths (FIFO/device) are spooled
+  whole; `encode_split`'s single-chunk shortcut reuses
+  `PayloadReader.buffered()` so it never re-reads an exhausted stream.
 - `tifffile` stores YCbCr JPEG planes **verbatim** — convert RGB→YCbCr
   with Pillow before writing or colors come out swapped (there is a
   solid-red regression test; keep it).
@@ -118,7 +125,9 @@ is the operator's guide for changing code.
   `fidelity.emit_gps` profiles are part of that baseline: the city
   sampler re-baselined them once, and
   `test_default_metadata_stream_matches_reference` pins the new values.
-  Reference profiles (no GPS) are unchanged.
+  Reference profiles (no GPS) are unchanged.  Payload bytes, paths and
+  open files must produce the same file: `FramedPayload` only changes
+  where the frame bytes come from, never the bit mapping.
 - `README.md` is the user manual: document every new flag, field,
   warning, and detection tradeoff there (see §1.6/§3 for the pattern).
 

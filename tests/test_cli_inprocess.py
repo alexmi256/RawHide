@@ -335,7 +335,11 @@ def test_cli_decode_marks_fallback(tmp_path, monkeypatch, capsys):
     files = sorted(glob.glob(str(tmp_path / "in" / "o0*.dng")))
     assert len(files) >= 2
     rec = str(tmp_path / "r.bin")
-    monkeypatch.setattr(cli_mod, "decode", lambda *a, **k: b"data")
+    def fake_decode_to(inputs, output, **kwargs):
+        with open(output, "wb") as f:
+            f.write(b"data")
+        return 4
+    monkeypatch.setattr(cli_mod, "decode_to", fake_decode_to)
     def boom(self, id_field="ImageUniqueID", seq_field="ImageNumber"):
         raise ValueError("marker boom")
     monkeypatch.setattr(cli_mod.DngContainer, "split_markers", boom)

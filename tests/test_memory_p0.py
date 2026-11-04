@@ -102,7 +102,7 @@ def test_iter_chunk_bounds_rejects_bad_split_size():
 
 
 class _SliceLogger:
-    """bytes-like payload recording every slice request."""
+    """Bytes-like payload recording every range read."""
 
     def __init__(self, data: bytes):
         self._data = data
@@ -120,40 +120,48 @@ class _SliceLogger:
         return self._data[s]
 
 
-def test_encode_split_slices_one_chunk_at_a_time(tmp_path, monkeypatch):
-    # Laziness is behavioral: slice/write events must interleave
-    # (slice1, write1, slice2, ...) instead of slicing everything
-    # up front (slice1, slice2, ..., write1, ...).
+def test_encode_split_reads_one_chunk_at_a_time(tmp_path, monkeypatch):
+    # Laziness is behavioral: each chunk is read only when its own file
+    # is about to be built, never all chunks up front.
     data = os.urandom(60000)
-    logged: list[tuple] = []
+    payload = _SliceLogger(data)
 
     def fake_write(self, path, **kw):
-        logged.append(("write", path))
+        payload.events.append(("write",))
         with open(path, "wb") as f:
             f.write(b"x")
         return False
 
     monkeypatch.setattr(DngStego, "_write_container", fake_write)
     monkeypatch.setattr(DngStego, "_write_split_tags",
-                        staticmethod(lambda *a, **k: logged.append(("tags",)) or None))
+                        staticmethod(lambda *a, **k: None))
 
-    payload = _SliceLogger(data)
     out = str(tmp_path / "lz.dng")
     infos = DngStego().encode_split(
         payload, out, 20000, width=512, height=384, seed=5,
         thumbnail="synthetic", split_id="lazytest")
     assert [i["chunk_seq"] for i in infos] == [1, 2, 3]
     assert [i["payload_len"] for i in infos] == [20000, 20000, 20000]
-    # Chunk bytes seen by pack() reassemble the payload in order.
-    assert payload.events == [("slice", 0, 20000), ("slice", 20000, 40000),
-                              ("slice", 40000, 60000)]
-    order = [e[0] for e in logged]
-    assert order == ["write", "tags"] * 3
+
+    bounds = [(0, 20000), (20000, 40000), (40000, 60000)]
+    chunks_done = 0
+    for event in payload.events:
+        if event[0] == "write":
+            chunks_done += 1
+            continue
+        start = event[1]
+        # A read may only touch the current chunk (plus framing bytes
+        # that still land inside it).
+        assert bounds[chunks_done][0] <= start < bounds[chunks_done][1], (
+            event, chunks_done)
+    assert chunks_done == 3
+    # No up-front pass over the whole payload: the first read starts at 0.
+    assert payload.events[0] == ("slice", 0, payload.events[0][2])
 
 
 def test_encode_split_slice_write_interleaving(tmp_path, monkeypatch):
-    # Companion to the above: a single shared event log proves each
-    # chunk is sliced just before its file is written.
+    # Companion to the above: each chunk is read just before its file is
+    # written (read*, write, read*, write, ...).
     data = os.urandom(45000)
     events: list[str] = []
 
@@ -177,7 +185,15 @@ def test_encode_split_slice_write_interleaving(tmp_path, monkeypatch):
         width=512, height=384, seed=5, thumbnail="synthetic",
         split_id="lazytest2")
     assert [i["payload_len"] for i in infos] == [20000, 20000, 5000]
-    assert events == ["slice", "write"] * 3
+    # Reads and writes interleave: every write is preceded by reads for
+    # its own chunk, and the next chunk's reads only start afterwards.
+    first_writes = [i for i, e in enumerate(events) if e == "write"]
+    assert len(first_writes) == 3
+    for i, w in enumerate(first_writes):
+        assert "slice" in events[:w], i
+        if i + 1 < len(first_writes):
+            assert events[w + 1] == "slice"
+    assert events[-1] == "write"
 
 
 def test_encode_split_empty_and_exact_multiple(tmp_path):

@@ -22,7 +22,7 @@ from .split import (
     split_album_dir,
     split_album_output,
 )
-from .stego import decode, encode, encode_split, generate_tiff
+from .stego import decode_to, encode, encode_split, generate_tiff
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -30,7 +30,9 @@ def main(argv: list[str] | None = None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     e = sub.add_parser("encode", help="embed a file into a new DNG")
-    e.add_argument("--input", "-i", required=True)
+    e.add_argument("--input", "-i", required=True,
+                   help="payload file (read lazily; the whole file is never "
+                   "held in memory)")
     e.add_argument("--output", "-o", required=False, default=None,
                    help="output DNG path (default: <input>.dng; with "
                    "--split-file the 0001-style sequence numbers are "
@@ -149,7 +151,9 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("--input", "-i", required=True, nargs="+",
                    help="one DNG, or several chunk files to concatenate "
                    "(verified via split metadata, else 0001-style names)")
-    d.add_argument("--output", "-o", required=True)
+    d.add_argument("--output", "-o", required=True,
+                   help="recovered payload path (written incrementally via a "
+                   ".part temp file, renamed only after CRC verification)")
     d.add_argument("--key", default=None)
     d.add_argument("--lsb-planes", type=int, default=None,
                    choices=tuple(range(1, MAX_LSB_PLANES + 1)),
@@ -233,8 +237,15 @@ def main(argv: list[str] | None = None) -> int:
             # Profile split defaults belong to the flagless path: explicit
             # geometry or a pinned subprofile keeps full control.
             split_spec = defaults.split_file
-        with open(args.input, "rb") as f:
-            payload = f.read()
+        if os.path.isfile(args.input):
+            payload_input = args.input
+            payload_len = os.path.getsize(args.input)
+        else:
+            # FIFO/device/stdin: st_size is 0, so read it like the old
+            # code did (the only path that buffers a whole payload).
+            with open(args.input, "rb") as f:
+                payload_input = f.read()
+            payload_len = len(payload_input)
         split_size = None
         if split_spec is not None:
             try:
@@ -274,7 +285,7 @@ def main(argv: list[str] | None = None) -> int:
                         sensor_sizes=None, prefer_max_planes=prefer_max,
                     )
                     for _, _, start, end in iter_chunk_bounds(
-                        len(payload), split_size)
+                        payload_len, split_size)
                 ]
                 cfg = chunk_cfgs[0]
             else:
@@ -282,7 +293,7 @@ def main(argv: list[str] | None = None) -> int:
                                 if fidelity and fidelity.prefer_native
                                 else None)
                 cfg = recommend(
-                    split_size if split_size is not None else len(payload),
+                    split_size if split_size is not None else payload_len,
                     width=w, height=h, mode=mode,
                     bit_depth=args.bit_depth, lsb_planes=args.lsb_planes,
                     auto_size=bool(auto_size), frames=args.raw_frames,
@@ -303,9 +314,9 @@ def main(argv: list[str] | None = None) -> int:
                         f"{format_kb(last['capacity'])}")
                 else:
                     scope = (f"per {format_kb(split_size)} chunk "
-                             f"(from {format_kb(len(payload))} input)"
+                             f"(from {format_kb(payload_len)} input)"
                              if split_size is not None else
-                             f"for {format_kb(len(payload))} input")
+                             f"for {format_kb(payload_len)} input")
                     print(f"auto-config ({', '.join(cfg['auto'])}): "
                           f"{cfg['width']}x{cfg['height']} {cfg['mode']} "
                           f"{cfg['bit_depth']}-bit, "
@@ -361,7 +372,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             if split_size is not None:
                 infos = encode_split(
-                    payload, output_path, split_size,
+                    payload_input, output_path, split_size,
                     split_id=args.split_file_id,
                     split_id_field=args.split_file_metadata_id,
                     split_seq_field=args.split_file_metadata_seq,
@@ -370,7 +381,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
             else:
                 infos = [encode(
-                    payload, output_path, **common,
+                    payload_input, output_path, **common,
                 )]
         except ValueError as exc:
             if (album is not None and not album_preexisted
@@ -402,7 +413,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"wrote {info['path']} "
                       f"(chunk {info['chunk_seq']}/{total}, "
                       f"{format_kb(info['payload_len'])} of "
-                      f"{format_kb(len(payload))})")
+                      f"{format_kb(payload_len)})")
             if idf == "none" and seqf == "none":
                 print("note: no split markers written to metadata; keep the "
                       "0001-style filenames so decode can order the chunks.")
@@ -436,8 +447,9 @@ def main(argv: list[str] | None = None) -> int:
                 except ValueError as exc:
                     print(f"error: {exc}", file=sys.stderr)
                     return 1
-            payload = decode(
+            recovered = decode_to(
                 args.input,
+                args.output,
                 key=args.key.encode() if args.key else None,
                 lsb_planes=args.lsb_planes,
                 max_bytes=max_bytes,
@@ -449,9 +461,7 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
-        with open(args.output, "wb") as f:
-            f.write(payload)
-        print(f"recovered {format_kb(len(payload))} -> {args.output}")
+        print(f"recovered {format_kb(recovered)} -> {args.output}")
         if len(args.input) > 1:
             # Fail-open warning: seq fields like ImageNumber carry no
             # total, so a consecutive subset decodes without error.

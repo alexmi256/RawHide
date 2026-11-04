@@ -25,6 +25,8 @@ import struct
 import sys
 import zlib
 
+from typing import cast
+
 import numpy as np
 import tifffile
 
@@ -84,7 +86,7 @@ from stegodng.opcodes import (
     parse_opcode_list2,
     validate_opcode_list2,
 )
-from stegodng.framing import PayloadFrame
+from stegodng.framing import FrameSink, FramedPayload, PayloadFrame, PayloadReader
 from stegodng.metadata import (
     EXPPROG_CHOICES,
     EXPOSURE_CHOICES,
@@ -135,6 +137,7 @@ from stegodng.split import (
 from stegodng.stego import (
     DngStego,
     decode,
+    decode_to,
     encode,
     encode_split,
     generate_tiff,
@@ -173,9 +176,9 @@ def _decode_with_planes(raw, key: bytes | None, lsb_planes: int,
                         desc: str = "Extracting",
                         position: int = 0) -> bytes:
     """Original single-frame signature; the class takes frame lists."""
-    return DngStego._decode_with_planes([raw], key, lsb_planes, max_bytes,
-                                        progress=progress, desc=desc,
-                                        position=position)
+    return cast(bytes, DngStego._decode_with_planes(
+        [raw], key, lsb_planes, max_bytes,
+        progress=progress, desc=desc, position=position))
 
 
 # Reference profile as a plain dict (original ``STATIC`` shape).
