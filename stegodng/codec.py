@@ -150,13 +150,18 @@ class LsbCodec:
         return cls.stripe_frames([cover], frame, lsb_planes)[0]
 
     @staticmethod
-    def stripe_frames(covers: list[np.ndarray], frame: bytes,
+    def stripe_frames(covers: list[np.ndarray], frame,
                       lsb_planes: int, progress: bool | None = None,
                       desc: str = "Embedding",
                       position: int = 0) -> list[np.ndarray]:
         """Unpack a framed payload and stripe its bits over frame covers
         in write order (one shared helper so single- and split-file
         encodes cannot drift apart).
+
+        ``frame`` is either a ``bytes`` blob or a
+        :class:`~stegodng.framing.FramedPayload` (file-backed view).
+        The file-backed form reads only the bit range each chunk needs,
+        so a 1 GB payload never becomes a 1 GB ``bytes`` object.
 
         Streaming implementation: the frame is never fully unpacked
         (``np.unpackbits`` on a 1 GB payload would need ~8 GB of bit
@@ -176,8 +181,13 @@ class LsbCodec:
         Non-contiguous inputs fall back to a contiguous copy for that
         cover.
         """
-        farr = np.frombuffer(frame, dtype=np.uint8)
         total_bits = len(frame) * 8
+        if hasattr(frame, "read_bits"):
+            bits_for = frame.read_bits
+        else:
+            farr = np.frombuffer(frame, dtype=np.uint8)
+            bits_for = lambda start, length: LsbCodec._bits_for_range(  # noqa: E731
+                farr, start, length)
         total_slots = sum(c.size * lsb_planes for c in covers)
         if total_bits > total_slots:
             raise ValueError(
@@ -207,7 +217,7 @@ class LsbCodec:
                         s1 = min(s0 + chunk_samples, n_used)
                         b0 = pos + s0 * lsb_planes
                         b1 = min(pos + s1 * lsb_planes, pos + take)
-                        bits = LsbCodec._bits_for_range(farr, b0, b1 - b0)
+                        bits = bits_for(b0, b1 - b0)
                         ns = (bits.size + lsb_planes - 1) // lsb_planes
                         window = flat[s0:s0 + ns].astype(np.uint32)
                         LsbCodec._embed_bits_into_window(window, bits,
@@ -222,16 +232,21 @@ class LsbCodec:
     def extract_stream(raws: list[np.ndarray], lsb_planes: int,
                        total_bits: int, progress: bool | None = None,
                        desc: str = "Extracting",
-                       position: int = 0) -> bytes:
+                       position: int = 0, sink=None) -> bytes | int:
         """Gather ``total_bits`` LSBs across ordered raw frames -> bytes.
 
         Streaming counterpart of :meth:`stripe_frames`: extracts in
         ~8-Mbit sample chunks and packs incrementally, so a 1 GB payload
         never materializes its ~8 GB unpacked bit array.
+
+        With ``sink`` (any object with ``write(bytes)``) the packed
+        payload is written out incrementally and the number of bytes
+        written is returned; nothing scales with the payload size.
+        ``sink=None`` keeps the original behavior (return ``bytes``).
         """
         if total_bits % 8:
             raise ValueError("total_bits must be a whole number of bytes")
-        out = bytearray(total_bits // 8)
+        out = bytearray(total_bits // 8) if sink is None else None
         out_pos = 0
         pending = np.empty(0, dtype=np.uint8)
         remaining = total_bits
@@ -264,8 +279,12 @@ class LsbCodec:
                         pending = np.empty(0, dtype=np.uint8)
                     n_full = (bits.size // 8) * 8
                     if n_full:
-                        out[out_pos:out_pos + n_full // 8] = np.packbits(
-                            bits[:n_full]).tobytes()
+                        packed = np.packbits(bits[:n_full]).tobytes()
+                        if sink is not None:
+                            sink.write(packed)
+                        else:
+                            assert out is not None
+                            out[out_pos:out_pos + n_full // 8] = packed
                         out_pos += n_full // 8
                     if n_full < bits.size:
                         pending = bits[n_full:].copy()
@@ -275,6 +294,9 @@ class LsbCodec:
                     done = True
         if pending.size:  # pragma: no cover - total_bits is byte-multiple
             raise ValueError("bitstream ended mid-byte")
+        if sink is not None:
+            return out_pos
+        assert out is not None
         return bytes(out)
 
     @classmethod
@@ -282,7 +304,9 @@ class LsbCodec:
                      n_bytes: int) -> bytes:
         if n_bytes == 0:
             return b""
-        return cls.extract_stream([raw], lsb_planes, n_bytes * 8)
+        result = cls.extract_stream([raw], lsb_planes, n_bytes * 8)
+        assert isinstance(result, bytes)
+        return result
 
 
 def capacity_bytes(n_samples: int, lsb_planes: int) -> int:

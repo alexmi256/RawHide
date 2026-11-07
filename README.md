@@ -226,12 +226,45 @@ cfg = AutoSizer().recommend(len(payload))         # auto-sizing
 gives the short last chunk a smaller frame; omit it to keep one fixed
 geometry for the whole set.
 
+#### Large payloads (streaming)
+
+`encode` / `encode_split` accept the payload as raw `bytes`, a filesystem
+path, an open binary file object, or any bytes-like sequence. Path/file
+inputs are streamed: the codec reads only the bit range it is currently
+embedding, and `encode_split` reads `split_size` bytes per chunk, so peak
+memory no longer grows with the payload. Non-seekable inputs (pipes,
+FIFOs, `/dev/stdin`) cannot be sized up front and are spooled whole, so
+they keep the old memory behavior.
+
+```python
+stego = DngStego()
+info = stego.encode("huge.raw", "out.dng", width=16382, height=12286)
+n = stego.decode_to("out.dng", "recovered.raw")  # streamed to disk
+```
+
+`decode_to` writes through a temporary `<output>.part` and renames it
+only after every chunk's length and CRC32 checks pass, so a wrong key or
+corrupt file leaves no partial output behind; it returns the recovered
+byte count. `decode()` still returns `bytes` for callers that want the
+payload in memory.
+
+Low-level pieces are exported too: `PayloadReader` (a seekable byte
+source over bytes/path/file), `FramedPayload` (random-access
+`header ‖ body` view used by the codec) and `FrameSink` (incremental
+decrypt + CRC verification during decode). The CLI uses this path
+automatically: `encode -i` hands the path to the API and `decode -o`
+streams straight to the output file.
+
+Note that the raw cover frames are still allocated whole (a 16382x12286
+RGB uint16 frame is ~1.1 GiB each), so payload size is no longer the
+memory ceiling, but image geometry still is.
+
 Module layout:
 
 | module | classes | responsibility |
 |---|---|---|
 | `profile.py` | `CameraProfile`, `ProfileDefaults` | GFX reference constants, per-depth levels, geometry presets/limits, per-profile CLI defaults |
-| `framing.py` | `PayloadFrame` | magic/length/CRC framing + keystream |
+| `framing.py` | `PayloadFrame`, `PayloadReader`, `FramedPayload`, `FrameSink` | magic/length/CRC framing + keystream; file-backed payload streaming |
 | `metadata.py` | `MetadataRandomizer` | per-file metadata re-rolling |
 | `filetime.py` | — | `--image-time` sources: input birth time (statx), mtime, now |
 | `cover.py` | `CoverGenerator` | synthetic raw covers + JPEG thumbnails |
@@ -244,7 +277,7 @@ Module layout:
 | `opcodes.py` | `GainMapConfig` | `OpcodeList2` GainMap generation/parsing |
 | `sizing.py` | `AutoSizer` | smallest-fit search, max-capacity errors, risk warnings |
 | `split.py` | — | chunk sizing/naming, split-field registries, seq parse/format |
-| `stego.py` | `DngStego` | `encode` / `decode` / `generate_tiff` orchestration |
+| `stego.py` | `DngStego` | `encode` / `encode_split` / `decode` / `decode_to` / `generate_tiff` orchestration |
 | `progress.py` | — | tqdm helpers (stderr bars, `True`/`False`/`None`=auto) |
 | `cli.py` | — | `encode` / `decode` / `capacity` / `gen-tiff` commands |
 | `thumbnails.py` | `ThumbnailProvider` | random-Commons / synthetic / file preview pictures |
@@ -607,7 +640,8 @@ usage: stego_dng.py encode [-h] --input INPUT [--output OUTPUT]
 
 options:
   -h, --help            show this help message and exit
-  --input, -i INPUT
+  --input, -i INPUT     payload file (read lazily; the whole file is never
+                        held in memory)
   --output, -o OUTPUT   output DNG path (default: <input>.dng; with --split-
                         file the 0001-style sequence numbers are inserted
                         before the .dng extension; with --split-file-album (on
@@ -718,7 +752,8 @@ options:
   --input, -i INPUT [INPUT ...]
                         one DNG, or several chunk files to concatenate
                         (verified via split metadata, else 0001-style names)
-  --output, -o OUTPUT
+  --output, -o OUTPUT   recovered payload path (written incrementally via a
+                        .part temp file, renamed only after CRC verification)
   --key KEY
   --lsb-planes {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16}
                         LSB planes used at encode time (default: auto-detect)

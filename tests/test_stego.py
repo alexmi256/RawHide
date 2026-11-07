@@ -957,6 +957,7 @@ def test_shim_delegates_to_package():
         "encode_split", "decode", "generate_tiff", "recommend_config",
         "CameraProfile", "PayloadFrame", "MetadataRandomizer",
         "CoverGenerator", "LsbCodec", "DngContainer", "AutoSizer",
+        "decode_to", "FramedPayload", "PayloadReader", "FrameSink",
         "ThumbnailProvider", "main", "split_album_dir", "split_album_output",
         "get_profile", "list_profiles", "AdobeProfile", "FidelityConfig",
         "GainMap", "GainMapConfig", "build_opcode_list2",

@@ -6,12 +6,13 @@ wrappers preserve the original single-file API.
 from __future__ import annotations
 
 import datetime as _dt
+import io
 import itertools
 import os
 import random
 import struct
 import warnings
-from typing import Any
+from typing import Any, BinaryIO, cast
 
 import numpy as np
 import tifffile
@@ -27,10 +28,10 @@ from .container import (
     set_ifd0_tag,
 )
 from .cover import CoverGenerator
-from .debugmeta import build_debug_document, crc32_hex, write_debug_metadata
+from .debugmeta import build_debug_document, write_debug_metadata
 from .digests import new_raw_image_digest, raw_data_unique_id
 from .filetime import normalize_image_time
-from .framing import PayloadFrame
+from .framing import FrameSink, PayloadFrame, PayloadReader
 from .metadata import MetadataRandomizer
 from .opcodes import build_opcode_list2
 from .thumbnails import ThumbnailProvider
@@ -538,7 +539,7 @@ class DngStego:
 
     def encode(
             self,
-        payload: bytes,
+        payload: bytes | bytearray | memoryview | os.PathLike | BinaryIO,
         output_path: str,
         width: int = 2048,
         height: int = 1536,
@@ -559,6 +560,11 @@ class DngStego:
         location: geo.Location | None = None,
     ) -> dict:
         """Embed `payload` into a new DNG file. Returns info dict.
+
+        ``payload`` may be raw ``bytes``, a filesystem path or an open
+        binary file object. Path/file inputs are read lazily: only the
+        bit range the codec is writing is ever in memory, so payload
+        size no longer sets peak memory.
 
         ``frames`` full-resolution raw SubIFDs share the file (burst/stack
         style); the framed payload is striped across them in order, so
@@ -605,20 +611,25 @@ class DngStego:
             white_level=white, headroom=headroom) for i in range(frames)]
         n_samples = covers[0].size
         cap = LsbCodec.capacity_bytes_total(n_samples, lsb_planes, frames)
-        if len(payload) > cap:
-            raise ValueError(
-                f"payload {format_kb_hi(len(payload))} exceeds capacity {format_kb_lo(cap)} "
-                f"({width}x{height} {mode} {bit_depth}-bit, "
-                f"{lsb_planes} LSB plane(s)"
-                f"{f' x {frames} frames' if frames > 1 else ''})"
-            )
-        frame = PayloadFrame.pack(payload, key)
-        frame_crc = crc32_hex(frame) if debug_metadata else ""
-        stegos = LsbCodec.stripe_frames(
-            covers, frame, lsb_planes, progress=progress)
+        reader = PayloadReader(payload)
+        try:
+            framed = reader.framed(key)
+            payload_len = framed.payload_len
+            if payload_len > cap:
+                raise ValueError(
+                    f"payload {format_kb_hi(payload_len)} exceeds capacity {format_kb_lo(cap)} "
+                    f"({width}x{height} {mode} {bit_depth}-bit, "
+                    f"{lsb_planes} LSB plane(s)"
+                    f"{f' x {frames} frames' if frames > 1 else ''})"
+                )
+            frame_crc = framed.frame_crc32_hex() if debug_metadata else ""
+            stegos = LsbCodec.stripe_frames(
+                covers, framed, lsb_planes, progress=progress)
+        finally:
+            reader.close()
         # stripe_frames embeds in place: stegos share the covers'
         # buffers, so drop the extra references promptly.
-        del covers, frame
+        del covers, framed
 
         tw, th = self._thumbnail_size(width, height)
         thumb, thumb_label = ThumbnailProvider(seed=seed).get(
@@ -633,7 +644,7 @@ class DngStego:
             output_path, width=width, height=height, mode=mode,
             bit_depth=bit_depth, container=str(stegos[0].dtype),
             lsb_planes=lsb_planes, frames=frames, thumb_label=thumb_label,
-            bigtiff=bigtiff, cap=cap, payload_len=len(payload), meta=meta,
+            bigtiff=bigtiff, cap=cap, payload_len=payload_len, meta=meta,
         )
         if debug_metadata:
             self._debug_sidecar(
@@ -699,7 +710,7 @@ class DngStego:
 
     def encode_split(
             self,
-        payload: bytes,
+        payload: bytes | bytearray | memoryview | os.PathLike | BinaryIO,
         output_path: str,
         split_size: int,
         width: int = 2048,
@@ -724,6 +735,11 @@ class DngStego:
         chunk_configs: list[dict] | None = None,
     ) -> list[dict]:
         """Split `payload` into ≤`split_size`-byte chunks across DNG files.
+
+        ``payload`` accepts the same types as :meth:`encode` (bytes, path
+        or file object); with a path/file only one chunk is read at a
+        time, so peak memory is ~``split_size`` instead of the whole
+        payload.
 
         Each chunk is an independent framed payload (own header/CRC), so a
         short last chunk needs no padding. Files are named
@@ -764,7 +780,8 @@ class DngStego:
         except UnicodeEncodeError as exc:
             raise ValueError(
                 f"split_id must be ASCII for metadata storage: {exc}") from exc
-        chunks = iter_chunk_bounds(len(payload), split_size)
+        reader = PayloadReader(payload)
+        chunks = iter_chunk_bounds(reader.length, split_size)
         # Peek the first item to learn the total without slicing any
         # payload bytes up front.
         first = next(chunks)
@@ -814,8 +831,13 @@ class DngStego:
         if total == 1:
             # Fits in one chunk: plain single file, no split markers.
             cw, ch, cp = configs[0] if configs else (width, height, lsb_planes)
+            # A non-seekable source was already consumed to measure its
+            # length; re-passing the stream would encode an empty payload.
+            buffered = reader.buffered()
+            reader.close()
             return [self.encode(
-                payload, output_path, width=cw, height=ch, seed=seed,
+                buffered if buffered is not None else payload, output_path,
+                width=cw, height=ch, seed=seed,
                 key=key, lsb_planes=cp, bit_depth=bit_depth,
                 mode=mode, compression=compression,
                 no_randomize=no_randomize, frames=frames,
@@ -832,10 +854,11 @@ class DngStego:
                             disable=not show) as outer:
             for seq, chunk_total, start, end in itertools.chain([first], chunks):
                 assert chunk_total == total  # generator yields one fixed total
-                # One chunk copy at a time: slicing all chunks up front
-                # would hold a second full payload beside ``payload``.
-                chunk = payload[start:end]
-                chunk_len = len(chunk)
+                # File-backed view of just this chunk: no bytes are copied
+                # out of the payload source and only the bit range the
+                # codec writes is ever read.
+                framed = reader.framed(key, offset=start, length=end - start)
+                chunk_len = framed.payload_len
                 cw, chh, cp = (configs[seq - 1] if configs
                                else (width, height, lsb_planes))
                 path = chunk_path(output_path, seq)
@@ -884,15 +907,13 @@ class DngStego:
                         f"Lower --split-file to at most {format_kb_lo(cap)} or "
                         f"enlarge the geometry / add planes."
                     )
-                frame = PayloadFrame.pack(chunk, key)
-                frame_crc = crc32_hex(frame) if debug_metadata else ""
-                del chunk
+                frame_crc = framed.frame_crc32_hex() if debug_metadata else ""
                 stegos = LsbCodec.stripe_frames(
-                    covers, frame, cp, progress=show,
+                    covers, framed, cp, progress=show,
                     desc=f"Embedding chunk {seq}/{total}", position=1)
                 # stripe_frames embeds in place: stegos share the covers'
                 # buffers, so drop the extra references promptly.
-                del covers, frame
+                del covers, framed
                 tw, th = self._thumbnail_size(cw, chh)
                 thumb, thumb_label = ThumbnailProvider(seed=cs).get(
                     tw, th, source=thumbnail)
@@ -930,7 +951,7 @@ class DngStego:
                         stegos=stegos, cover_seed=cs,
                         metadata_seed=cseed, white_level=white,
                         headroom=headroom, frame_crc32=frame_crc,
-                        total_payload_bytes=len(payload),
+                        total_payload_bytes=reader.length,
                         split={"chunk_seq": seq, "chunk_total": total,
                                "split_id": uid,
                                "split_id_field": split_id_field,
@@ -940,6 +961,7 @@ class DngStego:
                 infos.append(info)
                 del stegos, thumb
                 outer.update(1)
+        reader.close()
         return infos
 
     @staticmethod
@@ -972,7 +994,8 @@ class DngStego:
         progress: bool | None = None,
         desc: str = "Extracting",
         position: int = 0,
-    ) -> bytes:
+        sink=None,
+    ) -> bytes | int:
         """Single-plane-count decode attempt across ordered raw frames.
 
         The framed bitstream is striped over frames in write order; gather
@@ -984,6 +1007,11 @@ class DngStego:
         ``max_bytes`` is an opt-in safety cap (``None`` means bounded only
         by the image capacity); it guards against allocating a huge buffer
         from a bogus header before the capacity check runs.
+
+        With ``sink`` (a writable, seekable binary file) the verified
+        payload is written out as it is recovered and the byte count is
+        returned, so decode memory stays at the chunk size. ``sink=None``
+        returns the payload as ``bytes`` (the historical API).
         """
         head = LsbCodec.extract_bitarray(raws[0], lsb_planes, PayloadFrame.HEADER_LEN * 8)
         header = np.packbits(head).tobytes()
@@ -1003,11 +1031,15 @@ class DngStego:
         if total_bits > total_slots:
             raise _DecodeLimitError(
                 "declared payload exceeds image capacity")
-        stream = LsbCodec.extract_stream(raws, lsb_planes, total_bits,
-                                             progress=progress, desc=desc,
-                                             position=position)
-        payload, _ = PayloadFrame.unpack(stream, key)
-        return payload
+        target = sink if sink is not None else io.BytesIO()
+        frame_sink = FrameSink(key, target)
+        LsbCodec.extract_stream(raws, lsb_planes, total_bits,
+                                progress=progress, desc=desc,
+                                position=position, sink=frame_sink)
+        written = frame_sink.finish()
+        if sink is None:
+            return target.getvalue()
+        return written
 
     def decode(
             self,
@@ -1040,23 +1072,143 @@ class DngStego:
         if not paths:
             raise ValueError("no input files given")
         if len(paths) == 1:
-            payload = self._decode_one(paths[0], key, lsb_planes, max_bytes,
-                                       progress=progress)
-            markers = DngContainer(paths[0]).split_markers(split_id_field,
-                                                           split_seq_field)
-            if markers["seq_present"] or markers["id_present"]:
-                total = markers["total"] or "?"
-                warnings.warn(
-                    f"{paths[0]} carries split metadata (chunk "
-                    f"{markers['seq'] or '?'} of {total}): decoding one "
-                    f"chunk returns partial data; pass every chunk file to "
-                    f"restore the whole payload.")
+            payload = cast(bytes, self._decode_one(
+                paths[0], key, lsb_planes, max_bytes, progress=progress))
+            self._warn_partial(paths[0], split_id_field, split_seq_field)
             return payload
         return self._decode_many(paths, key=key, lsb_planes=lsb_planes,
                                  max_bytes=max_bytes,
                                  id_field=split_id_field,
                                  seq_field=split_seq_field,
                                  progress=progress)
+
+    @staticmethod
+    def _warn_partial(path: str, id_field: str, seq_field: str) -> None:
+        """Warn when one chunk file is decoded as if it were complete."""
+        markers = DngContainer(path).split_markers(id_field, seq_field)
+        if markers["seq_present"] or markers["id_present"]:
+            total = markers["total"] or "?"
+            warnings.warn(
+                f"{path} carries split metadata (chunk "
+                f"{markers['seq'] or '?'} of {total}): decoding one "
+                f"chunk returns partial data; pass every chunk file to "
+                f"restore the whole payload.")
+
+    def decode_to(
+            self,
+        input_path: str | list[str],
+        output_path: str,
+        key: bytes | None = None,
+        lsb_planes: int | None = None,
+        max_bytes: int | None = None,
+        split_id_field: str = "ImageUniqueID",
+        split_seq_field: str = "ImageNumber",
+        progress: bool | None = None,
+    ) -> int:
+        """Stream a decoded payload straight to ``output_path``.
+
+        Same inputs and validation as :meth:`decode`, but the payload is
+        never held in memory: it is written to a temporary file beside
+        ``output_path`` and renamed only after every chunk's length and
+        CRC32 check out, so a corrupt or truncated stream leaves no
+        partial output behind. Returns the recovered byte count.
+        """
+        if lsb_planes is not None and not (1 <= lsb_planes <= MAX_LSB_PLANES):
+            raise ValueError(f"lsb_planes must be 1-{MAX_LSB_PLANES}")
+        resolve_split_fields(split_id_field, split_seq_field)
+        paths = [input_path] if isinstance(input_path, str) else list(input_path)
+        if not paths:
+            raise ValueError("no input files given")
+        if len(paths) == 1:
+            ordered = paths
+            self._warn_partial(paths[0], split_id_field, split_seq_field)
+        else:
+            ordered = self._ordered_paths(paths, split_id_field,
+                                          split_seq_field)
+        tmp_path = f"{output_path}.part"
+        total = 0
+        show = _progress_enabled(progress)
+        try:
+            with open(tmp_path, "wb") as out:
+                with _progress_bar(total=len(ordered), desc="Decoding chunks",
+                                   unit="file", disable=not show) as outer:
+                    for i, p in enumerate(ordered, 1):
+                        try:
+                            total += cast(int, self._decode_one(
+                                p, key, lsb_planes, max_bytes,
+                                progress=show,
+                                desc=(f"Extracting chunk {i}/{len(ordered)}"
+                                      if len(ordered) > 1 else "Extracting"),
+                                position=1 if show else 0, sink=out))
+                        except ValueError as exc:
+                            raise ValueError(f"{p}: {exc}") from exc
+                        outer.update(1)
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(tmp_path, output_path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        return total
+
+    def _ordered_paths(self, paths: list[str], id_field: str,
+                       seq_field: str) -> list[str]:
+        """Verify and order a chunk set (metadata, else filenames)."""
+        markers = []
+        for p in paths:
+            try:
+                markers.append(DngContainer(p).split_markers(id_field,
+                                                             seq_field))
+            except ValueError as exc:
+                raise ValueError(f"{p}: {exc}") from exc
+        id_active = id_field != "none"
+        seq_active = seq_field != "none"
+
+        def _has(m: dict) -> bool:
+            return ((not id_active or m["id_present"])
+                    and (not seq_active or m["seq_present"]))
+
+        def _has_any(m: dict) -> bool:
+            return ((id_active and m["id_present"])
+                    or (seq_active and m["seq_present"]))
+
+        n_all = sum(1 for m in markers if _has(m))
+        n_any = sum(1 for m in markers if _has_any(m))
+        if id_active or seq_active:
+            if n_all == len(paths):
+                return self._order_by_markers(paths, markers, id_active,
+                                              seq_active)
+            if n_any == 0:
+                return self._order_by_names(paths)
+            partial = [p for p, m in zip(paths, markers)
+                       if not _has(m) and _has_any(m)]
+            if len(partial) == len(paths):
+                lacking = sorted(
+                    {name for name, active, field in
+                     (("id", id_active, "id_present"),
+                      ("sequence", seq_active, "seq_present"))
+                     if active and not any(m[field] for m in markers)})
+                raise ValueError(
+                    "every file carries split markers, but none carries "
+                    f"{' and '.join(lacking)} markers "
+                    f"({', '.join(sorted(partial))}). Re-encode with "
+                    f"matching --split-file-metadata-* fields, or pass "
+                    f"the same field names used at encode time to "
+                    f"decode.")
+            missing = sorted(p for p, m in zip(paths, markers)
+                             if not _has(m))
+            raise ValueError(
+                "inconsistent split metadata: these files carry chunk "
+                "markers but these do not: "
+                f"{missing}. Pass a consistent set — either every file "
+                "with markers, or plain files following the 0001 naming "
+                "convention. (If you encoded with non-default "
+                "--split-file-metadata-id/seq names, pass the same "
+                "ones to decode.)")
+        return self._order_by_names(paths)
 
     def _decode_one(
             self,
@@ -1067,21 +1219,32 @@ class DngStego:
         progress: bool | None = None,
         desc: str = "Extracting",
         position: int = 0,
-    ) -> bytes:
-        """Decode a single DNG (chunk or whole payload)."""
+        sink=None,
+    ) -> bytes | int:
+        """Decode a single DNG (chunk or whole payload).
+
+        With ``sink`` the payload is streamed to that file and the byte
+        count returned; a failed plane candidate rewinds the sink to its
+        starting offset so earlier chunks in a split set survive.
+        """
         if lsb_planes is not None and not (1 <= lsb_planes <= MAX_LSB_PLANES):
             raise ValueError(f"lsb_planes must be 1-{MAX_LSB_PLANES}")
         raws = DngContainer(input_path).raw_frames()
         candidates = ([lsb_planes] if lsb_planes is not None
                       else list(range(1, MAX_LSB_PLANES + 1)))
+        base = sink.tell() if sink is not None else 0
         last_err: ValueError | None = None
         limit_err: ValueError | None = None
         for p in candidates:
+            if sink is not None:
+                sink.seek(base)
+                sink.truncate()
             try:
                 return self._decode_with_planes(raws, key, p, max_bytes,
                                                     progress=progress,
                                                     desc=desc,
-                                                    position=position)
+                                                    position=position,
+                                                    sink=sink)
             except ValueError as exc:
                 # A magic match with a bad length means the right plane was
                 # found but the payload was rejected (cap/capacity). Surface
@@ -1107,70 +1270,18 @@ class DngStego:
                      id_field: str, seq_field: str,
                      progress: bool | None = None) -> bytes:
         """Verify a chunk set (metadata, else filenames) and concatenate."""
-        markers = []
-        for p in paths:
-            try:
-                markers.append(DngContainer(p).split_markers(id_field,
-                                                             seq_field))
-            except ValueError as exc:
-                raise ValueError(f"{p}: {exc}") from exc
-        id_active = id_field != "none"
-        seq_active = seq_field != "none"
-
-        def _has(m: dict) -> bool:
-            return ((not id_active or m["id_present"])
-                    and (not seq_active or m["seq_present"]))
-
-        def _has_any(m: dict) -> bool:
-            return ((id_active and m["id_present"])
-                    or (seq_active and m["seq_present"]))
-
-        n_all = sum(1 for m in markers if _has(m))
-        n_any = sum(1 for m in markers if _has_any(m))
-        if id_active or seq_active:
-            if n_all == len(paths):
-                ordered = self._order_by_markers(paths, markers, id_active,
-                                                 seq_active)
-            elif n_any == 0:
-                ordered = self._order_by_names(paths)
-            else:
-                partial = [p for p, m in zip(paths, markers)
-                           if not _has(m) and _has_any(m)]
-                if len(partial) == len(paths):
-                    lacking = sorted(
-                        {name for name, active, key in
-                         (("id", id_active, "id_present"),
-                          ("sequence", seq_active, "seq_present"))
-                         if active and not any(m[key] for m in markers)})
-                    raise ValueError(
-                        "every file carries split markers, but none carries "
-                        f"{' and '.join(lacking)} markers "
-                        f"({', '.join(sorted(partial))}). Re-encode with "
-                        f"matching --split-file-metadata-* fields, or pass "
-                        f"the same field names used at encode time to "
-                        f"decode.")
-                missing = sorted(p for p, m in zip(paths, markers)
-                                 if not _has(m))
-                raise ValueError(
-                    "inconsistent split metadata: these files carry chunk "
-                    "markers but these do not: "
-                    f"{missing}. Pass a consistent set — either every file "
-                    "with markers, or plain files following the 0001 naming "
-                    "convention. (If you encoded with non-default "
-                    "--split-file-metadata-id/seq names, pass the same "
-                    "ones to decode.)")
-        else:
-            ordered = self._order_by_names(paths)
+        ordered = self._ordered_paths(paths, id_field, seq_field)
         out = bytearray()
         show = _progress_enabled(progress)
         with _progress_bar(total=len(ordered), desc="Decoding chunks",
                             unit="file", disable=not show) as outer:
             for i, p in enumerate(ordered, 1):
                 try:
-                    out += self._decode_one(p, key, lsb_planes, max_bytes,
-                                            progress=show,
-                                            desc=f"Extracting chunk {i}/{len(ordered)}",
-                                            position=1 if show else 0)
+                    out += cast(bytes, self._decode_one(
+                        p, key, lsb_planes, max_bytes,
+                        progress=show,
+                        desc=f"Extracting chunk {i}/{len(ordered)}",
+                        position=1 if show else 0))
                 except ValueError as exc:
                     raise ValueError(f"{p}: {exc}") from exc
                 outer.update(1)
@@ -1290,7 +1401,7 @@ _DEFAULT = DngStego()
 
 
 def encode(
-    payload: bytes,
+    payload: bytes | bytearray | memoryview | os.PathLike | BinaryIO,
     output_path: str,
     width: int = 2048,
     height: int = 1536,
@@ -1340,8 +1451,25 @@ def decode(
         progress=progress)
 
 
+def decode_to(
+    input_path: str | list[str],
+    output_path: str,
+    key: bytes | None = None,
+    lsb_planes: int | None = None,
+    max_bytes: int | None = None,
+    split_id_field: str = "ImageUniqueID",
+    split_seq_field: str = "ImageNumber",
+    progress: bool | None = None,
+) -> int:
+    """Backwards-compatible wrapper (see :meth:`DngStego.decode_to`)."""
+    return _DEFAULT.decode_to(
+        input_path, output_path, key=key, lsb_planes=lsb_planes,
+        max_bytes=max_bytes, split_id_field=split_id_field,
+        split_seq_field=split_seq_field, progress=progress)
+
+
 def encode_split(
-    payload: bytes,
+    payload: bytes | bytearray | memoryview | os.PathLike | BinaryIO,
     output_path: str,
     split_size: int,
     width: int = 2048,
